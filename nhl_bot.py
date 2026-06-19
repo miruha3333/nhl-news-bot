@@ -8,7 +8,7 @@ from duckduckgo_search import DDGS
 
 # Вставь свой ID канала
 TOKEN = os.environ.get('TOKEN') 
-CHANNEL_ID = '-100XXXXXXXXXX' 
+CHANNEL_ID = '-1004423088204' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
