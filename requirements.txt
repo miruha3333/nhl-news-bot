@@ -1,3 +1,5 @@
 g4f
 feedparser
 pyTelegramBotAPI
+duckduckgo_search
+requests
