@@ -29,12 +29,9 @@ def escape_html(text):
 
 def download_image(query):
     """Ищет картинки без водяных знаков и пробует скачать несколько вариантов"""
-    # Добавляем фильтр против стоковых сайтов с ватермарками
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
     print(f"Ищем чистую картинку по запросу: {clean_query}")
-    
-    # Небольшая пауза перед поиском, чтобы поисковик не блокировал за скорость
-    time.sleep(3)
+    time.sleep(2)
     
     try:
         with DDGS() as ddgs:
@@ -57,7 +54,7 @@ def download_image(query):
     return None
 
 def translate_tweet(raw_text):
-    # Отрезаем источник и дату с помощью Python
+    # Отрезаем приписки сайтов и даты с помощью Python
     if ' - ' in raw_text:
         clean_text_for_ai = raw_text.rsplit(' - ', 1)[0]
     else:
@@ -67,13 +64,12 @@ def translate_tweet(raw_text):
     Ты — автоматический хоккейный редактор. Переведи твит о НХЛ на живой русский язык.
     
     СТРОГИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ ПОСТА:
-    1. Формат вывода должен быть строго: Источник: Текст перевода.
-    2. Если в начале текста есть автор (например, "Chris Johnston:"), оставь его на английском в начале.
-    3. ВАЖНО: Все имена, фамилии хоккеистов и названия команд ПЕРЕВОДИ на русский язык (например: Дилан Ларкин, Алекс Дебринкэт, Детройт, Вегас Голден Найтс).
-    4. Убери из текста ВСЕ лишние знаки: кавычки, звездочки. Текст должен быть абсолютно чистым.
-    5. Хоккейные термины: Cap hit -> кэпхит, Trade -> обмен, Free agent -> свободный агент.
-    6. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО добавлять от себя вводные фразы. Выдай только пост в формате "Источник: Текст".
-    7. В самой последней строке ответа напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
+    1. Если в оригинале указан автор (например, "Chris Johnston:" или "David Pagnotta:"), начни перевод с его имени на английском, поставь двоеточие и пробел. Само слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
+    2. ВАЖНО: Все имена, фамилии хоккеистов и названия команд ПЕРЕВОДИ на русский язык (например: Дилан Ларкин, Алекс Дебринкэт, Детройт).
+    3. Убери из текста ВСЕ лишние знаки: кавычки, звездочки. Текст должен быть абсолютно чистым.
+    4. Хоккейные термины: Cap hit -> кэпхит, Trade -> обмен, Free agent -> свободный агент.
+    5. Выдай только готовый текст. Никаких вводных фраз.
+    6. В самой последней строке ответа напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
     
     Оригинальный текст: "{clean_text_for_ai}"
     """
@@ -85,7 +81,6 @@ def translate_tweet(raw_text):
                 messages=[{"role": "user", "content": prompt}]
             )
             if response:
-                # Базовая очистка от мусора разметки
                 clean_response = response.replace("**", "").replace('"', "").replace("«", "").replace("»", "")
                 return clean_response.strip()
         except:
@@ -96,56 +91,78 @@ def main():
     feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
     history = get_history()
     
+    # Собираем список новых новостей
+    new_entries = []
     for entry in reversed(feed.entries[:5]):
         if entry.title not in history:
-            raw_response = translate_tweet(entry.title)
+            new_entries.append(entry)
             
-            if raw_response:
-                # Разделяем текст поста и поисковый запрос
-                if "SEARCH_QUERY:" in raw_response:
-                    parts = raw_response.split("SEARCH_QUERY:")
-                    post_text = parts[0].strip()
-                    search_query = parts[1].strip()
-                else:
-                    post_text = raw_response
-                    search_query = None
+    if not new_entries:
+        print("Новых постов нет.")
+        return
+        
+    combined_texts = []
+    main_search_query = None
+    
+    for entry in new_entries:
+        raw_response = translate_tweet(entry.title)
+        
+        if raw_response:
+            # Разделяем текст и запрос для картинки
+            if "SEARCH_QUERY:" in raw_response:
+                parts = raw_response.split("SEARCH_QUERY:")
+                post_text = parts[0].strip()
+                # Берем запрос для фото только из первой попавшейся новости
+                if not main_search_query and len(parts) > 1:
+                    main_search_query = parts[1].strip()
+            else:
+                post_text = raw_response
+            
+            # Делаем имя инсайдера жирным
+            if ": " in post_text:
+                author, text_content = post_text.split(": ", 1)
+                # Страховка, если ИИ всё же написал слово "Источник"
+                author = author.replace("Источник", "").strip() 
+                formatted_text = f"<b>{escape_html(author)}:</b> {escape_html(text_content)}"
+            else:
+                formatted_text = escape_html(post_text)
                 
-                # Красивое форматирование текста: Автор (жирным) + Новая строка + Текст новости
-                post_text = post_text.replace("**", "") # убираем старые звездочки если есть
-                if ": " in post_text:
-                    author, text_content = post_text.split(": ", 1)
-                    formatted_text = f"<b>{escape_html(author.strip())}</b>\n{escape_html(text_content.strip())}"
-                else:
-                    formatted_text = escape_html(post_text)
-                
-                image_path = None
-                # План А: Ищем фото игрока/команды
-                if search_query:
-                    image_path = download_image(search_query)
-                
-                # План Б: Универсальное фото, если План А не сработал
-                if not image_path:
-                    print("План Б: ищем дефолтную картинку...")
-                    image_path = download_image("NHL ice hockey match action")
-                
-                try:
-                    if image_path and os.path.exists(image_path):
-                        with open(image_path, 'rb') as photo:
-                            # Публикуем фото с HTML-подписью
-                            bot.send_photo(CHANNEL_ID, photo, caption=formatted_text, parse_mode='HTML')
-                        os.remove(image_path)
-                        print("✅ Пост с картинкой отправлен!")
+            combined_texts.append(formatted_text)
+            
+            # Сразу записываем в историю, что новость обработана
+            add_to_history(entry.title)
+            
+    # Если есть что публиковать
+    if combined_texts:
+        # Склеиваем все новости через пустую строку
+        final_post = "\n\n".join(combined_texts)
+        
+        image_path = None
+        if main_search_query:
+            image_path = download_image(main_search_query)
+            
+        if not image_path:
+            print("План Б: ищем дефолтную картинку...")
+            image_path = download_image("NHL ice hockey match action")
+        
+        try:
+            # В Telegram лимит текста под фото - 1024 символа
+            if image_path and os.path.exists(image_path):
+                with open(image_path, 'rb') as photo:
+                    if len(final_post) <= 1024:
+                        # Если текст влез в лимит — шлем одним постом
+                        bot.send_photo(CHANNEL_ID, photo, caption=final_post, parse_mode='HTML')
                     else:
-                        # Если совсем всё упало — шлем чистый текст
-                        bot.send_message(CHANNEL_ID, formatted_text, parse_mode='HTML')
-                        print("⚠️ Пост отправлен БЕЗ картинки.")
-                        
-                    add_to_history(entry.title)
-                except Exception as e:
-                    print(f"❌ Ошибка отправки в Telegram: {e}")
-                    
-                # Пауза между постами для стабильности
-                time.sleep(5)
+                        # Если накопилось слишком много текста — шлем фото отдельно, текст отдельно
+                        bot.send_photo(CHANNEL_ID, photo)
+                        bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
+                os.remove(image_path)
+                print("✅ Сводный пост с картинкой отправлен!")
+            else:
+                bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
+                print("⚠️ Сводный пост отправлен БЕЗ картинки.")
+        except Exception as e:
+            print(f"❌ Ошибка отправки в Telegram: {e}")
 
 if __name__ == "__main__":
     main()
