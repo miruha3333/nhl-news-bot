@@ -39,8 +39,8 @@ def download_image(query):
     
     try:
         with DDGS() as ddgs:
-            # Берем 10 результатов для максимального выбора
-            results = list(ddgs.images(keywords=clean_query, max_results=10))
+            # ИССПРАВЛЕНО: используем query= вместо keywords= согласно новой версии библиотеки
+            results = list(ddgs.images(query=clean_query, max_results=10))
             
             for res in results:
                 try:
@@ -60,7 +60,6 @@ def download_image(query):
                     elif 'image/png' in content_type:
                         img_name = "temp.png"
                     else:
-                        # Пропускаем webp и прочий мусор, который не ест Телега
                         print(f"Пропуск (формат {content_type}): {img_url}")
                         continue 
                     
@@ -182,7 +181,6 @@ def main():
                         os.remove(image_path)
             
             if not image_sent:
-                # Если ВСЕ 10 картинок оказались невалидными, шлем хотя бы текст
                 bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
                 print("⚠️ Пост отправлен БЕЗ картинки (все 10 вариантов не подошли).")
             else:
