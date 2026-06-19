@@ -4,7 +4,7 @@ import telebot
 import os
 import time
 import requests
-from duckduckgo_search import DDGS
+from ddgs import DDGS
 
 # Вставь свой ID канала
 TOKEN = os.environ.get('TOKEN') 
