@@ -1,0 +1,3 @@
+g4f
+feedparser
+pyTelegramBotAPI
