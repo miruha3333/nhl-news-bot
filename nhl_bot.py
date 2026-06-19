@@ -1,55 +1,39 @@
 import g4f
 import feedparser
-import time
+import telebot
+import os
 
+# Замени на свои данные
+TOKEN = os.environ.get('TOKEN') 
+CHANNEL_ID = '-1004423088204' # Твой ID из шага 2
+
+bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 
 def get_history():
-    try:
-        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-            return set(line.strip() for line in f)
-    except FileNotFoundError:
-        return set()
+    if not os.path.exists(HISTORY_FILE): return set()
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f)
 
 def add_to_history(title):
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:
         f.write(title + "\n")
 
-def translate_tweet_with_ai(text):
-    # Добавили правило №4: удалять всё, что идет после последнего тире
-    prompt = f"""
-    Ты — редактор хоккейного канала. Переведи твит на живой русский язык.
-    ПРАВИЛА:
-    1. Имена и фамилии оставляй в ОРИГИНАЛЕ (Darnell Nurse, Drew Doughty).
-    2. Термины: Cap hit -> кэпхит, Trade -> обмен, Free agent -> свободный агент.
-    3. Выдай ТОЛЬКО перевод.
-    4. ВАЖНО: Удали из текста любую информацию об источнике (например, "- The Athletic (6/16)" или "- Oilers Now (6/15)"). 
-       Оставляй только суть новости.
-    Текст: "{text}"
-    """
-    for attempt in range(3):
-        try:
-            return g4f.ChatCompletion.create(model=g4f.models.gpt_4o, messages=[{"role": "user", "content": prompt}])
-        except:
-            time.sleep(2)
-    return None
+def translate_tweet(text):
+    prompt = f"""Переведи твит о НХЛ. Имена/фамилии — строго на английском (Darnell Nurse). 
+    Термины: Cap hit -> кэпхит, Trade -> обмен. Удали источник и дату в конце. 
+    Текст: "{text}" """
+    return g4f.ChatCompletion.create(model=g4f.models.gpt_4o, messages=[{"role": "user", "content": prompt}])
 
 def main():
-    rss_url = "https://nitter.net/NHLRumourReport/rss"
-    feed = feedparser.parse(rss_url)
+    feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
     history = get_history()
-    
-    print("🚀 Проверка новых новостей...\n")
-    
+    # Берем новости в обратном порядке
     for entry in reversed(feed.entries[:5]):
         if entry.title not in history:
-            print(f"✨ Новая новость: {entry.title}")
-            translated = translate_tweet_with_ai(entry.title)
-            
-            if translated:
-                print(f"✅ Перевод: {translated}")
-                add_to_history(entry.title)
-            print("-" * 50)
+            translated = translate_tweet(entry.title)
+            bot.send_message(CHANNEL_ID, translated)
+            add_to_history(entry.title)
 
 if __name__ == "__main__":
     main()
