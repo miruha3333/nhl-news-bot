@@ -39,21 +39,28 @@ def download_image(query):
         print(f"Не удалось загрузить картинку: {e}")
     return None
 
-def translate_tweet(text):
-    # Добавили правило №7 для генерации поискового запроса картинки
+def translate_tweet(raw_text):
+    # 1. Жестко отрезаем источник и дату с помощью Python.
+    # rsplit(' - ', 1) ищет последнее ' - ' и берет только текст до него.
+    if ' - ' in raw_text:
+        clean_text_for_ai = raw_text.rsplit(' - ', 1)[0]
+    else:
+        clean_text_for_ai = raw_text
+
+    # 2. Обновленный промпт: теперь переводим имена, но для поиска картинки просим английское имя
     prompt = f"""
-    Ты — автоматический хоккейный редактор. Переведи твит о НХЛ на русский язык.
+    Ты — автоматический хоккейный редактор. Переведи твит о НХЛ на живой русский язык.
     
     СТРОГИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ ПОСТА:
     1. Формат вывода должен быть строго: Источник (на английском языке): Текст перевода.
-    2. Если в начале оригинального текста указан автор/источник (например, "Chris Johnston:"), оставь его имя на английском в самом начале поста, затем поставь двоеточие и пробел.
-    3. Убери из итогового текста ВСЕ лишние знаки: кавычки, звездочки (**). Текст должен быть абсолютно чистым.
-    4. Все имена и фамилии игроков внутри перевода оставляй в ОРИГИНАЛЕ на английском (Darnell Nurse, Drew Doughty).
+    2. Если в начале текста есть автор (например, "Chris Johnston:"), оставь его на английском в начале.
+    3. ВАЖНО: Все имена, фамилии хоккеистов и названия команд ПЕРЕВОДИ на русский язык (например: Дилан Ларкин, Алекс Дебринкэт, Детройт, Вегас Голден Найтс).
+    4. Убери из текста ВСЕ лишние знаки: кавычки, звездочки (**). Текст должен быть абсолютно чистым.
     5. Хоккейные термины: Cap hit -> кэпхит, Trade -> обмен, Free agent -> свободный агент.
-    6. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО добавлять от себя любые вводные фразы ("Вот перевод..."). 
-    7. ВАЖНО: В самой последней строке ответа напиши строго: SEARCH_QUERY: [Имя главного игрока или команды из текста на английском] NHL photo.
+    6. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО добавлять от себя вводные фразы ("Вот перевод..."). Выдай только пост.
+    7. В самой последней строке ответа напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
     
-    Оригинальный текст: "{text}"
+    Оригинальный текст: "{clean_text_for_ai}"
     """
     
     for attempt in range(3):
@@ -63,8 +70,8 @@ def translate_tweet(text):
                 messages=[{"role": "user", "content": prompt}]
             )
             if response:
-                clean_text = response.replace("**", "").replace('"', "").replace("«", "").replace("»", "")
-                return clean_text.strip()
+                clean_response = response.replace("**", "").replace('"', "").replace("«", "").replace("»", "")
+                return clean_response.strip()
         except:
             time.sleep(2)
     return None
@@ -78,7 +85,6 @@ def main():
             raw_response = translate_tweet(entry.title)
             
             if raw_response:
-                # Разделяем текст поста и поисковый запрос картинки
                 if "SEARCH_QUERY:" in raw_response:
                     parts = raw_response.split("SEARCH_QUERY:")
                     post_text = parts[0].strip()
@@ -92,22 +98,17 @@ def main():
                     print(f"Ищем картинку по запросу: {search_query}")
                     image_path = download_image(search_query)
                 
-                # Отправка в Telegram
                 try:
                     if image_path and os.path.exists(image_path):
-                        # Если картинка скачалась, отправляем её с текстом в качестве описания
                         with open(image_path, 'rb') as photo:
                             bot.send_photo(CHANNEL_ID, photo, caption=post_text)
-                        os.remove(image_path) # Удаляем временный файл
-                        print("Пост отправлен с картинкой!")
+                        os.remove(image_path)
                     else:
-                        # Запасной вариант: если картинки нет, шлем просто текст
                         bot.send_message(CHANNEL_ID, post_text)
-                        print("Пост отправлен БЕЗ картинки (не нашли или сбой).")
                         
                     add_to_history(entry.title)
                 except Exception as e:
-                    print(f"Ошибка отправки в Telegram: {e}")
+                    print(f"Ошибка отправки: {e}")
                     
                 time.sleep(2)
 
