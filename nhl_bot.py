@@ -8,7 +8,7 @@ from duckduckgo_search import DDGS
 
 # Вставь свой ID канала
 TOKEN = os.environ.get('TOKEN') 
-CHANNEL_ID = '-1004423088204' 
+CHANNEL_ID = '-100XXXXXXXXXX' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
@@ -24,37 +24,52 @@ def add_to_history(title):
         f.write(title + "\n")
 
 def escape_html(text):
-    """Экранирует спецсимволы, чтобы Telegram не выдавал ошибку разметки"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def download_image(query):
-    """Ищет картинки без водяных знаков и пробует скачать несколько вариантов"""
+    """Ищет чистые картинки и строго фильтрует форматы JPG/PNG"""
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
     print(f"Ищем чистую картинку по запросу: {clean_query}")
     time.sleep(2)
     
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.images(keywords=clean_query, max_results=3))
-            
+            # Берем топ-5 результатов, чтобы точно найти подходящий формат
+            results = list(ddgs.images(keywords=clean_query, max_results=5))
             for res in results:
                 try:
                     img_url = res['image']
-                    img_data = requests.get(img_url, timeout=10).content
-                    img_name = "temp.jpg"
+                    
+                    # Скачиваем картинку
+                    response = requests.get(img_url, timeout=10)
+                    
+                    # Получаем реальный формат файла из заголовков сервера
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    
+                    # СТРОГАЯ ПРОВЕРКА: разрешаем только JPEG и PNG
+                    if 'image/jpeg' in content_type:
+                        img_name = "temp.jpg"
+                    elif 'image/png' in content_type:
+                        img_name = "temp.png"
+                    else:
+                        print(f"Пропускаем: неподдерживаемый Telegram формат ({content_type}) для {img_url}")
+                        continue # Переходим к следующей картинке
+                    
+                    # Если проверка пройдена, сохраняем файл
                     with open(img_name, 'wb') as handler:
-                        handler.write(img_data)
+                        handler.write(response.content)
+                    print(f"Успешно скачан подходящий формат: {img_name}")
                     return img_name 
+                    
                 except Exception as e:
-                    print(f"Не удалось скачать вариант {img_url}: {e}")
+                    print(f"Не удалось обработать вариант {img_url}: {e}")
                     continue 
     except Exception as e:
-        print(f"Ошибка поиска DuckDuckGo: {e}")
+        print(f"Ошибка поиска: {e}")
         
     return None
 
 def translate_tweet(raw_text):
-    # Отрезаем приписки сайтов и даты с помощью Python
     if ' - ' in raw_text:
         clean_text_for_ai = raw_text.rsplit(' - ', 1)[0]
     else:
@@ -64,7 +79,7 @@ def translate_tweet(raw_text):
     Ты — автоматический хоккейный редактор. Переведи твит о НХЛ на живой русский язык.
     
     СТРОГИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ ПОСТА:
-    1. Если в оригинале указан автор (например, "Chris Johnston:" или "David Pagnotta:"), начни перевод с его имени на английском, поставь двоеточие и пробел. Само слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
+    1. Если в оригинале указан автор (например, "Chris Johnston:" или "David Pagnotta:"), начни перевод с его имени на английском, поставь двоеточие и пробел. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
     2. ВАЖНО: Все имена, фамилии хоккеистов и названия команд ПЕРЕВОДИ на русский язык (например: Дилан Ларкин, Алекс Дебринкэт, Детройт).
     3. Убери из текста ВСЕ лишние знаки: кавычки, звездочки. Текст должен быть абсолютно чистым.
     4. Хоккейные термины: Cap hit -> кэпхит, Trade -> обмен, Free agent -> свободный агент.
@@ -91,7 +106,6 @@ def main():
     feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
     history = get_history()
     
-    # Собираем список новых новостей
     new_entries = []
     for entry in reversed(feed.entries[:5]):
         if entry.title not in history:
@@ -103,38 +117,31 @@ def main():
         
     combined_texts = []
     main_search_query = None
+    entries_to_save = []
     
     for entry in new_entries:
         raw_response = translate_tweet(entry.title)
         
         if raw_response:
-            # Разделяем текст и запрос для картинки
             if "SEARCH_QUERY:" in raw_response:
                 parts = raw_response.split("SEARCH_QUERY:")
                 post_text = parts[0].strip()
-                # Берем запрос для фото только из первой попавшейся новости
                 if not main_search_query and len(parts) > 1:
                     main_search_query = parts[1].strip()
             else:
                 post_text = raw_response
             
-            # Делаем имя инсайдера жирным
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
-                # Страховка, если ИИ всё же написал слово "Источник"
                 author = author.replace("Источник", "").strip() 
                 formatted_text = f"<b>{escape_html(author)}:</b> {escape_html(text_content)}"
             else:
                 formatted_text = escape_html(post_text)
                 
             combined_texts.append(formatted_text)
+            entries_to_save.append(entry.title)
             
-            # Сразу записываем в историю, что новость обработана
-            add_to_history(entry.title)
-            
-    # Если есть что публиковать
     if combined_texts:
-        # Склеиваем все новости через пустую строку
         final_post = "\n\n".join(combined_texts)
         
         image_path = None
@@ -146,23 +153,33 @@ def main():
             image_path = download_image("NHL ice hockey match action")
         
         try:
-            # В Telegram лимит текста под фото - 1024 символа
+            image_sent = False
             if image_path and os.path.exists(image_path):
-                with open(image_path, 'rb') as photo:
-                    if len(final_post) <= 1024:
-                        # Если текст влез в лимит — шлем одним постом
-                        bot.send_photo(CHANNEL_ID, photo, caption=final_post, parse_mode='HTML')
-                    else:
-                        # Если накопилось слишком много текста — шлем фото отдельно, текст отдельно
-                        bot.send_photo(CHANNEL_ID, photo)
-                        bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
-                os.remove(image_path)
-                print("✅ Сводный пост с картинкой отправлен!")
-            else:
+                try:
+                    with open(image_path, 'rb') as photo:
+                        if len(final_post) <= 1024:
+                            bot.send_photo(CHANNEL_ID, photo, caption=final_post, parse_mode='HTML')
+                        else:
+                            bot.send_photo(CHANNEL_ID, photo)
+                            bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
+                    image_sent = True
+                except Exception as e:
+                    print(f"⚠️ Telegram все равно отклонил этот файл: {e}")
+                finally:
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+            
+            if not image_sent:
                 bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
-                print("⚠️ Сводный пост отправлен БЕЗ картинки.")
+                print("✅ Пост отправлен БЕЗ картинки (сработал запасной план).")
+            else:
+                print("✅ Сводный пост с валидной картинкой отправлен успешно!")
+                
+            for title in entries_to_save:
+                add_to_history(title)
+                
         except Exception as e:
-            print(f"❌ Ошибка отправки в Telegram: {e}")
+            print(f"❌ Критическая ошибка отправки: {e}")
 
 if __name__ == "__main__":
     main()
