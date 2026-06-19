@@ -1,0 +1,27 @@
+name: NHL News Bot
+on:
+  schedule:
+    - cron: '0 * * * *' # Раз в час
+  workflow_dispatch: # Позволяет запустить вручную
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with: {python-version: '3.9'}
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+      - name: Run bot
+        run: python nhl_bot.py
+        env:
+          TOKEN: ${{ secrets.TOKEN }}
+      - name: Commit history
+        run: |
+          git config --global user.name "Bot"
+          git config --global user.email "bot@bot.com"
+          git add history.txt
+          git commit -m "Update history" || exit 0
+          git push
