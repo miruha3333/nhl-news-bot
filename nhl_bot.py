@@ -8,7 +8,7 @@ from ddgs import DDGS
 
 # Вставь свой ID канала
 TOKEN = os.environ.get('TOKEN') 
-CHANNEL_ID = '-1004423088204' 
+CHANNEL_ID = '-100XXXXXXXXXX' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
@@ -27,45 +27,57 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def download_image(query):
-    """Ищет чистые картинки и строго фильтрует форматы JPG/PNG"""
+    """Ищет картинки, маскируясь под браузер, и находит валидный JPG/PNG"""
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
     print(f"Ищем чистую картинку по запросу: {clean_query}")
     time.sleep(2)
     
+    # Заголовки, чтобы сайты думали, что качает человек, а не бот
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    }
+    
     try:
         with DDGS() as ddgs:
-            # Берем топ-5 результатов, чтобы точно найти подходящий формат
-            results = list(ddgs.images(keywords=clean_query, max_results=5))
+            # Берем 10 результатов для максимального выбора
+            results = list(ddgs.images(keywords=clean_query, max_results=10))
+            
             for res in results:
                 try:
                     img_url = res['image']
                     
-                    # Скачиваем картинку
-                    response = requests.get(img_url, timeout=10)
+                    # Скачиваем с фейковым браузерным юзер-агентом
+                    response = requests.get(img_url, headers=headers, timeout=10)
                     
-                    # Получаем реальный формат файла из заголовков сервера
+                    if response.status_code != 200:
+                        continue
+                        
                     content_type = response.headers.get('Content-Type', '').lower()
                     
-                    # СТРОГАЯ ПРОВЕРКА: разрешаем только JPEG и PNG
-                    if 'image/jpeg' in content_type:
+                    # Проверяем формат
+                    if 'image/jpeg' in content_type or 'image/jpg' in content_type:
                         img_name = "temp.jpg"
                     elif 'image/png' in content_type:
                         img_name = "temp.png"
                     else:
-                        print(f"Пропускаем: неподдерживаемый Telegram формат ({content_type}) для {img_url}")
-                        continue # Переходим к следующей картинке
+                        # Пропускаем webp и прочий мусор, который не ест Телега
+                        print(f"Пропуск (формат {content_type}): {img_url}")
+                        continue 
                     
-                    # Если проверка пройдена, сохраняем файл
+                    # Проверяем, что картинка не пустая (больше 5 КБ)
+                    if len(response.content) < 5000:
+                        continue
+
                     with open(img_name, 'wb') as handler:
                         handler.write(response.content)
-                    print(f"Успешно скачан подходящий формат: {img_name}")
+                    print(f"Успешно скачан рабочий файл: {img_name} ({content_type})")
                     return img_name 
                     
                 except Exception as e:
                     print(f"Не удалось обработать вариант {img_url}: {e}")
                     continue 
     except Exception as e:
-        print(f"Ошибка поиска: {e}")
+        print(f"Ошибка поиска картинок: {e}")
         
     return None
 
@@ -170,8 +182,9 @@ def main():
                         os.remove(image_path)
             
             if not image_sent:
+                # Если ВСЕ 10 картинок оказались невалидными, шлем хотя бы текст
                 bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
-                print("✅ Пост отправлен БЕЗ картинки (сработал запасной план).")
+                print("⚠️ Пост отправлен БЕЗ картинки (все 10 вариантов не подошли).")
             else:
                 print("✅ Сводный пост с валидной картинкой отправлен успешно!")
                 
