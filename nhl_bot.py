@@ -4,14 +4,21 @@ import telebot
 import os
 import time
 import requests
+import difflib
 from ddgs import DDGS
 
-# Вставь свой ID канала
 TOKEN = os.environ.get('TOKEN') 
 CHANNEL_ID = '-1004423088204' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
+
+# --- СЛОВАРЬ ИМЕН ---
+# Заполняй его теми игроками, которых ИИ постоянно коверкает
+NAMES_DICT = {
+    "Carson Carels": "Карсон Карелс",
+    "Alberts Smits": "Альберт Шмидтс"
+}
 
 def get_history():
     if not os.path.exists(HISTORY_FILE): 
@@ -26,78 +33,96 @@ def add_to_history(title):
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
+def is_duplicate(new_text, existing_texts):
+    """Проверяет, нет ли в посте слишком похожего текста (защита от дублей)"""
+    for text in existing_texts:
+        # Если тексты совпадают на 80% и более - это дубль
+        similarity = difflib.SequenceMatcher(None, new_text, text).ratio()
+        if similarity > 0.8:
+            return True
+    return False
+
 def download_image(query):
-    """Ищет картинки, маскируясь под браузер, и находит валидный JPG/PNG"""
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
     print(f"Ищем чистую картинку по запросу: {clean_query}")
     time.sleep(2)
     
-    # Заголовки, чтобы сайты думали, что качает человек, а не бот
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
     }
+    
+    # Черный список слов в URL (броня от водяных знаков)
+    bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
     
     try:
         with DDGS() as ddgs:
-            # ИССПРАВЛЕНО: используем query= вместо keywords= согласно новой версии библиотеки
-            results = list(ddgs.images(query=clean_query, max_results=10))
+            results = list(ddgs.images(query=clean_query, max_results=15))
             
             for res in results:
                 try:
-                    img_url = res['image']
+                    img_url = res['image'].lower()
                     
-                    # Скачиваем с фейковым браузерным юзер-агентом
-                    response = requests.get(img_url, headers=headers, timeout=10)
-                    
+                    # Если в ссылке есть стоковый сайт - сразу пропускаем
+                    if any(bad in img_url for bad in bad_url_words):
+                        print(f"Пропуск (копирайт в URL): {img_url}")
+                        continue
+                        
+                    response = requests.get(res['image'], headers=headers, timeout=10)
                     if response.status_code != 200:
                         continue
                         
                     content_type = response.headers.get('Content-Type', '').lower()
-                    
-                    # Проверяем формат
                     if 'image/jpeg' in content_type or 'image/jpg' in content_type:
                         img_name = "temp.jpg"
                     elif 'image/png' in content_type:
                         img_name = "temp.png"
                     else:
-                        print(f"Пропуск (формат {content_type}): {img_url}")
                         continue 
                     
-                    # Проверяем, что картинка не пустая (больше 5 КБ)
                     if len(response.content) < 5000:
                         continue
 
                     with open(img_name, 'wb') as handler:
                         handler.write(response.content)
-                    print(f"Успешно скачан рабочий файл: {img_name} ({content_type})")
+                    print(f"Успешно скачан рабочий файл: {img_name}")
                     return img_name 
                     
                 except Exception as e:
-                    print(f"Не удалось обработать вариант {img_url}: {e}")
                     continue 
     except Exception as e:
         print(f"Ошибка поиска картинок: {e}")
         
     return None
 
+def preprocess_text(text):
+    """Меняет сложные имена ДО отправки в ИИ"""
+    for eng_name, rus_name in NAMES_DICT.items():
+        # Чтобы не ломать английский запрос поиска, мы можем делать замену аккуратно,
+        # но для простоты переводим сразу. ИИ всё равно поймет контекст.
+        text = text.replace(eng_name, rus_name)
+    return text
+
 def translate_tweet(raw_text):
-    if ' - ' in raw_text:
-        clean_text_for_ai = raw_text.rsplit(' - ', 1)[0]
+    # Предобработка сложных имен
+    clean_text = preprocess_text(raw_text)
+    
+    if ' - ' in clean_text:
+        clean_text_for_ai = clean_text.rsplit(' - ', 1)[0]
     else:
-        clean_text_for_ai = raw_text
+        clean_text_for_ai = clean_text
 
     prompt = f"""
-    Ты — автоматический хоккейный редактор. Переведи твит о НХЛ на живой русский язык.
+    Ты — профессиональный хоккейный журналист, редактор и эксперт по НХЛ. Переведи инсайд на безупречный, живой и литературный русский язык.
+
+    СТРОГИЕ ПРАВИЛА:
+    1. Качество: Никакого машинного перевода! Строй предложения логично. Текст не должен вызывать смех. 
+    2. Автор: Если в оригинале указан автор (напр. "Chris Johnston:"), начни с его имени по-английски и поставь двоеточие. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
+    3. Имена: Переводи имена и названия команд на русский.
+    4. Очистка от мусора: Безжалостно УДАЛЯЙ названия радиошоу, подкастов, приписки в духе "Мелник ин зе Афтернун", "Fourth Period" и даты в конце текста. Оставляй только саму новость.
+    5. Выдай только готовый текст.
+    6. В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
     
-    СТРОГИЕ ПРАВИЛА ФОРМАТИРОВАНИЯ ПОСТА:
-    1. Если в оригинале указан автор (например, "Chris Johnston:" или "David Pagnotta:"), начни перевод с его имени на английском, поставь двоеточие и пробел. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
-    2. ВАЖНО: Все имена, фамилии хоккеистов и названия команд ПЕРЕВОДИ на русский язык (например: Дилан Ларкин, Алекс Дебринкэт, Детройт).
-    3. Убери из текста ВСЕ лишние знаки: кавычки, звездочки. Текст должен быть абсолютно чистым.
-    4. Хоккейные термины: Cap hit -> кэпхит, Trade -> обмен, Free agent -> свободный агент.
-    5. Выдай только готовый текст. Никаких вводных фраз.
-    6. В самой последней строке ответа напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
-    
-    Оригинальный текст: "{clean_text_for_ai}"
+    Оригинал: "{clean_text_for_ai}"
     """
     
     for attempt in range(3):
@@ -107,8 +132,7 @@ def translate_tweet(raw_text):
                 messages=[{"role": "user", "content": prompt}]
             )
             if response:
-                clean_response = response.replace("**", "").replace('"', "").replace("«", "").replace("»", "")
-                return clean_response.strip()
+                return response.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
         except:
             time.sleep(2)
     return None
@@ -118,7 +142,7 @@ def main():
     history = get_history()
     
     new_entries = []
-    for entry in reversed(feed.entries[:5]):
+    for entry in reversed(feed.entries[:10]):
         if entry.title not in history:
             new_entries.append(entry)
             
@@ -127,6 +151,7 @@ def main():
         return
         
     combined_texts = []
+    pure_texts_for_diff = [] # Список для сравнения текстов на дубли
     main_search_query = None
     entries_to_save = []
     
@@ -134,19 +159,35 @@ def main():
         raw_response = translate_tweet(entry.title)
         
         if raw_response:
+            # Надежное разделение текста и SEARCH_QUERY
             if "SEARCH_QUERY:" in raw_response:
-                parts = raw_response.split("SEARCH_QUERY:")
-                post_text = parts[0].strip()
-                if not main_search_query and len(parts) > 1:
-                    main_search_query = parts[1].strip()
+                idx = raw_response.rfind("SEARCH_QUERY:")
+                post_text = raw_response[:idx].strip()
+                query_part = raw_response[idx:].replace("SEARCH_QUERY:", "").strip()
+                if not main_search_query and query_part:
+                    main_search_query = query_part
             else:
                 post_text = raw_response
             
+            # Разбираем на автора и текст
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
                 author = author.replace("Источник", "").strip() 
-                formatted_text = f"<b>{escape_html(author)}:</b> {escape_html(text_content)}"
+                
+                # Защита от дублирующихся новостей
+                if is_duplicate(text_content, pure_texts_for_diff):
+                    print(f"Найден дубль, пропускаем: {text_content[:30]}...")
+                    entries_to_save.append(entry.title) # Сохраняем в историю, чтобы больше не парсить
+                    continue
+                
+                pure_texts_for_diff.append(text_content)
+                # Выделяем субъекта (автора) жирным, а сам текст переносим на строку ниже
+                formatted_text = f"<b>{escape_html(author)}</b>\n{escape_html(text_content)}"
             else:
+                if is_duplicate(post_text, pure_texts_for_diff):
+                    entries_to_save.append(entry.title)
+                    continue
+                pure_texts_for_diff.append(post_text)
                 formatted_text = escape_html(post_text)
                 
             combined_texts.append(formatted_text)
@@ -160,7 +201,6 @@ def main():
             image_path = download_image(main_search_query)
             
         if not image_path:
-            print("План Б: ищем дефолтную картинку...")
             image_path = download_image("NHL ice hockey match action")
         
         try:
@@ -175,22 +215,19 @@ def main():
                             bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
                     image_sent = True
                 except Exception as e:
-                    print(f"⚠️ Telegram все равно отклонил этот файл: {e}")
+                    print(f"⚠️ Telegram отклонил файл: {e}")
                 finally:
                     if os.path.exists(image_path):
                         os.remove(image_path)
             
             if not image_sent:
                 bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
-                print("⚠️ Пост отправлен БЕЗ картинки (все 10 вариантов не подошли).")
-            else:
-                print("✅ Сводный пост с валидной картинкой отправлен успешно!")
-                
+            
             for title in entries_to_save:
                 add_to_history(title)
                 
         except Exception as e:
-            print(f"❌ Критическая ошибка отправки: {e}")
+            print(f"❌ Ошибка отправки: {e}")
 
 if __name__ == "__main__":
     main()
