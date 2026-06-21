@@ -5,12 +5,12 @@ import time
 import requests
 import difflib
 from google import genai
-from ddgs import DDGS
+from duckduckgo_search import DDGS  # <-- Исправленный импорт
 
 # --- НАСТРОЙКИ ДОСТУПА ---
 TOKEN = os.environ.get('TOKEN') 
 # ВСТАВЬ НИЖЕ СВОЙ ID КАНАЛА:
-CHANNEL_ID = '-1004423088204' 
+CHANNEL_ID = '-100XXXXXXXXXX' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
@@ -72,38 +72,39 @@ def download_image(query):
     bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
     
     try:
-        with DDGS() as ddgs:
-            results = list(ddgs.images(query=clean_query, max_results=15))
-            
-            for res in results:
-                try:
-                    img_url = res['image'].lower()
+        # Обновленный синтаксис для свежей версии duckduckgo_search
+        ddgs = DDGS()
+        results = list(ddgs.images(keywords=clean_query, max_results=15))
+        
+        for res in results:
+            try:
+                img_url = res.get('image', '').lower()
+                
+                if any(bad in img_url for bad in bad_url_words):
+                    continue
                     
-                    if any(bad in img_url for bad in bad_url_words):
-                        continue
-                        
-                    response = requests.get(res['image'], headers=headers, timeout=10)
-                    if response.status_code != 200:
-                        continue
-                        
-                    content_type = response.headers.get('Content-Type', '').lower()
-                    if 'image/jpeg' in content_type or 'image/jpg' in content_type:
-                        img_name = "temp.jpg"
-                    elif 'image/png' in content_type:
-                        img_name = "temp.png"
-                    else:
-                        continue 
+                response = requests.get(res['image'], headers=headers, timeout=10)
+                if response.status_code != 200:
+                    continue
                     
-                    if len(response.content) < 5000:
-                        continue
-
-                    with open(img_name, 'wb') as handler:
-                        handler.write(response.content)
-                    print(f"Успешно скачан рабочий файл: {img_name}")
-                    return img_name 
-                    
-                except Exception:
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'image/jpeg' in content_type or 'image/jpg' in content_type:
+                    img_name = "temp.jpg"
+                elif 'image/png' in content_type:
+                    img_name = "temp.png"
+                else:
                     continue 
+                
+                if len(response.content) < 5000:
+                    continue
+
+                with open(img_name, 'wb') as handler:
+                    handler.write(response.content)
+                print(f"Успешно скачан рабочий файл: {img_name}")
+                return img_name 
+                
+            except Exception:
+                continue 
     except Exception as e:
         print(f"Ошибка поиска картинок: {e}")
         
