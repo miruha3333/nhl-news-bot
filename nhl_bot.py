@@ -7,15 +7,20 @@ import difflib
 from google import genai
 from ddgs import DDGS
 
+# --- НАСТРОЙКИ ДОСТУПА ---
 TOKEN = os.environ.get('TOKEN') 
-CHANNEL_ID = '-100XXXXXXXXXX' 
+# ВСТАВЬ НИЖЕ СВОЙ ID КАНАЛА:
+CHANNEL_ID = '-1004423088204' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 
-# Инициализируем официального клиента Gemini
-# Он автоматически подтянет переменную GEMINI_API_KEY из окружения GitHub Actions
-gemini_client = genai.Client()
+# --- ИНИЦИАЛИЗАЦИЯ GEMINI ---
+api_key_gemini = os.environ.get('GEMINI_API_KEY')
+if not api_key_gemini:
+    raise ValueError("❌ Критическая ошибка: Секрет GEMINI_API_KEY не найден! Проверь настройки GitHub Actions (Secrets) и файл .yml.")
+
+gemini_client = genai.Client(api_key=api_key_gemini)
 
 # --- СЛОВАРЬ ИМЕН ---
 NAMES_DICT = {
@@ -30,7 +35,7 @@ def get_history():
         return set(line.strip() for line in f)
 
 def add_to_history(title):
-    """Добавляет новость и оставляет в файле только последние 100 актуальных записей"""
+    """Сохраняет историю и автоматически обрезает ее до 100 последних постов"""
     lines = []
     if os.path.exists(HISTORY_FILE):
         with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -49,7 +54,6 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def is_duplicate(new_text, existing_texts):
-    """Проверяет, нет ли в посте слишком похожего текста (защита от дублей)"""
     for text in existing_texts:
         similarity = difflib.SequenceMatcher(None, new_text, text).ratio()
         if similarity > 0.8:
@@ -76,7 +80,6 @@ def download_image(query):
                     img_url = res['image'].lower()
                     
                     if any(bad in img_url for bad in bad_url_words):
-                        print(f"Пропуск (копирайт в URL): {img_url}")
                         continue
                         
                     response = requests.get(res['image'], headers=headers, timeout=10)
@@ -99,7 +102,7 @@ def download_image(query):
                     print(f"Успешно скачан рабочий файл: {img_name}")
                     return img_name 
                     
-                except Exception as e:
+                except Exception:
                     continue 
     except Exception as e:
         print(f"Ошибка поиска картинок: {e}")
@@ -135,7 +138,6 @@ def translate_tweet(raw_text):
     
     for attempt in range(3):
         try:
-            # Делаем официальный запрос к актуальной модели Gemini
             response = gemini_client.models.generate_content(
                 model='gemini-2.5-flash',
                 contents=prompt,
@@ -183,7 +185,6 @@ def main():
                 author = author.replace("Источник", "").strip() 
                 
                 if is_duplicate(text_content, pure_texts_for_diff):
-                    print(f"Найден дубль, пропускаем: {text_content[:30]}...")
                     entries_to_save.append(entry.title) 
                     continue
                 
