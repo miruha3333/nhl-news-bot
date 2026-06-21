@@ -1,27 +1,38 @@
-name: NHL News Bot
+name: Run NHL Bot
+
 on:
   schedule:
-    - cron: '0 * * * *' # Раз в час
-  workflow_dispatch: # Позволяет запустить вручную
+    - cron: "0 * * * *" # Запуск каждый час, можешь поменять под себя
+  workflow_dispatch: # Позволяет запускать скрипт вручную по кнопке
 
 jobs:
-  build:
+  run-bot:
     runs-on: ubuntu-latest
+
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
       - name: Set up Python
-        uses: actions/setup-python@v4
-        with: {python-version: '3.9'}
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10' # Используем современную версию Python
+
       - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run bot
-        run: python nhl_bot.py
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run bot script
         env:
           TOKEN: ${{ secrets.TOKEN }}
-      - name: Commit history
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+        run: python nhl_bot.py
+
+      - name: Commit history file
         run: |
-          git config --global user.name "Bot"
-          git config --global user.email "bot@bot.com"
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add history.txt
-          git commit -m "Update history" || exit 0
+          git commit -m "Update history.txt" || echo "No changes to commit"
           git push
