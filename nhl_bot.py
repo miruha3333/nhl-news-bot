@@ -10,7 +10,7 @@ from duckduckgo_search import DDGS  # <-- Исправленный импорт
 # --- НАСТРОЙКИ ДОСТУПА ---
 TOKEN = os.environ.get('TOKEN') 
 # ВСТАВЬ НИЖЕ СВОЙ ID КАНАЛА:
-CHANNEL_ID = '-100XXXXXXXXXX' 
+CHANNEL_ID = '-1004423088204' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
