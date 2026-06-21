@@ -1,23 +1,26 @@
-import g4f
 import feedparser
 import telebot
 import os
 import time
 import requests
 import difflib
+from google import genai
 from ddgs import DDGS
 
 TOKEN = os.environ.get('TOKEN') 
-CHANNEL_ID = '-1004423088204' 
+CHANNEL_ID = '-100XXXXXXXXXX' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 
+# Инициализируем официального клиента Gemini
+# Он автоматически подтянет переменную GEMINI_API_KEY из окружения GitHub Actions
+gemini_client = genai.Client()
+
 # --- СЛОВАРЬ ИМЕН ---
-# Заполняй его теми игроками, которых ИИ постоянно коверкает
 NAMES_DICT = {
-    "Carson Carels": "Карсон Карелс",
-    "Alberts Smits": "Альберт Шмидтс"
+    "Carson Carels": "Карсон Кулеш",
+    "Alberts Smits": "Альберт Шмидт"
 }
 
 def get_history():
@@ -27,8 +30,20 @@ def get_history():
         return set(line.strip() for line in f)
 
 def add_to_history(title):
-    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-        f.write(title + "\n")
+    """Добавляет новость и оставляет в файле только последние 100 актуальных записей"""
+    lines = []
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    
+    if title not in lines:
+        lines.append(title)
+    
+    lines = lines[-100:]
+    
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
 
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
@@ -36,7 +51,6 @@ def escape_html(text):
 def is_duplicate(new_text, existing_texts):
     """Проверяет, нет ли в посте слишком похожего текста (защита от дублей)"""
     for text in existing_texts:
-        # Если тексты совпадают на 80% и более - это дубль
         similarity = difflib.SequenceMatcher(None, new_text, text).ratio()
         if similarity > 0.8:
             return True
@@ -51,7 +65,6 @@ def download_image(query):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # Черный список слов в URL (броня от водяных знаков)
     bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
     
     try:
@@ -62,7 +75,6 @@ def download_image(query):
                 try:
                     img_url = res['image'].lower()
                     
-                    # Если в ссылке есть стоковый сайт - сразу пропускаем
                     if any(bad in img_url for bad in bad_url_words):
                         print(f"Пропуск (копирайт в URL): {img_url}")
                         continue
@@ -95,15 +107,11 @@ def download_image(query):
     return None
 
 def preprocess_text(text):
-    """Меняет сложные имена ДО отправки в ИИ"""
     for eng_name, rus_name in NAMES_DICT.items():
-        # Чтобы не ломать английский запрос поиска, мы можем делать замену аккуратно,
-        # но для простоты переводим сразу. ИИ всё равно поймет контекст.
         text = text.replace(eng_name, rus_name)
     return text
 
 def translate_tweet(raw_text):
-    # Предобработка сложных имен
     clean_text = preprocess_text(raw_text)
     
     if ' - ' in clean_text:
@@ -115,10 +123,10 @@ def translate_tweet(raw_text):
     Ты — профессиональный хоккейный журналист, редактор и эксперт по НХЛ. Переведи инсайд на безупречный, живой и литературный русский язык.
 
     СТРОГИЕ ПРАВИЛА:
-    1. Качество: Никакого машинного перевода! Строй предложения логично. Текст не должен вызывать смех. 
+    1. Качество: Никакого машинного перевода! Строй предложения логично. Текст должен быть авторитетным и серьезным. 
     2. Автор: Если в оригинале указан автор (напр. "Chris Johnston:"), начни с его имени по-английски и поставь двоеточие. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
-    3. Имена: Переводи имена и названия команд на русский.
-    4. Очистка от мусора: Безжалостно УДАЛЯЙ названия радиошоу, подкастов, приписки в духе "Мелник ин зе Афтернун", "Fourth Period" и даты в конце текста. Оставляй только саму новость.
+    3. Имена: Переводи все имена, фамилии хоккеистов и названия команд на русский язык.
+    4. Очистка от мусора: Безжалостно УДАЛЯЙ названия радиошоу, подкастов, приписки в духе "Мелник ин зе Афтернун", "Fourth Period" и даты в конце текста. Оставляй только саму хоккейную новость.
     5. Выдай только готовый текст.
     6. В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
     
@@ -127,13 +135,15 @@ def translate_tweet(raw_text):
     
     for attempt in range(3):
         try:
-            response = g4f.ChatCompletion.create(
-                model=g4f.models.gpt_4o, 
-                messages=[{"role": "user", "content": prompt}]
+            # Делаем официальный запрос к актуальной модели Gemini
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
             )
-            if response:
-                return response.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-        except:
+            if response and response.text:
+                return response.text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception as e:
+            print(f"Ошибка Gemini (попытка {attempt+1}): {e}")
             time.sleep(2)
     return None
 
@@ -151,7 +161,7 @@ def main():
         return
         
     combined_texts = []
-    pure_texts_for_diff = [] # Список для сравнения текстов на дубли
+    pure_texts_for_diff = [] 
     main_search_query = None
     entries_to_save = []
     
@@ -159,7 +169,6 @@ def main():
         raw_response = translate_tweet(entry.title)
         
         if raw_response:
-            # Надежное разделение текста и SEARCH_QUERY
             if "SEARCH_QUERY:" in raw_response:
                 idx = raw_response.rfind("SEARCH_QUERY:")
                 post_text = raw_response[:idx].strip()
@@ -169,19 +178,16 @@ def main():
             else:
                 post_text = raw_response
             
-            # Разбираем на автора и текст
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
                 author = author.replace("Источник", "").strip() 
                 
-                # Защита от дублирующихся новостей
                 if is_duplicate(text_content, pure_texts_for_diff):
                     print(f"Найден дубль, пропускаем: {text_content[:30]}...")
-                    entries_to_save.append(entry.title) # Сохраняем в историю, чтобы больше не парсить
+                    entries_to_save.append(entry.title) 
                     continue
                 
                 pure_texts_for_diff.append(text_content)
-                # Выделяем субъекта (автора) жирным, а сам текст переносим на строку ниже
                 formatted_text = f"<b>{escape_html(author)}</b>\n{escape_html(text_content)}"
             else:
                 if is_duplicate(post_text, pure_texts_for_diff):
