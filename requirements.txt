@@ -1,4 +1,4 @@
-g4f
+google-genai
 feedparser
 pyTelegramBotAPI
 ddgs
