@@ -1,366 +1,241 @@
-import os
-import sys
-import json
-import re
-import time
-import random
 import feedparser
+import telebot
+import os
+import time
 import requests
-from bs4 import BeautifulSoup
+import difflib
 from google import genai
-from google.genai.errors import APIError
+from duckduckgo_search import DDGS  # <-- Исправленный импорт
 
-# Принудительный перевод окружения на UTF-8 для серверов Linux
-os.environ["LC_ALL"] = "C.UTF-8"
-os.environ["LANG"] = "C.UTF-8"
-os.environ["PYTHONIOENCODING"] = "utf-8"
+# --- НАСТРОЙКИ ДОСТУПА ---
+TOKEN = os.environ.get('TOKEN') 
+# ВСТАВЬ НИЖЕ СВОЙ ID КАНАЛА:
+CHANNEL_ID = '-1004423088204' 
 
-# ==================== НАСТРОЙКИ (БЕЗОПАСНЫЕ) ====================
-# Скрипт автоматически подтягивает ключи из GitHub Secrets
-GEMINI_API_KEY_1 = os.environ.get("GEMINI_API_KEY_1", "")
-GEMINI_API_KEY_2 = os.environ.get("GEMINI_API_KEY_2", "")
-GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GITHUB_TOKEN = os.environ.get("GH_MODELS_TOKEN", "")
+bot = telebot.TeleBot(TOKEN)
+HISTORY_FILE = "history.txt"
 
-# ОФИЦИАЛЬНЫЙ ПОИСК КАРТИНОК GOOGLE
-GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
-GOOGLE_CSE_CX = os.environ.get("GOOGLE_CSE_CX", "")
+# --- ИНИЦИАЛИЗАЦИЯ GEMINI ---
+api_key_gemini = os.environ.get('GEMINI_API_KEY')
+if not api_key_gemini:
+    raise ValueError("❌ Критическая ошибка: Секрет GEMINI_API_KEY не найден! Проверь настройки GitHub Actions (Secrets) и файл .yml.")
 
-OUTPUT_FILE = "hockey_news.txt"
-HISTORY_FILE = "history.json"
+gemini_client = genai.Client(api_key=api_key_gemini)
 
-# Пул красивых дефолтных картинок (на случай тотального бана всех поисковиков)
-DEFAULT_HOCKEY_IMAGES = [
-    "https://images.unsplash.com/photo-1515523110800-9415d13b84a8?q=80&w=1200",  # Шайба на льду
-    "https://images.unsplash.com/photo-1580748141549-71748d60bdc9?q=80&w=1200",  # Хоккейные ворота
-    "https://images.unsplash.com/photo-1547057416-ba97ef66d8b5?q=80&w=1200",  # Хоккейная арена
-    "https://images.unsplash.com/photo-1612872087720-bb876e2e67d1?q=80&w=1200"   # Снаряжение/динамика
-]
-
-# Твой личный хоккейный словарь автозамен
-DICTIONARY_FIXES = {
-    "Гюнтцель": "Генцел",
-    "Гюнтцеля": "Генцела",
-    "Лафренир": "Лафренье",
-    "Ткачак": "Ткачук",
-    "Бифилд": "Байфилд",
-    "Мэтьюс": "Мэттьюс",
-    "Драйсдейл": "Драйсдейл",
-    "Иссон": "Эассон",
-    "Юта Маммут": "Юта",
-    "Юты Маммут": "Юты",
-    "Юта Маммот": "Юта"
+# --- СЛОВАРЬ ИМЕН ---
+NAMES_DICT = {
+    "Carson Carels": "Карсон Кулеш",
+    "Alberts Smits": "Альберт Шмидт"
 }
-# ================================================================
 
-def load_history():
+def get_history():
+    if not os.path.exists(HISTORY_FILE): 
+        return set()
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f)
+
+def add_to_history(title):
+    """Сохраняет историю и автоматически обрезает ее до 100 последних постов"""
+    lines = []
     if os.path.exists(HISTORY_FILE):
-        with open(HISTORY_FILE, 'r', encoding='utf-8') as f:
-            return json.load(f)
-    return {"processed_urls": [], "recent_titles": []}
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    
+    if title not in lines:
+        lines.append(title)
+    
+    lines = lines[-100:]
+    
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
 
-def save_history(history):
-    with open(HISTORY_FILE, 'w', encoding='utf-8') as f:
-        json.dump(history, f, ensure_ascii=False, indent=4)
+def escape_html(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
-def clean_text_with_dict(text):
-    for wrong, right in DICTIONARY_FIXES.items():
-        text = re.sub(r'\b' + wrong + r'\b', right, text)
+def is_duplicate(new_text, existing_texts):
+    for text in existing_texts:
+        similarity = difflib.SequenceMatcher(None, new_text, text).ratio()
+        if similarity > 0.8:
+            return True
+    return False
+
+def download_image(query):
+    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
+    print(f"Ищем чистую картинку по запросу: {clean_query}")
+    time.sleep(2)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
+    
+    try:
+        # Обновленный синтаксис для свежей версии duckduckgo_search
+        ddgs = DDGS()
+        results = list(ddgs.images(keywords=clean_query, max_results=15))
+        
+        for res in results:
+            try:
+                img_url = res.get('image', '').lower()
+                
+                if any(bad in img_url for bad in bad_url_words):
+                    continue
+                    
+                response = requests.get(res['image'], headers=headers, timeout=10)
+                if response.status_code != 200:
+                    continue
+                    
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'image/jpeg' in content_type or 'image/jpg' in content_type:
+                    img_name = "temp.jpg"
+                elif 'image/png' in content_type:
+                    img_name = "temp.png"
+                else:
+                    continue 
+                
+                if len(response.content) < 5000:
+                    continue
+
+                with open(img_name, 'wb') as handler:
+                    handler.write(response.content)
+                print(f"Успешно скачан рабочий файл: {img_name}")
+                return img_name 
+                
+            except Exception:
+                continue 
+    except Exception as e:
+        print(f"Ошибка поиска картинок: {e}")
+        
+    return None
+
+def preprocess_text(text):
+    for eng_name, rus_name in NAMES_DICT.items():
+        text = text.replace(eng_name, rus_name)
     return text
 
-# --- БЛОК ПОИСКА КАРТИНОК (КАСКАДНЫЙ ФОЛЛБЕК) ---
-
-def search_google_images(query):
-    """Метод №1: Официальный Google Custom Search API (Бесплатно 100 запросов/день)"""
-    if not GOOGLE_API_KEY or not GOOGLE_CSE_CX:
-        return None
+def translate_tweet(raw_text):
+    clean_text = preprocess_text(raw_text)
     
-    url = "https://www.googleapis.com/customsearch/v1"
-    params = {
-        "key": GOOGLE_API_KEY,
-        "cx": GOOGLE_CSE_CX,
-        "q": query,
-        "searchType": "image",
-        "num": 1,
-        "safe": "active"
-    }
-    try:
-        response = requests.get(url, params=params, timeout=10)
-        if response.status_code == 200:
-            data = response.json()
-            if "items" in data and len(data["items"]) > 0:
-                return data["items"][0]["link"]
-        elif response.status_code == 429:
-            print("   [!] Google Images API: Исчерпан суточный лимит.")
-    except Exception as e:
-        print(f"   [!] Ошибка Google Images API: {e}")
-    return None
+    if ' - ' in clean_text:
+        clean_text_for_ai = clean_text.rsplit(' - ', 1)[0]
+    else:
+        clean_text_for_ai = clean_text
 
-def search_duckduckgo_images(query):
-    """Метод №2: DuckDuckGo напрямую в обход блокировок (имитация браузера)"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "application/json"
-    }
-    try:
-        token_url = f"https://duckduckgo.com/?q={requests.utils.quote(query)}"
-        res = requests.get(token_url, headers=headers, timeout=10)
-        vqd_match = re.search(r"vqd=([0-9-]+)&", res.text)
-        if not vqd_match:
-            # ИСПРАВЛЕНО: Тройные кавычки спасают от синтаксической ошибки кавычек внутри регулярки
-            vqd_match = re.search(r"""vqd\s*=\s*["']([0-9-]+)["']""", res.text)
-            
-        if vqd_match:
-            vqd = vqd_match.group(1)
-            img_url = "https://duckduckgo.com/i.js"
-            params = {"o": "json", "q": query, "vqd": vqd, "f": ",,,,,", "p": "1"}
-            img_res = requests.get(img_url, headers=headers, params=params, timeout=10)
-            if img_res.status_code == 200:
-                data = img_res.json()
-                if "results" in data and len(data["results"]) > 0:
-                    return data["results"][0]["image"]
-    except Exception:
-        pass
-    return None
-
-def get_smart_image(player_name, team_context="NHL"):
-    """Главный диспетчер картинок. Пробует Google, затем DDG, затем выдает красивый дефолт."""
-    clean_query = f"{player_name} {team_context} photo -getty -alamy -shutterstock -stock -watermark"
-    print(f"   -> Ищем изображение для запроса: {player_name}...")
-    
-    # 1. Пробуем официальный Google API
-    img = search_google_images(clean_query)
-    if img: 
-        print("      Успешно найдено через Google Images API!")
-        return img
-        
-    # 2. Если Google превысил лимит или не настроен — идем в DuckDuckGo
-    print("      Google API недоступен или лимит исчерпан. Пробуем резервный DuckDuckGo...")
-    img = search_duckduckgo_images(clean_query)
-    if img:
-        print("      Успешно найдено через DuckDuckGo!")
-        return img
-        
-    # 3. Тотальный сбой поиска — берем случайную заготовку хоккейного HD-фото
-    default_img = random.choice(DEFAULT_HOCKEY_IMAGES)
-    print(f"      [!] Поисковики заблокированы. Берем красивую заглушку: {default_img}")
-    return default_img
-
-# --- БЛОК ТЕКСТОВЫХ НЕЙРОСЕТЕЙ (КАСКАДНЫЙ ФОЛЛБЕК) ---
-
-def get_prompts(article, recent_titles):
-    system_prompt = f"""
-    Ты — профессиональный хоккейный журналист. Твоя задача — перевести новость на русский язык и адаптировать ее под формат постов в Telegram.
+    prompt = f"""
+    Ты — профессиональный хоккейный журналист, редактор и эксперт по НХЛ. Переведи инсайд на безупречный, живой и литературный русский язык.
 
     СТРОГИЕ ПРАВИЛА:
-    1. Термины: "кэпхит" -> "сумма контракта"; "оборонец" -> "защитник"; "Utah/Utah Mammoths" -> "Юта"; "no-trade clause" -> "полный запрет на обмен". "переход на Остров" -> "переход в стан Островитян".
-    2. ФАКТЫ: Пиши ТОЛЬКО ту информацию, которая есть в тексте. ЗАПРЕЩЕНО брать факты, даты или статистику из своей головы или интернета.
-    3. ОБЪЕМ: Каждая новость строго от 400 до 500 символов. Если инфы мало, разверни мысль автора более глубоким русским литературным языком.
-    4. РАЗДЕЛЕНИЕ: Если текст содержит слухи про РАЗНЫЕ команды/игроков, разбей их на отдельные посты. Разделяй их строкой: ===
-    5. ФОРМАТ ПОСТА: Каждый пост начинается строго с субъекта, от которого исходит новость, выделенного жирным шрифтом, и точки. Пример: **Марк Эассон.** или **Пьер ЛеБрюн.** Никаких слов "Источник:" или "Автор:" в тексте быть категорически не должно! Только само имя.
-    6. ИГРОК ДЛЯ КАРТИНКИ: В САМОЙ ПОСЛЕДНЕЙ СТРОКЕ поста напиши имя главного героя новости на английском языке для поиска картинки, строго в формате: КАРТИНКА: Имя Фамилия. Пример: КАРТИНКА: Connor McDavid. Если главных героев несколько, напиши название команды или лиги, например: КАРТИНКА: Philadelphia Flyers.
-    7. ДУБЛИ: Если вся новость целиком по смыслу совпадает с тем, что уже было в истории ({recent_titles}), верни только одно слово: ДУБЛЬ.
-    """
-    user_prompt = f"Данные автора/источника: {article['source']}\nТекст новости: {article['content']}"
-    return system_prompt, user_prompt
-
-def ask_gemini(api_key, system_prompt, user_prompt):
-    if not api_key: return None
-    try:
-        client = genai.Client(api_key=api_key)
-        full_prompt = system_prompt + "\n\n" + user_prompt
-        response = client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt)
-        return response.text.strip()
-    except APIError as e:
-        if e.code == 429: return "LIMIT"
-        print(f" [!] Ошибка Gemini: {e}", end="")
-        return None
-    except Exception as e:
-        print(f" [!] Ошибка: {e}", end="")
-        return None
-
-def ask_groq(api_key, system_prompt, user_prompt):
-    if not api_key: return None
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "llama3-8b-8192",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-    }
-    try:
-        response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=15)
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content'].strip()
-        elif response.status_code == 429:
-            return "LIMIT"
-        else:
-            print(f" [!] Код Groq: {response.status_code}", end="")
-    except Exception as e:
-        print(f" [!] Ошибка Groq: {e}", end="")
-    return None
-
-def ask_github(api_key, system_prompt, user_prompt):
-    if not api_key: return None
-    headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
-    payload = {
-        "model": "gpt-4o-mini",
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt}
-        ]
-    }
-    try:
-        response = requests.post("https://models.inference.ai.azure.com/chat/completions", headers=headers, json=payload, timeout=15)
-        if response.status_code == 200:
-            return response.json()['choices'][0]['message']['content'].strip()
-        elif response.status_code == 429:
-            return "LIMIT"
-        else:
-            print(f" [!] Код GitHub: {response.status_code}", end="")
-    except Exception as e:
-        print(f" [!] Ошибка GitHub: {e}", end="")
-    return None
-
-def process_news_with_fallback(article, recent_titles_str):
-    system_prompt, user_prompt = get_prompts(article, recent_titles_str)
+    1. Качество: Никакого машинного перевода! Строй предложения логично. Текст должен быть авторитетным и серьезным. 
+    2. Автор: Если в оригинале указан автор (напр. "Chris Johnston:"), начни с его имени по-английски и поставь двоеточие. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
+    3. Имена: Переводи все имена, фамилии хоккеистов и названия команд на русский язык.
+    4. Очистка от мусора: Безжалостно УДАЛЯЙ названия радиошоу, подкастов, приписки в духе "Мелник ин зе Афтернун", "Fourth Period" и даты в конце текста. Оставляй только саму хоккейную новость.
+    5. Выдай только готовый текст.
+    6. В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
     
-    print("   -> Отправка в Gemini (Ключ 1)...", end="")
-    res = ask_gemini(GEMINI_API_KEY_1, system_prompt, user_prompt)
-    if res and res != "LIMIT": 
-        print(" Успешно!")
-        return res
-    if res == "LIMIT": print(" Лимит исчерпан.")
-
-    if GEMINI_API_KEY_2:
-        print("   -> Отправка в Gemini (Ключ 2)...", end="")
-        res = ask_gemini(GEMINI_API_KEY_2, system_prompt, user_prompt)
-        if res and res != "LIMIT": 
-            print(" Успешно!")
-            return res
-        if res == "LIMIT": print(" Лимит исчерпан.")
-
-    print("   -> Отправка в Groq (Llama 3)...", end="")
-    res = ask_groq(GROQ_API_KEY, system_prompt, user_prompt)
-    if res and res != "LIMIT": 
-        print(" Успешно!")
-        return res
-    if res == "LIMIT": print(" Лимит исчерпан.")
-
-    print("   -> Отправка в GitHub (GPT-4o-mini)...", end="")
-    res = ask_github(GITHUB_TOKEN, system_prompt, user_prompt)
-    if res and res != "LIMIT": 
-        print(" Успешно!")
-        return res
-    if res == "LIMIT": print(" Лимит исчерпан.")
-
-    print("   [!] Все доступные нейросети исчерпали лимит. Ждем 60 секунд...")
-    time.sleep(60)
+    Оригинал: "{clean_text_for_ai}"
+    """
+    
+    for attempt in range(3):
+        try:
+            response = gemini_client.models.generate_content(
+                model='gemini-2.5-flash',
+                contents=prompt,
+            )
+            if response and response.text:
+                return response.text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception as e:
+            print(f"Ошибка Gemini (попытка {attempt+1}): {e}")
+            time.sleep(2)
     return None
-
-# --- БЛОК СБОРА НОВОСТЕЙ (ПАРСЕРЫ) ---
-
-def parse_nhl_rumors():
-    print("[Парсер] Проверяем NHL Rumors...")
-    url = "https://nhlrumors.com/feed/"
-    feed = feedparser.parse(url)
-    articles = []
-    for entry in feed.entries:
-        author = entry.get('author', 'NHL Rumors')
-        full_html = entry.content[0].value if 'content' in entry else entry.summary
-        clean_text = BeautifulSoup(full_html, "html.parser").get_text()
-        articles.append({"title": entry.title, "link": entry.link, "source": author, "content": clean_text})
-    return articles
-
-def parse_hockey_feed():
-    print("[Парсер] Проверяем Hockey Feed...")
-    url = "https://www.hockeyfeed.com/nhl-news"
-    articles = []
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        if response.status_code == 200:
-            soup = BeautifulSoup(response.text, 'html.parser')
-            blocks = soup.find_all('a', href=re.compile(r'/nhl-news/'))
-            for block in blocks[:10]:
-                link = block['href']
-                if not link.startswith('http'): link = 'https://www.hockeyfeed.com' + link
-                raw_title = block.get_text().strip()
-                clean_title = re.sub(r'^(Jonathan Larivee|Chris Gosselin|Published).*?ago\s*', '', raw_title, flags=re.IGNORECASE)
-                author = "Hockey Feed"
-                if "Jonathan Larivee" in raw_title: author = "Джонатан Лариве"
-                elif "Chris Gosselin" in raw_title: author = "Крис Госселин"
-                if len(clean_title) > 15:
-                    articles.append({"title": clean_title, "link": link, "source": author, "content": clean_title})
-    except Exception as e:
-        print(f"[Ошибка] Не удалось спарсить Hockey Feed: {e}")
-    return articles
-
-# --- ОСНОВНАЯ УПРАВЛЯЮЩАЯ ЛОГИКА ---
 
 def main():
-    print("[Парсер хоккея запущен]")
-    history = load_history()
-    is_first_run = len(history["processed_urls"]) == 0
-    all_articles = parse_nhl_rumors() + parse_hockey_feed()
-    new_posts_count = 0
+    feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
+    history = get_history()
     
-    for article in all_articles:
-        url = article['link']
-        if url in history["processed_urls"]: continue
+    new_entries = []
+    for entry in reversed(feed.entries[:10]):
+        if entry.title not in history:
+            new_entries.append(entry)
             
-        if is_first_run and new_posts_count >= 3:
-            history["processed_urls"].append(url)
-            history["recent_titles"].append(article['title'])
-            continue
-            
-        print(f"\n[Обработка новостей] Новость: {article['title'][:60]}...")
-        recent_titles_str = ", ".join(history["recent_titles"][-15:])
+    if not new_entries:
+        print("Новых постов нет.")
+        return
         
-        final_text = process_news_with_fallback(article, recent_titles_str)
-        if not final_text: continue
-            
-        if "ДУБЛЬ" in final_text.upper() and len(final_text) < 10:
-            print("   -> Определено как смысловой дубликат. Пропускаем.")
-            history["processed_urls"].append(url)
-            save_history(history)
-            continue
-            
-        history["processed_urls"].append(url)
-        sub_posts = final_text.split("===")
+    combined_texts = []
+    pure_texts_for_diff = [] 
+    main_search_query = None
+    entries_to_save = []
+    
+    for entry in new_entries:
+        raw_response = translate_tweet(entry.title)
         
-        with open(OUTPUT_FILE, "a", encoding="utf-8") as f:
-            for post in sub_posts:
-                clean_post = post.strip()
-                if len(clean_post) < 40: continue
-                
-                # Поиск и извлечение имени игрока/команды для картинки
-                player_search_name = "NHL ice hockey match"
-                image_match = re.search(r"КАРТИНКА:\s*(.*?)$", clean_post, re.IGNORECASE)
-                if image_match:
-                    player_search_name = image_match.group(1).strip()
-                    # Чистим сам пост от технического тега КАРТИНКА
-                    clean_post = clean_post.replace(image_match.group(0), "").strip()
-                
-                # Запускаем каскадный поиск картинки
-                image_url = get_smart_image(player_search_name)
-                
-                # Исправляем ошибки перевода через словарь автозамен
-                clean_post = clean_text_with_dict(clean_post)
-                
-                # Записываем результат в текстовый файл выдачи
-                f.write(f"ФОТО ССЫЛКА: {image_url}\n")
-                f.write(f"{clean_post}\n")
-                f.write("-" * 50 + "\n\n")
-                new_posts_count += 1
-                print("   [+] Пост и изображение успешно сохранены!")
+        if raw_response:
+            if "SEARCH_QUERY:" in raw_response:
+                idx = raw_response.rfind("SEARCH_QUERY:")
+                post_text = raw_response[:idx].strip()
+                query_part = raw_response[idx:].replace("SEARCH_QUERY:", "").strip()
+                if not main_search_query and query_part:
+                    main_search_query = query_part
+            else:
+                post_text = raw_response
             
-        history["recent_titles"].append(article['title'])
-        time.sleep(3)  # Небольшая пауза между статьями
+            if ": " in post_text:
+                author, text_content = post_text.split(": ", 1)
+                author = author.replace("Источник", "").strip() 
+                
+                if is_duplicate(text_content, pure_texts_for_diff):
+                    entries_to_save.append(entry.title) 
+                    continue
+                
+                pure_texts_for_diff.append(text_content)
+                formatted_text = f"<b>{escape_html(author)}</b>\n{escape_html(text_content)}"
+            else:
+                if is_duplicate(post_text, pure_texts_for_diff):
+                    entries_to_save.append(entry.title)
+                    continue
+                pure_texts_for_diff.append(post_text)
+                formatted_text = escape_html(post_text)
+                
+            combined_texts.append(formatted_text)
+            entries_to_save.append(entry.title)
+            
+    if combined_texts:
+        final_post = "\n\n".join(combined_texts)
         
-    save_history(history)
-    print(f"\n[Работа завершена] Новых постов создано: {new_posts_count}")
+        image_path = None
+        if main_search_query:
+            image_path = download_image(main_search_query)
+            
+        if not image_path:
+            image_path = download_image("NHL ice hockey match action")
+        
+        try:
+            image_sent = False
+            if image_path and os.path.exists(image_path):
+                try:
+                    with open(image_path, 'rb') as photo:
+                        if len(final_post) <= 1024:
+                            bot.send_photo(CHANNEL_ID, photo, caption=final_post, parse_mode='HTML')
+                        else:
+                            bot.send_photo(CHANNEL_ID, photo)
+                            bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
+                    image_sent = True
+                except Exception as e:
+                    print(f"⚠️ Telegram отклонил файл: {e}")
+                finally:
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+            
+            if not image_sent:
+                bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
+            
+            for title in entries_to_save:
+                add_to_history(title)
+                
+        except Exception as e:
+            print(f"❌ Ошибка отправки: {e}")
 
 if __name__ == "__main__":
     main()
