@@ -25,6 +25,6 @@ jobs:
 
       - name: Run bot script
         env:
-          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TOKEN: ${{ secrets.TOKEN }}  # Вот теперь имя совпадает со скриншотом!
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python nhl_bot.py
