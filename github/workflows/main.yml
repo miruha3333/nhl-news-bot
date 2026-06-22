@@ -2,8 +2,8 @@ name: Run NHL News Bot
 
 on:
   schedule:
-    - cron: '0 9,15,21 * * *' # Запуск 3 раза в день (время UTC)
-  workflow_dispatch: # Кнопка для ручного запуска
+    - cron: '0 * * * *' # Запуск КАЖДЫЙ ЧАС (в 00 минут)
+  workflow_dispatch: # Кнопка для ручного запуска в любое время
 
 jobs:
   run-bot:
@@ -25,7 +25,6 @@ jobs:
 
       - name: Run bot script
         env:
-          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
-          TELEGRAM_CHANNEL_ID: ${{ secrets.TELEGRAM_CHANNEL_ID }}
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
         run: python nhl_bot.py
