@@ -10,40 +10,48 @@ from bs4 import BeautifulSoup
 from google import genai
 from google.genai.errors import APIError
 
-# Принудительный перевод окружения на UTF-8
+# Принудительный перевод окружения на UTF-8 для серверов Linux
 os.environ["LC_ALL"] = "C.UTF-8"
 os.environ["LANG"] = "C.UTF-8"
 os.environ["PYTHONIOENCODING"] = "utf-8"
 
 # ==================== НАСТРОЙКИ (БЕЗОПАСНЫЕ) ====================
-# Скрипт автоматически подтянет ключи из переменных окружения (GitHub Secrets)
+# Скрипт автоматически подтягивает ключи из GitHub Secrets
 GEMINI_API_KEY_1 = os.environ.get("GEMINI_API_KEY_1", "")
 GEMINI_API_KEY_2 = os.environ.get("GEMINI_API_KEY_2", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
 GITHUB_TOKEN = os.environ.get("GH_MODELS_TOKEN", "")
 
-# ПОИСК КАРТИНОК
+# ОФИЦИАЛЬНЫЙ ПОИСК КАРТИНОК GOOGLE
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
 GOOGLE_CSE_CX = os.environ.get("GOOGLE_CSE_CX", "")
 
 OUTPUT_FILE = "hockey_news.txt"
 HISTORY_FILE = "history.json"
-# ================================================================
 
-# Пул красивых дефолтных картинок (на случай тотального сбоя всех поисковиков)
+# Пул красивых дефолтных картинок (на случай тотального бана всех поисковиков)
 DEFAULT_HOCKEY_IMAGES = [
-    "https://images.unsplash.com/photo-1515523110800-9415d13b84a8?q=80&w=1200", # Шайба на льду
-    "https://images.unsplash.com/photo-1580748141549-71748d60bdc9?q=80&w=1200", # Хоккейные коньки/ворота
-    "https://images.unsplash.com/photo-1547057416-ba97ef66d8b5?q=80&w=1200", # Арена/матч
-    "https://images.unsplash.com/photo-1612872087720-bb876e2e67d1?q=80&w=1200"  # Экипировка/динамика
+    "https://images.unsplash.com/photo-1515523110800-9415d13b84a8?q=80&w=1200",  # Шайба на льду
+    "https://images.unsplash.com/photo-1580748141549-71748d60bdc9?q=80&w=1200",  # Хоккейные ворота
+    "https://images.unsplash.com/photo-1547057416-ba97ef66d8b5?q=80&w=1200",  # Хоккейная арена
+    "https://images.unsplash.com/photo-1612872087720-bb876e2e67d1?q=80&w=1200"   # Снаряжение/динамика
 ]
 
+# Твой личный хоккейный словарь автозамен
 DICTIONARY_FIXES = {
-    "Гюнтцель": "Генцел", "Гюнтцеля": "Генцела", "Лафренир": "Лафренье",
-    "Ткачак": "Ткачук", "Бифилд": "Байфилд", "Мэтьюс": "Мэттьюс",
-    "Юта Маммут": "Юта", "Юты Маммут": "Юты"
+    "Гюнтцель": "Генцел",
+    "Гюнтцеля": "Генцела",
+    "Лафренир": "Лафренье",
+    "Ткачак": "Ткачук",
+    "Бифилд": "Байфилд",
+    "Мэтьюс": "Мэттьюс",
+    "Драйсдейл": "Драйсдейл",
+    "Иссон": "Эассон",
+    "Юта Маммут": "Юта",
+    "Юты Маммут": "Юты",
+    "Юта Маммот": "Юта"
 }
-# ============================================================================
+# ================================================================
 
 def load_history():
     if os.path.exists(HISTORY_FILE):
@@ -57,14 +65,14 @@ def save_history(history):
 
 def clean_text_with_dict(text):
     for wrong, right in DICTIONARY_FIXES.items():
-        text = re.sub(r' ' + wrong + r' ', right, text)
+        text = re.sub(r'\b' + wrong + r'\b', right, text)
     return text
 
-# --- БЛОК ПОИСКА КАРТИНОК (ОФИЦИАЛЬНЫЙ GOOGLE API + ФОЛЛБЕКИ) ---
+# --- БЛОК ПОИСКА КАРТИНОК (КАСКАДНЫЙ ФОЛЛБЕК) ---
 
 def search_google_images(query):
-    """Метод №1: Официальный Google Custom Search API (Бесплатно 100 запросов в сутки)"""
-    if not GOOGLE_API_KEY or "ТВОЙ" in GOOGLE_API_KEY or not GOOGLE_CSE_CX or "ТВОЙ" in GOOGLE_CSE_CX:
+    """Метод №1: Официальный Google Custom Search API (Бесплатно 100 запросов/день)"""
+    if not GOOGLE_API_KEY or not GOOGLE_CSE_CX:
         return None
     
     url = "https://www.googleapis.com/customsearch/v1"
@@ -83,25 +91,24 @@ def search_google_images(query):
             if "items" in data and len(data["items"]) > 0:
                 return data["items"][0]["link"]
         elif response.status_code == 429:
-            print("   [!] Google Images API: Исчерпан суточный лимит (429).")
+            print("   [!] Google Images API: Исчерпан суточный лимит.")
     except Exception as e:
         print(f"   [!] Ошибка Google Images API: {e}")
     return None
 
 def search_duckduckgo_images(query):
-    """Метод №2: DuckDuckGo с обходом блокировок (User-Agent и заголовки)"""
-    # Так как старая библиотека упала, делаем аккуратный прямой запрос с маскировкой под браузер
+    """Метод №2: DuckDuckGo напрямую в обход блокировок (имитация браузера)"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
         "Accept": "application/json"
     }
     try:
-        # Сначала получаем vqd токен, который требует DuckDuckGo
         token_url = f"https://duckduckgo.com/?q={requests.utils.quote(query)}"
         res = requests.get(token_url, headers=headers, timeout=10)
         vqd_match = re.search(r"vqd=([0-9-]+)&", res.text)
         if not vqd_match:
-            vqd_match = re.search(r'vqd\s*=\s*["']([0-9-]+)["']', res.text)
+            # ИСПРАВЛЕНО: Тройные кавычки спасают от синтаксической ошибки кавычек внутри регулярки
+            vqd_match = re.search(r"""vqd\s*=\s*["']([0-9-]+)["']""", res.text)
             
         if vqd_match:
             vqd = vqd_match.group(1)
@@ -117,30 +124,29 @@ def search_duckduckgo_images(query):
     return None
 
 def get_smart_image(player_name, team_context="NHL"):
-    """Главный диспетчер картинок: собирает поисковый запрос и ищет его по каскаду"""
-    # Формируем чистый запрос без водяных знаков
-    clean_query = f"{player_name} {team_context} match photo -getty -alamy -shutterstock -stock -watermark"
-    print(f"   -> Ищем картинку для: {player_name}...")
+    """Главный диспетчер картинок. Пробует Google, затем DDG, затем выдает красивый дефолт."""
+    clean_query = f"{player_name} {team_context} photo -getty -alamy -shutterstock -stock -watermark"
+    print(f"   -> Ищем изображение для запроса: {player_name}...")
     
-    # 1. Пробуем Google API
+    # 1. Пробуем официальный Google API
     img = search_google_images(clean_query)
     if img: 
-        print("      Успешно найдено через Google Images!")
+        print("      Успешно найдено через Google Images API!")
         return img
         
-    # 2. Если Google пуст/лимит, пробуем замаскированный DuckDuckGo
-    print("      Google недоступен. Пробуем резервный DuckDuckGo...")
+    # 2. Если Google превысил лимит или не настроен — идем в DuckDuckGo
+    print("      Google API недоступен или лимит исчерпан. Пробуем резервный DuckDuckGo...")
     img = search_duckduckgo_images(clean_query)
     if img:
         print("      Успешно найдено через DuckDuckGo!")
         return img
         
-    # 3. Тотальный фоллбек — берем случайное крутое хоккейное фото из пула
+    # 3. Тотальный сбой поиска — берем случайную заготовку хоккейного HD-фото
     default_img = random.choice(DEFAULT_HOCKEY_IMAGES)
-    print(f"      [!] Все поисковики заблокированы. Используем базовое фото: {default_img}")
+    print(f"      [!] Поисковики заблокированы. Берем красивую заглушку: {default_img}")
     return default_img
 
-# --- БЛОК НЕЙРОСЕТЕЙ (ТЕКСТ) ---
+# --- БЛОК ТЕКСТОВЫХ НЕЙРОСЕТЕЙ (КАСКАДНЫЙ ФОЛЛБЕК) ---
 
 def get_prompts(article, recent_titles):
     system_prompt = f"""
@@ -152,80 +158,113 @@ def get_prompts(article, recent_titles):
     3. ОБЪЕМ: Каждая новость строго от 400 до 500 символов. Если инфы мало, разверни мысль автора более глубоким русским литературным языком.
     4. РАЗДЕЛЕНИЕ: Если текст содержит слухи про РАЗНЫЕ команды/игроков, разбей их на отдельные посты. Разделяй их строкой: ===
     5. ФОРМАТ ПОСТА: Каждый пост начинается строго с субъекта, от которого исходит новость, выделенного жирным шрифтом, и точки. Пример: **Марк Эассон.** или **Пьер ЛеБрюн.** Никаких слов "Источник:" или "Автор:" в тексте быть категорически не должно! Только само имя.
-    6. ИГРОК: В САМОЙ ПОСЛЕДНЕЙ СТРОКЕ поста напиши имя главного героя новости на английском языке для поиска картинки, строго в формате: КАРТИНКА: Имя Фамилия. Пример: КАРТИНКА: Connor McDavid. Если главных героев несколько или это общий слух про команду, напиши название команды или лиги, например: КАРТИНКА: Philadelphia Flyers.
+    6. ИГРОК ДЛЯ КАРТИНКИ: В САМОЙ ПОСЛЕДНЕЙ СТРОКЕ поста напиши имя главного героя новости на английском языке для поиска картинки, строго в формате: КАРТИНКА: Имя Фамилия. Пример: КАРТИНКА: Connor McDavid. Если главных героев несколько, напиши название команды или лиги, например: КАРТИНКА: Philadelphia Flyers.
     7. ДУБЛИ: Если вся новость целиком по смыслу совпадает с тем, что уже было в истории ({recent_titles}), верни только одно слово: ДУБЛЬ.
     """
-    user_prompt = f"Данные автора/источника: {article['source']}
-Текст новости: {article['content']}"
+    user_prompt = f"Данные автора/источника: {article['source']}\nТекст новости: {article['content']}"
     return system_prompt, user_prompt
 
 def ask_gemini(api_key, system_prompt, user_prompt):
-    if not api_key or "ТВОЙ" in api_key: return None
+    if not api_key: return None
     try:
         client = genai.Client(api_key=api_key)
-        full_prompt = system_prompt + "
-
-" + user_prompt
+        full_prompt = system_prompt + "\n\n" + user_prompt
         response = client.models.generate_content(model="gemini-2.5-flash", contents=full_prompt)
         return response.text.strip()
     except APIError as e:
         if e.code == 429: return "LIMIT"
+        print(f" [!] Ошибка Gemini: {e}", end="")
         return None
-    except Exception:
+    except Exception as e:
+        print(f" [!] Ошибка: {e}", end="")
         return None
 
 def ask_groq(api_key, system_prompt, user_prompt):
-    if not api_key or "ТВОЙ" in api_key: return None
+    if not api_key: return None
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": "llama3-8b-8192",
-        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
     }
     try:
         response = requests.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload, timeout=15)
-        if response.status_code == 200: return response.json()['choices'][0]['message']['content'].strip()
-        elif response.status_code == 429: return "LIMIT"
-    except Exception: pass
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content'].strip()
+        elif response.status_code == 429:
+            return "LIMIT"
+        else:
+            print(f" [!] Код Groq: {response.status_code}", end="")
+    except Exception as e:
+        print(f" [!] Ошибка Groq: {e}", end="")
     return None
 
 def ask_github(api_key, system_prompt, user_prompt):
-    if not api_key or "ТВОЙ" in api_key: return None
+    if not api_key: return None
     headers = {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"}
     payload = {
         "model": "gpt-4o-mini",
-        "messages": [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}]
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt}
+        ]
     }
     try:
         response = requests.post("https://models.inference.ai.azure.com/chat/completions", headers=headers, json=payload, timeout=15)
-        if response.status_code == 200: return response.json()['choices'][0]['message']['content'].strip()
-        elif response.status_code == 429: return "LIMIT"
-    except Exception: pass
+        if response.status_code == 200:
+            return response.json()['choices'][0]['message']['content'].strip()
+        elif response.status_code == 429:
+            return "LIMIT"
+        else:
+            print(f" [!] Код GitHub: {response.status_code}", end="")
+    except Exception as e:
+        print(f" [!] Ошибка GitHub: {e}", end="")
     return None
 
 def process_news_with_fallback(article, recent_titles_str):
     system_prompt, user_prompt = get_prompts(article, recent_titles_str)
     
+    print("   -> Отправка в Gemini (Ключ 1)...", end="")
     res = ask_gemini(GEMINI_API_KEY_1, system_prompt, user_prompt)
-    if res and res != "LIMIT": return res
+    if res and res != "LIMIT": 
+        print(" Успешно!")
+        return res
+    if res == "LIMIT": print(" Лимит исчерпан.")
 
     if GEMINI_API_KEY_2:
+        print("   -> Отправка в Gemini (Ключ 2)...", end="")
         res = ask_gemini(GEMINI_API_KEY_2, system_prompt, user_prompt)
-        if res and res != "LIMIT": return res
+        if res and res != "LIMIT": 
+            print(" Успешно!")
+            return res
+        if res == "LIMIT": print(" Лимит исчерпан.")
 
-    if GROQ_API_KEY:
-        res = ask_groq(GROQ_API_KEY, system_prompt, user_prompt)
-        if res and res != "LIMIT": return res
+    print("   -> Отправка в Groq (Llama 3)...", end="")
+    res = ask_groq(GROQ_API_KEY, system_prompt, user_prompt)
+    if res and res != "LIMIT": 
+        print(" Успешно!")
+        return res
+    if res == "LIMIT": print(" Лимит исчерпан.")
 
-    if GITHUB_TOKEN:
-        res = ask_github(GITHUB_TOKEN, system_prompt, user_prompt)
-        if res and res != "LIMIT": return res
+    print("   -> Отправка в GitHub (GPT-4o-mini)...", end="")
+    res = ask_github(GITHUB_TOKEN, system_prompt, user_prompt)
+    if res and res != "LIMIT": 
+        print(" Успешно!")
+        return res
+    if res == "LIMIT": print(" Лимит исчерпан.")
 
+    print("   [!] Все доступные нейросети исчерпали лимит. Ждем 60 секунд...")
+    time.sleep(60)
     return None
 
-# --- ПАРСЕРЫ СЛЕНТ ---
+# --- БЛОК СБОРА НОВОСТЕЙ (ПАРСЕРЫ) ---
 
 def parse_nhl_rumors():
-    feed = feedparser.parse("https://nhlrumors.com/feed/")
+    print("[Парсер] Проверяем NHL Rumors...")
+    url = "https://nhlrumors.com/feed/"
+    feed = feedparser.parse(url)
     articles = []
     for entry in feed.entries:
         author = entry.get('author', 'NHL Rumors')
@@ -235,6 +274,7 @@ def parse_nhl_rumors():
     return articles
 
 def parse_hockey_feed():
+    print("[Парсер] Проверяем Hockey Feed...")
     url = "https://www.hockeyfeed.com/nhl-news"
     articles = []
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
@@ -253,11 +293,14 @@ def parse_hockey_feed():
                 elif "Chris Gosselin" in raw_title: author = "Крис Госселин"
                 if len(clean_title) > 15:
                     articles.append({"title": clean_title, "link": link, "source": author, "content": clean_title})
-    except Exception: pass
+    except Exception as e:
+        print(f"[Ошибка] Не удалось спарсить Hockey Feed: {e}")
     return articles
 
+# --- ОСНОВНАЯ УПРАВЛЯЮЩАЯ ЛОГИКА ---
+
 def main():
-    print("[Парсер Скрипт Включен]")
+    print("[Парсер хоккея запущен]")
     history = load_history()
     is_first_run = len(history["processed_urls"]) == 0
     all_articles = parse_nhl_rumors() + parse_hockey_feed()
@@ -272,15 +315,16 @@ def main():
             history["recent_titles"].append(article['title'])
             continue
             
-        print(f"
-[Обработка] Новость: {article['title'][:50]}...")
+        print(f"\n[Обработка новостей] Новость: {article['title'][:60]}...")
         recent_titles_str = ", ".join(history["recent_titles"][-15:])
         
         final_text = process_news_with_fallback(article, recent_titles_str)
         if not final_text: continue
             
         if "ДУБЛЬ" in final_text.upper() and len(final_text) < 10:
+            print("   -> Определено как смысловой дубликат. Пропускаем.")
             history["processed_urls"].append(url)
+            save_history(history)
             continue
             
         history["processed_urls"].append(url)
@@ -291,36 +335,32 @@ def main():
                 clean_post = post.strip()
                 if len(clean_post) < 40: continue
                 
-                # Извлекаем сущность для поиска картинки
-                player_search_name = "NHL ice hockey"
+                # Поиск и извлечение имени игрока/команды для картинки
+                player_search_name = "NHL ice hockey match"
                 image_match = re.search(r"КАРТИНКА:\s*(.*?)$", clean_post, re.IGNORECASE)
                 if image_match:
                     player_search_name = image_match.group(1).strip()
-                    # Удаляем техническую строку из финального текста поста
+                    # Чистим сам пост от технического тега КАРТИНКА
                     clean_post = clean_post.replace(image_match.group(0), "").strip()
                 
-                # Запускаем бессмертный поиск картинки
+                # Запускаем каскадный поиск картинки
                 image_url = get_smart_image(player_search_name)
                 
-                # Очищаем финальный русский текст через словарь
+                # Исправляем ошибки перевода через словарь автозамен
                 clean_post = clean_text_with_dict(clean_post)
                 
-                f.write(f"ФОТО ССЫЛКА: {image_url}
-")
-                f.write(f"{clean_post}
-")
-                f.write("-" * 50 + "
-
-")
+                # Записываем результат в текстовый файл выдачи
+                f.write(f"ФОТО ССЫЛКА: {image_url}\n")
+                f.write(f"{clean_post}\n")
+                f.write("-" * 50 + "\n\n")
                 new_posts_count += 1
-                print(f"   [+] Пост и картинка успешно сохранены!")
+                print("   [+] Пост и изображение успешно сохранены!")
             
         history["recent_titles"].append(article['title'])
-        time.sleep(2)
+        time.sleep(3)  # Небольшая пауза между статьями
         
     save_history(history)
-    print(f"
-[Готово] Работа завершена. Создано постов: {new_posts_count}")
+    print(f"\n[Работа завершена] Новых постов создано: {new_posts_count}")
 
 if __name__ == "__main__":
     main()
