@@ -1,38 +1,240 @@
-name: Run NHL Bot
+import feedparser
+import telebot
+import os
+import time
+import requests
+import difflib
+from openai import OpenAI
+from ddgs import DDGS 
 
-on:
-  schedule:
-    - cron: "0 * * * *" # Запуск каждый час, можешь поменять под себя
-  workflow_dispatch: # Позволяет запускать скрипт вручную по кнопке
+# --- НАСТРОЙКИ ДОСТУПА ---
+TOKEN = os.environ.get('TOKEN') 
+# ОБЯЗАТЕЛЬНО ЗАМЕНИ НА СВОЙ ID КАНАЛА (ДОЛЖЕН НАЧИНАТЬСЯ НА -100):
+CHANNEL_ID = '-1004423088204' 
 
-jobs:
-  run-bot:
-    runs-on: ubuntu-latest
+bot = telebot.TeleBot(TOKEN)
+HISTORY_FILE = "history.txt"
 
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
+# --- ИНИЦИАЛИЗАЦИЯ OPENAI ---
+api_key_openai = os.environ.get('OPENAI_API_KEY')
+if not api_key_openai:
+    raise ValueError("❌ Критическая ошибка: Секрет OPENAI_API_KEY не найден в GitHub Secrets!")
 
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.10' # Используем современную версию Python
+openai_client = OpenAI(api_key=api_key_openai)
 
-      - name: Install dependencies
-        run: |
-          python -m pip install --upgrade pip
-          pip install -r requirements.txt
+# --- СЛОВАРЬ ИМЕН ---
+NAMES_DICT = {
+    "Carson Carels": "Карсон Кулеш",
+    "Alberts Smits": "Альберт Шмидт"
+}
 
-      - name: Run bot script
-        env:
-          TOKEN: ${{ secrets.TOKEN }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-        run: python nhl_bot.py
+def get_history():
+    if not os.path.exists(HISTORY_FILE): 
+        return set()
+    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f)
 
-      - name: Commit history file
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add history.txt
-          git commit -m "Update history.txt" || echo "No changes to commit"
-          git push
+def add_to_history(title):
+    lines = []
+    if os.path.exists(HISTORY_FILE):
+        with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+            lines = [line.strip() for line in f if line.strip()]
+    
+    if title not in lines:
+        lines.append(title)
+    
+    lines = lines[-100:]
+    
+    with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+        for line in lines:
+            f.write(line + "\n")
+
+def escape_html(text):
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+def is_duplicate(new_text, existing_texts):
+    for text in existing_texts:
+        similarity = difflib.SequenceMatcher(None, new_text, text).ratio()
+        if similarity > 0.8:
+            return True
+    return False
+
+def download_image(query):
+    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
+    print(f"Ищем чистую картинку по запросу: {clean_query}")
+    time.sleep(2)
+    
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
+    }
+    
+    bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
+    
+    try:
+        ddgs = DDGS()
+        results = list(ddgs.images(keywords=clean_query, max_results=5))
+        
+        for res in results:
+            try:
+                img_url = res.get('image', '').lower()
+                if any(bad in img_url for bad in bad_url_words):
+                    continue
+                    
+                response = requests.get(res['image'], headers=headers, timeout=10)
+                if response.status_code != 200:
+                    continue
+                    
+                content_type = response.headers.get('Content-Type', '').lower()
+                if 'image/jpeg' in content_type or 'image/jpg' in content_type:
+                    img_name = "temp.jpg"
+                elif 'image/png' in content_type:
+                    img_name = "temp.png"
+                else:
+                    continue 
+                
+                if len(response.content) < 5000:
+                    continue
+
+                with open(img_name, 'wb') as handler:
+                    handler.write(response.content)
+                print(f"Успешно скачан рабочий файл: {img_name}")
+                return img_name 
+                
+            except Exception:
+                continue 
+    except Exception as e:
+        print(f"Пропуск поиска картинок (ограничение или ошибка): {e}")
+        
+    return None
+
+def preprocess_text(text):
+    for eng_name, rus_name in NAMES_DICT.items():
+        text = text.replace(eng_name, rus_name)
+    return text
+
+def translate_tweet(raw_text):
+    clean_text = preprocess_text(raw_text)
+    
+    if ' - ' in clean_text:
+        clean_text_for_ai = clean_text.rsplit(' - ', 1)[0]
+    else:
+        clean_text_for_ai = clean_text
+
+    prompt = f"""
+    Ты — профессиональный хоккейный журналист, редактор и эксперт по НХЛ. Переведи инсайд на безупречный, живой и литературный русский язык.
+
+    СТРОГИЕ ПРАВИЛА:
+    1. Качество: Никакого машинного перевода! Строй предложения логично. Текст должен быть авторитетным и серьезным. 
+    2. Автор: Если в оригинале указан автор (напр. "Chris Johnston:"), начни с его имени по-английски и поставь двоеточие. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
+    3. Имена: Переводи все имена, фамилии хоккеистов и названия команд на русский язык.
+    4. Очистка от мусора: Безжалостно УДАЛЯЙ названия радиошоу, подкастов, приписки в духе "Мелник ин зе Афтернун", "Fourth Period" и даты в конце текста. Оставляй только саму хоккейную новость.
+    5. Выдай только готовый текст.
+    6. В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
+    
+    Оригинал: "{clean_text_for_ai}"
+    """
+    
+    for attempt in range(3):
+        try:
+            response = openai_client.chat.completions.create(
+                model="gpt-4o-mini",
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.3
+            )
+            if response and response.choices[0].message.content:
+                result = response.choices[0].message.content
+                return result.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception as e:
+            print(f"Ошибка OpenAI (попытка {attempt+1}): {e}")
+            time.sleep(2)
+    return None
+
+def main():
+    feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
+    history = get_history()
+    
+    new_entries = []
+    for entry in reversed(feed.entries[:10]):
+        if entry.title not in history:
+            new_entries.append(entry)
+            
+    if not new_entries:
+        print("Новых постов нет.")
+        return
+        
+    combined_texts = []
+    pure_texts_for_diff = [] 
+    main_search_query = None
+    entries_to_save = []
+    
+    for entry in new_entries:
+        raw_response = translate_tweet(entry.title)
+        
+        if raw_response:
+            if "SEARCH_QUERY:" in raw_response:
+                idx = raw_response.rfind("SEARCH_QUERY:")
+                post_text = raw_response[:idx].strip()
+                query_part = raw_response[idx:].replace("SEARCH_QUERY:", "").strip()
+                if not main_search_query and query_part:
+                    main_search_query = query_part
+            else:
+                post_text = raw_response
+            
+            if ": " in post_text:
+                author, text_content = post_text.split(": ", 1)
+                author = author.replace("Источник", "").strip() 
+                
+                if is_duplicate(text_content, pure_texts_for_diff):
+                    entries_to_save.append(entry.title) 
+                    continue
+                
+                pure_texts_for_diff.append(text_content)
+                formatted_text = f"<b>{escape_html(author)}</b>\n{escape_html(text_content)}"
+            else:
+                if is_duplicate(post_text, pure_texts_for_diff):
+                    entries_to_save.append(entry.title)
+                    continue
+                pure_texts_for_diff.append(post_text)
+                formatted_text = escape_html(post_text)
+                
+            combined_texts.append(formatted_text)
+            entries_to_save.append(entry.title)
+            
+    if combined_texts:
+        final_post = "\n\n".join(combined_texts)
+        
+        image_path = None
+        if main_search_query:
+            image_path = download_image(main_search_query)
+            
+        if not image_path:
+            image_path = download_image("NHL ice hockey match action")
+        
+        try:
+            image_sent = False
+            if image_path and os.path.exists(image_path):
+                try:
+                    with open(image_path, 'rb') as photo:
+                        if len(final_post) <= 1024:
+                            bot.send_photo(CHANNEL_ID, photo, caption=final_post, parse_mode='HTML')
+                        else:
+                            bot.send_photo(CHANNEL_ID, photo)
+                            bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
+                    image_sent = True
+                except Exception as e:
+                    print(f"⚠️ Telegram отклонил файл: {e}")
+                finally:
+                    if os.path.exists(image_path):
+                        os.remove(image_path)
+            
+            if not image_sent:
+                bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
+            
+            for title in entries_to_save:
+                add_to_history(title)
+                
+        except Exception as e:
+            print(f"❌ Ошибка отправки: {e}")
+
+if __name__ == "__main__":
+    main()
