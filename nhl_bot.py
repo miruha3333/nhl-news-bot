@@ -16,7 +16,7 @@ HISTORY_FILE = "history.txt"
 # --- СЛОВАРЬ ИМЕН ---
 # Заполняй его теми игроками, которых ИИ постоянно коверкает
 NAMES_DICT = {
-    "Carson Carels": "Карсон Кулеш",
+    "Carson Carels": "Карсон Карелс",
     "Alberts Smits": "Альберт Шмидт"
 }
 
