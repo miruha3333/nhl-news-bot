@@ -2,8 +2,8 @@ name: Run NHL News Bot
 
 on:
   schedule:
-    - cron: '0 * * * *' # Запуск каждый час
-  workflow_dispatch: # Кнопка ручного запуска
+    - cron: '0 * * * *' # Скрипт автоматически запускается КАЖДЫЙ ЧАС
+  workflow_dispatch: # Позволяет запускать бота вручную кнопкой в Actions
 
 jobs:
   run-bot:
@@ -25,14 +25,10 @@ jobs:
 
       - name: Run bot script
         env:
+          # Передаем токен Телеграма
           TOKEN: ${{ secrets.TOKEN }}
-          # Передаем все ключи, которые есть у тебя на GitHub Secrets:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          GROQ_API_KEY: ${{ secrets.GROQ_API_KEY }}
-          GH_MODELS_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
-          GOOGLE_API_KEY: ${{ secrets.GOOGLE_API_KEY }}
-          GOOGLE_CSE_CX: ${{ secrets.GOOGLE_CSE_CX }}
           
-          # Направляем ключ Groq в переменную OpenAI, чтобы удовлетворить проверку в коде:
+          # Берем твой готовый ключ GROQ_API_KEY и перенаправляем его 
+          # в переменную OPENAI_API_KEY, которую ожидает наш скрипт.
           OPENAI_API_KEY: ${{ secrets.GROQ_API_KEY }} 
         run: python nhl_bot.py
