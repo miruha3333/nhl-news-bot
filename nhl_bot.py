@@ -20,7 +20,7 @@ os.environ["PYTHONIOENCODING"] = "utf-8"
 GEMINI_API_KEY_1 = os.environ.get("GEMINI_API_KEY_1", "")
 GEMINI_API_KEY_2 = os.environ.get("GEMINI_API_KEY_2", "")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "")
-GITHUB_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_TOKEN = os.environ.get("GH_MODELS_TOKEN", "")
 
 # ПОИСК КАРТИНОК
 GOOGLE_API_KEY = os.environ.get("GOOGLE_API_KEY", "")
