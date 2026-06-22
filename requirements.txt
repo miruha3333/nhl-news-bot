@@ -1,5 +1,5 @@
+g4f
 feedparser
 pyTelegramBotAPI
+ddgs
 requests
-duckduckgo-search
-google-genai
