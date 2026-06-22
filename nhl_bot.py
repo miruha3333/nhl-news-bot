@@ -4,23 +4,23 @@ import os
 import time
 import requests
 import difflib
-from google import genai
-from duckduckgo_search import DDGS  # <-- Исправленный импорт
+from openai import OpenAI
+from ddgs import DDGS
 
 # --- НАСТРОЙКИ ДОСТУПА ---
 TOKEN = os.environ.get('TOKEN') 
 # ВСТАВЬ НИЖЕ СВОЙ ID КАНАЛА:
-CHANNEL_ID = '-1004423088204' 
+CHANNEL_ID = '-100XXXXXXXXXX' 
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 
-# --- ИНИЦИАЛИЗАЦИЯ GEMINI ---
-api_key_gemini = os.environ.get('GEMINI_API_KEY')
-if not api_key_gemini:
-    raise ValueError("❌ Критическая ошибка: Секрет GEMINI_API_KEY не найден! Проверь настройки GitHub Actions (Secrets) и файл .yml.")
+# --- ИНИЦИАЛИЗАЦИЯ OPENAI ---
+api_key_openai = os.environ.get('OPENAI_API_KEY')
+if not api_key_openai:
+    raise ValueError("❌ Критическая ошибка: Секрет OPENAI_API_KEY не найден! Проверь настройки GitHub Actions (Secrets) и файл .yml.")
 
-gemini_client = genai.Client(api_key=api_key_gemini)
+openai_client = OpenAI(api_key=api_key_openai)
 
 # --- СЛОВАРЬ ИМЕН ---
 NAMES_DICT = {
@@ -72,39 +72,38 @@ def download_image(query):
     bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
     
     try:
-        # Обновленный синтаксис для свежей версии duckduckgo_search
-        ddgs = DDGS()
-        results = list(ddgs.images(keywords=clean_query, max_results=15))
-        
-        for res in results:
-            try:
-                img_url = res.get('image', '').lower()
-                
-                if any(bad in img_url for bad in bad_url_words):
-                    continue
+        with DDGS() as ddgs:
+            results = list(ddgs.images(query=clean_query, max_results=15))
+            
+            for res in results:
+                try:
+                    img_url = res['image'].lower()
                     
-                response = requests.get(res['image'], headers=headers, timeout=10)
-                if response.status_code != 200:
-                    continue
+                    if any(bad in img_url for bad in bad_url_words):
+                        continue
+                        
+                    response = requests.get(res['image'], headers=headers, timeout=10)
+                    if response.status_code != 200:
+                        continue
+                        
+                    content_type = response.headers.get('Content-Type', '').lower()
+                    if 'image/jpeg' in content_type or 'image/jpg' in content_type:
+                        img_name = "temp.jpg"
+                    elif 'image/png' in content_type:
+                        img_name = "temp.png"
+                    else:
+                        continue 
                     
-                content_type = response.headers.get('Content-Type', '').lower()
-                if 'image/jpeg' in content_type or 'image/jpg' in content_type:
-                    img_name = "temp.jpg"
-                elif 'image/png' in content_type:
-                    img_name = "temp.png"
-                else:
-                    continue 
-                
-                if len(response.content) < 5000:
-                    continue
+                    if len(response.content) < 5000:
+                        continue
 
-                with open(img_name, 'wb') as handler:
-                    handler.write(response.content)
-                print(f"Успешно скачан рабочий файл: {img_name}")
-                return img_name 
-                
-            except Exception:
-                continue 
+                    with open(img_name, 'wb') as handler:
+                        handler.write(response.content)
+                    print(f"Успешно скачан рабочий файл: {img_name}")
+                    return img_name 
+                    
+                except Exception:
+                    continue 
     except Exception as e:
         print(f"Ошибка поиска картинок: {e}")
         
@@ -128,7 +127,7 @@ def translate_tweet(raw_text):
 
     СТРОГИЕ ПРАВИЛА:
     1. Качество: Никакого машинного перевода! Строй предложения логично. Текст должен быть авторитетным и серьезным. 
-    2. Автор: Если в оригинале указан автор (напр. "Chris Johnston:"), начни с его имени по-английски и поставь двоеточие. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
+    2. Author: Если в оригинале указан автор (напр. "Chris Johnston:"), начни с его имени по-английски и поставь двоеточие. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
     3. Имена: Переводи все имена, фамилии хоккеистов и названия команд на русский язык.
     4. Очистка от мусора: Безжалостно УДАЛЯЙ названия радиошоу, подкастов, приписки в духе "Мелник ин зе Афтернун", "Fourth Period" и даты в конце текста. Оставляй только саму хоккейную новость.
     5. Выдай только готовый текст.
@@ -139,14 +138,15 @@ def translate_tweet(raw_text):
     
     for attempt in range(3):
         try:
-            response = gemini_client.models.generate_content(
-                model='gemini-2.5-flash',
-                contents=prompt,
+            response = openai_client.chat.completions.create(
+                model='gpt-4o-mini',
+                messages=[{"role": "user", "content": prompt}],
+                temperature=0.7
             )
-            if response and response.text:
-                return response.text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+            if response and response.choices[0].message.content:
+                return response.choices[0].message.content.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
         except Exception as e:
-            print(f"Ошибка Gemini (попытка {attempt+1}): {e}")
+            print(f"Ошибка OpenAI (попытка {attempt+1}): {e}")
             time.sleep(2)
     return None
 
