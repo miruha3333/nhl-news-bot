@@ -1,11 +1,9 @@
 name: NHL News Bot
 on:
-  schedule:
-    - cron: '0 * * * *'
-  workflow_dispatch:
+  workflow_dispatch: # Скрипт запускается ТУТ только по внешнему пинку
 
-permissions:                # ДОБАВЬ ЭТОТ БЛОК
-  contents: write           # ЭТО РАЗРЕШАЕТ ЗАПИСЬ
+permissions:
+  contents: write
 
 jobs:
   build:
@@ -13,7 +11,7 @@ jobs:
     steps:
       - uses: actions/checkout@v3
         with:
-          token: ${{ secrets.GITHUB_TOKEN }} # ДОБАВЬ ЭТОТ ТОКЕН
+          token: ${{ secrets.GITHUB_TOKEN }}
       - name: Set up Python
         uses: actions/setup-python@v4
         with: {python-version: '3.9'}
