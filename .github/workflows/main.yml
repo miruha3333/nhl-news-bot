@@ -1,6 +1,6 @@
 name: NHL News Bot
 on:
-  workflow_dispatch: # Скрипт запускается ТУТ только по внешнему пинку
+  workflow_dispatch: # Запускается только по сигналу от watcher.yml или вручную
 
 permissions:
   contents: write
