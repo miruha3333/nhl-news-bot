@@ -1,30 +1,60 @@
-name: NHL News Bot
+name: NHL Feed Watcher
 on:
-  workflow_dispatch: # Запускается только по сигналу от watcher.yml или вручную
+  schedule:
+    # 09:00 - 14:00 по МСК (06:00 - 11:00 UTC) -> 1 раз в час
+    - cron: '0 6-11 * * *'
+    # 14:30 по МСК (11:30 UTC)
+    - cron: '30 11 * * *'
+    # 15:00 - 02:30 по МСК (12:00 - 23:30 UTC) -> каждые 30 минут
+    - cron: '0,30 12-23 * * *'
+    # 03:00 - 08:30 по МСК (00:00 - 05:30 UTC) -> каждые 30 минут
+    - cron: '0,30 0-5 * * *'
+  workflow_dispatch: # Кнопка ручного запуска для тестов
 
 permissions:
-  contents: write
+  actions: write
+  contents: read
 
 jobs:
-  build:
+  check_feed:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v3
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-      - name: Set up Python
-        uses: actions/setup-python@v4
-        with: {python-version: '3.9'}
-      - name: Install dependencies
-        run: pip install -r requirements.txt
-      - name: Run bot
-        run: python nhl_bot.py
-        env:
-          TOKEN: ${{ secrets.TOKEN }}
-      - name: Commit history
+
+      - name: Check RSS for new entries
+        id: check_rss
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add history.txt
-          git commit -m "Update history" || exit 0
-          git push
+          # 1. Скачиваем RSS-ленту
+          FEED_DATA=$(curl -s "https://nitter.net/NHLRumourReport/rss")
+          
+          # 2. Достаем заголовок (title) самой последней новости
+          # Извлекаем текст внутри первого тега <title>, пропуская общий заголовок ленты
+          LAST_TITLE=$(echo "$FEED_DATA" | grep -oP '(?<=<title>).*?(?=</title>)' | sed -n '2p')
+          
+          if [ -z "$LAST_TITLE" ]; then
+            echo "Не удалось прочитать заголовок из RSS ленты."
+            echo "NEW_NEWS=false" >> $GITHUB_ENV
+            exit 0
+          fi
+          
+          echo "Последняя новость на сайте: $LAST_TITLE"
+          
+          # 3. Проверяем, есть ли этот заголовок в history.txt
+          # Используем флаг -F для точного поиска строки и -q для скрытия вывода
+          if ! grep -Fxq "$LAST_TITLE" history.txt; then
+            echo "Найдена новая новость! Даем отмашку парсеру."
+            echo "NEW_NEWS=true" >> $GITHUB_ENV
+          else
+            echo "Такая новость уже обрабатывалась. Спим дальше."
+            echo "NEW_NEWS=false" >> $GITHUB_ENV
+          fi
+
+      - name: Trigger NHL News Bot
+        if: env.NEW_NEWS == 'true'
+        run: |
+          # Передаем сигнал на запуск основному скрипту main.yml
+          curl -X POST \
+            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
+            -H "Accept: application/vnd.github.v3+json" \
+            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+            -d '{"ref":"main"}'
