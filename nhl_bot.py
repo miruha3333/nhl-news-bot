@@ -119,7 +119,7 @@ def translate_tweet(raw_text):
     2. Автор: Если в оригинале указан автор (напр. "Chris Johnston:"), начни с его имени по-английски и поставь двоеточие. Слово "Источник" писать КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО.
     3. Имена: Переводи имена и названия команд на русский.
     4. Очистка от мусора: Безжалостно УДАЛЯЙ названия радиошоу, подкастов, приписки в духе "Мелник ин зе Афтернун", "Fourth Period" и даты в конце текста. Оставляй только саму новость.
-    5. Выдай только готовый текст.
+    5. Выдай только готовый текст. Длина поста должна быть строго от 400 до 500 знаков.
     6. В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
     
     Оригинал: "{clean_text_for_ai}"
@@ -153,6 +153,7 @@ def main():
     combined_texts = []
     pure_texts_for_diff = [] # Список для сравнения текстов на дубли
     main_search_query = None
+    search_queries = [] # Список всех поисковых запросов для картинок из пачки новостей
     entries_to_save = []
     
     for entry in new_entries:
@@ -164,8 +165,13 @@ def main():
                 idx = raw_response.rfind("SEARCH_QUERY:")
                 post_text = raw_response[:idx].strip()
                 query_part = raw_response[idx:].replace("SEARCH_QUERY:", "").strip()
+                
                 if not main_search_query and query_part:
                     main_search_query = query_part
+                
+                # Добавляем в общий список для новой логики
+                if query_part:
+                    search_queries.append(query_part)
             else:
                 post_text = raw_response
             
@@ -197,7 +203,15 @@ def main():
         final_post = "\n\n".join(combined_texts)
         
         image_path = None
-        if main_search_query:
+        
+        # Перебираем все собранные запросы, ищем рабочую картинку
+        for query in search_queries:
+            image_path = download_image(query)
+            if image_path:
+                break
+                
+        # Если старый main_search_query был, а картинки так и нет
+        if not image_path and main_search_query:
             image_path = download_image(main_search_query)
             
         if not image_path:
