@@ -21,6 +21,8 @@ jobs:
         run: python nhl_bot.py
         env:
           TOKEN: ${{ secrets.TOKEN }}
+          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
       - name: Commit history
         run: |
           git config --global user.name "github-actions[bot]"
