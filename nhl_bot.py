@@ -165,17 +165,17 @@ def translate_tweet(raw_text):
             print(f"⚠️ Сбой сети GitHub Models (GPT-4o): {e}")
             time.sleep(1)
 
-    # --- Попытка 3: Gemini 2.0 Flash через OpenRouter ---
+    # --- Попытка 3: Gemini 1.5 Flash через OpenRouter ---
     if OPENROUTER_API_KEY:
         try:
-            print("🤖 Шаг 3: Пробуем Gemini 2.0 Flash через OpenRouter...")
+            print("🤖 Шаг 3: Пробуем Gemini 1.5 Flash через OpenRouter...")
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {
                 "Authorization": f"Bearer {OPENROUTER_API_KEY}",
                 "Content-Type": "application/json"
             }
             data = {
-                "model": "google/gemini-2.0-flash",
+                "model": "google/gemini-1.5-flash:free",
                 "messages": [{"role": "user", "content": prompt}]
             }
             response = requests.post(url, headers=headers, json=data, timeout=15)
