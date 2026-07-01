@@ -1,4 +1,3 @@
-import g4f
 import feedparser
 import telebot
 import os
@@ -16,7 +15,6 @@ bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 
 # --- СЛОВАРЬ ИМЕН ---
-# Заполняй его теми игроками, которых ИИ постоянно коверкает
 NAMES_DICT = {
     "Carson Carels": "Карсон Карелс",
     "Alberts Smits": "Альберт Шмидт"
@@ -36,9 +34,7 @@ def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 def is_duplicate(new_text, existing_texts):
-    """Проверяет, нет ли в посте слишком похожего текста (защита от дублей)"""
     for text in existing_texts:
-        # Если тексты совпадают на 80% и более - это дубль
         similarity = difflib.SequenceMatcher(None, new_text, text).ratio()
         if similarity > 0.8:
             return True
@@ -53,7 +49,6 @@ def download_image(query):
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
     }
     
-    # Черный список слов в URL (броня от водяных знаков)
     bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
     
     try:
@@ -64,7 +59,6 @@ def download_image(query):
                 try:
                     img_url = res['image'].lower()
                     
-                    # Если в ссылке есть стоковый сайт - сразу пропускаем
                     if any(bad in img_url for bad in bad_url_words):
                         print(f"Пропуск (копирайт в URL): {img_url}")
                         continue
@@ -97,15 +91,11 @@ def download_image(query):
     return None
 
 def preprocess_text(text):
-    """Меняет сложные имена ДО отправки в ИИ"""
     for eng_name, rus_name in NAMES_DICT.items():
-        # Чтобы не ломать английский запрос поиска, мы можем делать замену аккуратно,
-        # но для простоты переводим сразу. ИИ всё равно поймет контекст.
         text = text.replace(eng_name, rus_name)
     return text
 
 def translate_tweet(raw_text):
-    # Предобработка сложных имен
     clean_text = preprocess_text(raw_text)
     
     if ' - ' in clean_text:
@@ -127,7 +117,7 @@ def translate_tweet(raw_text):
 Оригинал: "{clean_text_for_ai}"
     """
     
-    # --- Попытка 1: Llama 3.3 70B (Бесплатная) через OpenRouter ---
+    # --- Попытка 1: Llama 3.3 70B через OpenRouter ---
     if OPENROUTER_API_KEY:
         try:
             print("🤖 Шаг 1: Пробуем Llama 3.3 70B через OpenRouter...")
@@ -145,8 +135,10 @@ def translate_tweet(raw_text):
                 ai_text = response.json()['choices'][0]['message']['content']
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+            else:
+                print(f"❌ Ошибка Шага 1 (Статус {response.status_code}): {response.text}")
         except Exception as e:
-            print(f"⚠️ Сбой OpenRouter (Llama): {e}")
+            print(f"⚠️ Сбой сети OpenRouter (Llama): {e}")
             time.sleep(1)
 
     # --- Попытка 2: GPT-4o через GitHub Models ---
@@ -167,8 +159,10 @@ def translate_tweet(raw_text):
                 ai_text = response.json()['choices'][0]['message']['content']
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+            else:
+                print(f"❌ Ошибка Шага 2 (Статус {response.status_code}): {response.text}")
         except Exception as e:
-            print(f"⚠️ Сбой GitHub Models (GPT-4o): {e}")
+            print(f"⚠️ Сбой сети GitHub Models (GPT-4o): {e}")
             time.sleep(1)
 
     # --- Попытка 3: Gemini 2.0 Flash через OpenRouter ---
@@ -189,8 +183,10 @@ def translate_tweet(raw_text):
                 ai_text = response.json()['choices'][0]['message']['content']
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+            else:
+                print(f"❌ Ошибка Шага 3 (Статус {response.status_code}): {response.text}")
         except Exception as e:
-            print(f"⚠️ Сбой OpenRouter (Gemini): {e}")
+            print(f"⚠️ Сбой сети OpenRouter (Gemini): {e}")
             time.sleep(1)
 
     return None
@@ -209,16 +205,15 @@ def main():
         return
         
     combined_texts = []
-    pure_texts_for_diff = [] # Список для сравнения текстов на дубли
+    pure_texts_for_diff = [] 
     main_search_query = None
-    search_queries = [] # Список всех поисковых запросов для картинок из пачки новостей
+    search_queries = [] 
     entries_to_save = []
     
     for entry in new_entries:
         raw_response = translate_tweet(entry.title)
         
         if raw_response:
-            # Надежное разделение текста и SEARCH_QUERY
             if "SEARCH_QUERY:" in raw_response:
                 idx = raw_response.rfind("SEARCH_QUERY:")
                 post_text = raw_response[:idx].strip()
@@ -227,25 +222,21 @@ def main():
                 if not main_search_query and query_part:
                     main_search_query = query_part
                 
-                # Добавляем в общий список для новой логики
                 if query_part:
                     search_queries.append(query_part)
             else:
                 post_text = raw_response
             
-            # Разбираем на автора и текст
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
                 author = author.replace("Источник", "").strip() 
                 
-                # Защита от дублирующихся новостей
                 if is_duplicate(text_content, pure_texts_for_diff):
                     print(f"Найден дубль, пропускаем: {text_content[:30]}...")
-                    entries_to_save.append(entry.title) # Сохраняем в историю, чтобы больше не парсить
+                    entries_to_save.append(entry.title) 
                     continue
                 
                 pure_texts_for_diff.append(text_content)
-                # Выделяем субъекта (автора) жирным, а сам текст переносим на строку ниже
                 formatted_text = f"<b>{escape_html(author)}</b>\n{escape_html(text_content)}"
             else:
                 if is_duplicate(post_text, pure_texts_for_diff):
@@ -262,13 +253,11 @@ def main():
         
         image_path = None
         
-        # Перебираем все собранные запросы, ищем рабочую картинку
         for query in search_queries:
             image_path = download_image(query)
             if image_path:
                 break
                 
-        # Если старый main_search_query был, а картинки так и нет
         if not image_path and main_search_query:
             image_path = download_image(main_search_query)
             
