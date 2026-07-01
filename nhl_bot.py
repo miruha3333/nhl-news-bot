@@ -9,6 +9,8 @@ from ddgs import DDGS
 
 TOKEN = os.environ.get('TOKEN') 
 CHANNEL_ID = '-1004423088204' 
+OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
+GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
@@ -125,16 +127,72 @@ def translate_tweet(raw_text):
 Оригинал: "{clean_text_for_ai}"
     """
     
-    for attempt in range(3):
+    # --- Попытка 1: Llama 3.3 70B (Бесплатная) через OpenRouter ---
+    if OPENROUTER_API_KEY:
         try:
-            response = g4f.ChatCompletion.create(
-                model=g4f.models.gpt_4o, 
-                messages=[{"role": "user", "content": prompt}]
-            )
-            if response:
-                return response.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-        except:
-            time.sleep(2)
+            print("🤖 Шаг 1: Пробуем Llama 3.3 70B через OpenRouter...")
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+            if response.status_code == 200:
+                ai_text = response.json()['choices'][0]['message']['content']
+                if ai_text:
+                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception as e:
+            print(f"⚠️ Сбой OpenRouter (Llama): {e}")
+            time.sleep(1)
+
+    # --- Попытка 2: GPT-4o через GitHub Models ---
+    if GITHUB_TOKEN:
+        try:
+            print("🤖 Шаг 2: Пробуем GPT-4o через GitHub Models...")
+            url = "https://models.inference.ai.azure.com/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {GITHUB_TOKEN}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "gpt-4o",
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+            if response.status_code == 200:
+                ai_text = response.json()['choices'][0]['message']['content']
+                if ai_text:
+                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception as e:
+            print(f"⚠️ Сбой GitHub Models (GPT-4o): {e}")
+            time.sleep(1)
+
+    # --- Попытка 3: Gemini 2.0 Flash через OpenRouter ---
+    if OPENROUTER_API_KEY:
+        try:
+            print("🤖 Шаг 3: Пробуем Gemini 2.0 Flash через OpenRouter...")
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+                "Content-Type": "application/json"
+            }
+            data = {
+                "model": "google/gemini-2.0-flash",
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+            if response.status_code == 200:
+                ai_text = response.json()['choices'][0]['message']['content']
+                if ai_text:
+                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception as e:
+            print(f"⚠️ Сбой OpenRouter (Gemini): {e}")
+            time.sleep(1)
+
     return None
 
 def main():
