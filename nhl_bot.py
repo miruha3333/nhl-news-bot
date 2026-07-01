@@ -9,7 +9,9 @@ from ddgs import DDGS
 TOKEN = os.environ.get('TOKEN') 
 CHANNEL_ID = '-1004423088204' 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
-GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN')
+
+# Проверяем оба возможных названия, чтобы исключить ошибку в main.yml
+GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN') or os.environ.get('GITHUB_TOKEN')
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
@@ -116,31 +118,10 @@ def translate_tweet(raw_text):
 Оригинал: "{clean_text_for_ai}"
     """
     
-    # --- Шаг 1: Llama 3.3 70B через OpenRouter ---
-    if OPENROUTER_API_KEY:
-        try:
-            print("🤖 Шаг 1: Пробуем Llama 3.3 70B через OpenRouter...")
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            data = {
-                "model": "meta-llama/llama-3.3-70b-instruct:free",
-                "messages": [{"role": "user", "content": prompt}]
-            }
-            response = requests.post(url, headers=headers, json=data, timeout=15)
-            if response.status_code == 200:
-                ai_text = response.json()['choices'][0]['message']['content']
-                if ai_text:
-                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-            else:
-                print(f"❌ Ошибка Шага 1 (Статус {response.status_code})")
-        except Exception as e:
-            print(f"⚠️ Сбой сети OpenRouter (Llama): {e}")
-            time.sleep(1)
-
-    # --- Шаг 2: GPT-4o через GitHub Models (с новым токеном) ---
+    # --- ШАГ 1: GPT-4o через GitHub Models (Основной стабильный вариант) ---
     if GH_MODELS_TOKEN:
         try:
-            print("🤖 Шаг 2: Пробуем GPT-4o через GitHub Models...")
+            print("🤖 Шаг 1: Пробуем GPT-4o через GitHub Models...")
             url = "https://models.inference.ai.azure.com/chat/completions"
             headers = {"Authorization": f"Bearer {GH_MODELS_TOKEN}", "Content-Type": "application/json"}
             data = {
@@ -153,12 +134,33 @@ def translate_tweet(raw_text):
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
             else:
-                print(f"❌ Ошибка Шага 2 (Статус {response.status_code}): {response.text}")
+                print(f"❌ Ошибка Шага 1 (GitHub Models, Статус {response.status_code}): {response.text}")
         except Exception as e:
-            print(f"⚠️ Сбой сети GitHub Models (GPT-4o): {e}")
+            print(f"⚠️ Сбой сети GitHub Models: {e}")
             time.sleep(1)
 
-    # --- Шаг 3: GPT-OSS-120B через OpenRouter (Бесплатная альтернатива) ---
+    # --- ШАГ 2: Llama 3.3 70B через OpenRouter (Резервный) ---
+    if OPENROUTER_API_KEY:
+        try:
+            print("🤖 Шаг 2: Пробуем Llama 3.3 70B через OpenRouter...")
+            url = "https://openrouter.ai/api/v1/chat/completions"
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
+            data = {
+                "model": "meta-llama/llama-3.3-70b-instruct:free",
+                "messages": [{"role": "user", "content": prompt}]
+            }
+            response = requests.post(url, headers=headers, json=data, timeout=15)
+            if response.status_code == 200:
+                ai_text = response.json()['choices'][0]['message']['content']
+                if ai_text:
+                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+            else:
+                print(f"❌ Ошибка Шага 2 (OpenRouter Llama, Статус {response.status_code})")
+        except Exception as e:
+            print(f"⚠️ Сбой сети OpenRouter (Llama): {e}")
+            time.sleep(1)
+
+    # --- ШАГ 3: GPT-OSS-120B через OpenRouter (Резервный) ---
     if OPENROUTER_API_KEY:
         try:
             print("🤖 Шаг 3: Пробуем GPT-OSS-120B через OpenRouter...")
@@ -174,7 +176,7 @@ def translate_tweet(raw_text):
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
             else:
-                print(f"❌ Ошибка Шага 3 (Статус {response.status_code})")
+                print(f"❌ Ошибка Шага 3 (OpenRouter GPT-OSS, Статус {response.status_code})")
         except Exception as e:
             print(f"⚠️ Сбой сети OpenRouter (GPT-OSS): {e}")
             time.sleep(1)
