@@ -9,7 +9,7 @@ from ddgs import DDGS
 TOKEN = os.environ.get('TOKEN') 
 CHANNEL_ID = '-1004423088204' 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
-GITHUB_TOKEN = os.environ.get('GITHUB_TOKEN')
+GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN')
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
@@ -58,7 +58,6 @@ def download_image(query):
             for res in results:
                 try:
                     img_url = res['image'].lower()
-                    
                     if any(bad in img_url for bad in bad_url_words):
                         print(f"Пропуск (копирайт в URL): {img_url}")
                         continue
@@ -117,15 +116,12 @@ def translate_tweet(raw_text):
 Оригинал: "{clean_text_for_ai}"
     """
     
-    # --- Попытка 1: Llama 3.3 70B через OpenRouter ---
+    # --- Шаг 1: Llama 3.3 70B через OpenRouter ---
     if OPENROUTER_API_KEY:
         try:
             print("🤖 Шаг 1: Пробуем Llama 3.3 70B через OpenRouter...")
             url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json"
-            }
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
             data = {
                 "model": "meta-llama/llama-3.3-70b-instruct:free",
                 "messages": [{"role": "user", "content": prompt}]
@@ -136,20 +132,17 @@ def translate_tweet(raw_text):
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
             else:
-                print(f"❌ Ошибка Шага 1 (Статус {response.status_code}): {response.text}")
+                print(f"❌ Ошибка Шага 1 (Статус {response.status_code})")
         except Exception as e:
             print(f"⚠️ Сбой сети OpenRouter (Llama): {e}")
             time.sleep(1)
 
-    # --- Попытка 2: GPT-4o через GitHub Models ---
-    if GITHUB_TOKEN:
+    # --- Шаг 2: GPT-4o через GitHub Models (с новым токеном) ---
+    if GH_MODELS_TOKEN:
         try:
             print("🤖 Шаг 2: Пробуем GPT-4o через GitHub Models...")
             url = "https://models.inference.ai.azure.com/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {GITHUB_TOKEN}",
-                "Content-Type": "application/json"
-            }
+            headers = {"Authorization": f"Bearer {GH_MODELS_TOKEN}", "Content-Type": "application/json"}
             data = {
                 "model": "gpt-4o",
                 "messages": [{"role": "user", "content": prompt}]
@@ -165,17 +158,14 @@ def translate_tweet(raw_text):
             print(f"⚠️ Сбой сети GitHub Models (GPT-4o): {e}")
             time.sleep(1)
 
-    # --- Попытка 3: Gemini 1.5 Flash через OpenRouter ---
+    # --- Шаг 3: GPT-OSS-120B через OpenRouter (Бесплатная альтернатива) ---
     if OPENROUTER_API_KEY:
         try:
-            print("🤖 Шаг 3: Пробуем Gemini 1.5 Flash через OpenRouter...")
+            print("🤖 Шаг 3: Пробуем GPT-OSS-120B через OpenRouter...")
             url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {OPENROUTER_API_KEY}",
-                "Content-Type": "application/json"
-            }
+            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
             data = {
-                "model": "google/gemini-1.5-flash:free",
+                "model": "openai/gpt-oss-120b:free",
                 "messages": [{"role": "user", "content": prompt}]
             }
             response = requests.post(url, headers=headers, json=data, timeout=15)
@@ -184,9 +174,9 @@ def translate_tweet(raw_text):
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
             else:
-                print(f"❌ Ошибка Шага 3 (Статус {response.status_code}): {response.text}")
+                print(f"❌ Ошибка Шага 3 (Статус {response.status_code})")
         except Exception as e:
-            print(f"⚠️ Сбой сети OpenRouter (Gemini): {e}")
+            print(f"⚠️ Сбой сети OpenRouter (GPT-OSS): {e}")
             time.sleep(1)
 
     return None
@@ -221,7 +211,6 @@ def main():
                 
                 if not main_search_query and query_part:
                     main_search_query = query_part
-                
                 if query_part:
                     search_queries.append(query_part)
             else:
@@ -250,7 +239,6 @@ def main():
             
     if combined_texts:
         final_post = "\n\n".join(combined_texts)
-        
         image_path = None
         
         for query in search_queries:
