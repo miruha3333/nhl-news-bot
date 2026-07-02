@@ -43,7 +43,6 @@ def is_duplicate(new_text, existing_texts):
     return False
 
 def download_image(query):
-    # Добавили исключение скриншотов для поиска широкоформатных и чистых фото
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark -screenshot -screen"
     print(f"Ищем чистую картинку по запросу: {clean_query}")
     time.sleep(2)
@@ -56,9 +55,27 @@ def download_image(query):
     
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.images(query=clean_query, max_results=15))
+            # Увеличили выборку до 20, чтобы было больше шансов найти идеальное горизонтальное фото
+            results = list(ddgs.images(query=clean_query, max_results=20))
             
+            wide_results = []
+            other_results = []
+            
+            # Сортируем результаты по геометрии на основе данных поисковика
             for res in results:
+                w = res.get('width', 0)
+                h = res.get('height', 0)
+                
+                if w and h and w > h:
+                    wide_results.append(res)
+                else:
+                    other_results.append(res)
+            
+            # Объединяем списки: сначала жестко пробуем все горизонтальные, а вертикальные/квадратные — в резерв
+            candidates = wide_results + other_results
+            print(f"Найдено картинок: широкоформатных — {len(wide_results)}, остальных — {len(other_results)}")
+            
+            for res in candidates:
                 try:
                     img_url = res['image'].lower()
                     if any(bad in img_url for bad in bad_url_words):
@@ -82,7 +99,9 @@ def download_image(query):
 
                     with open(img_name, 'wb') as handler:
                         handler.write(response.content)
-                    print(f"Успешно скачан рабочий файл: {img_name}")
+                    
+                    actual_is_wide = res.get('width', 0) > res.get('height', 0)
+                    print(f"Успешно скачан рабочий файл: {img_name} (Широкоформатный: {actual_is_wide})")
                     return img_name 
                     
                 except Exception as e:
@@ -105,7 +124,6 @@ def translate_tweet(raw_text):
     else:
         clean_text_for_ai = clean_text
 
-    # Модернизированный промпт с новыми правилами формирования поискового запроса
     prompt = f"""
     Ты — ведущий хоккейный инсайдер и спортивный блогер, пишущий о НХЛ. Твоя задача — перевести и адаптировать сухой английский инсайд в хлёсткий, живой и авторитетный пост для русскоязычных фанатов хоккея.
 
