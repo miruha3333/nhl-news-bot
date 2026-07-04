@@ -16,8 +16,18 @@ GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN') or os.environ.get('GITHUB_TO
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 
-# --- СЛОВАРЬ ИМЕН ---
+# --- БИБЛИОТЕКА ПРАВИЛЬНЫХ ИМЕН ---
 NAMES_DICT = {
+    "Mason Marchment": "Мэйсон Марчмент",
+    "J.J. Peterka": "Дж. Дж. Петерка",
+    "JJ Peterka": "Дж. Дж. Петерка",
+    "Zach Werenski": "Зак Веренски",
+    "Morgan Rielly": "Морган Райлли",
+    "Darnell Nurse": "Дарнелл Нерс",
+    "Jacob Trouba": "Джейкоб Троуба",
+    "Nick Jensen": "Ник Йенсен",
+    "Connor Hellebuyck": "Коннор Хеллебайк",
+    "Pat Verbeek": "Пэт Вербик",
     "Carson Carels": "Карсон Карелс",
     "Alberts Smits": "Альберт Шмидт"
 }
@@ -43,7 +53,7 @@ def is_duplicate(new_text, existing_texts):
     return False
 
 def download_image(query):
-    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark -screenshot -screen"
+    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
     print(f"Ищем чистую картинку по запросу: {clean_query}")
     time.sleep(2)
     
@@ -55,27 +65,9 @@ def download_image(query):
     
     try:
         with DDGS() as ddgs:
-            # Увеличили выборку до 20, чтобы было больше шансов найти идеальное горизонтальное фото
-            results = list(ddgs.images(query=clean_query, max_results=20))
+            results = list(ddgs.images(query=clean_query, max_results=15))
             
-            wide_results = []
-            other_results = []
-            
-            # Сортируем результаты по геометрии на основе данных поисковика
             for res in results:
-                w = res.get('width', 0)
-                h = res.get('height', 0)
-                
-                if w and h and w > h:
-                    wide_results.append(res)
-                else:
-                    other_results.append(res)
-            
-            # Объединяем списки: сначала жестко пробуем все горизонтальные, а вертикальные/квадратные — в резерв
-            candidates = wide_results + other_results
-            print(f"Найдено картинок: широкоформатных — {len(wide_results)}, остальных — {len(other_results)}")
-            
-            for res in candidates:
                 try:
                     img_url = res['image'].lower()
                     if any(bad in img_url for bad in bad_url_words):
@@ -99,9 +91,7 @@ def download_image(query):
 
                     with open(img_name, 'wb') as handler:
                         handler.write(response.content)
-                    
-                    actual_is_wide = res.get('width', 0) > res.get('height', 0)
-                    print(f"Успешно скачан рабочий файл: {img_name} (Широкоформатный: {actual_is_wide})")
+                    print(f"Успешно скачан рабочий файл: {img_name}")
                     return img_name 
                     
                 except Exception as e:
@@ -111,18 +101,15 @@ def download_image(query):
         
     return None
 
-def preprocess_text(text):
-    for eng_name, rus_name in NAMES_DICT.items():
-        text = text.replace(eng_name, rus_name)
-    return text
-
 def translate_tweet(raw_text):
-    clean_text = preprocess_text(raw_text)
-    
-    if ' - ' in clean_text:
-        clean_text_for_ai = clean_text.rsplit(' - ', 1)[0]
+    if ' - ' in raw_text:
+        clean_text_for_ai = raw_text.rsplit(' - ', 1)[0]
     else:
-        clean_text_for_ai = clean_text
+        clean_text_for_ai = raw_text
+
+    # Формируем список имен для интеграции в промпт нейросети
+    glossary_lines = [f"- {eng} -> {rus}" for eng, rus in NAMES_DICT.items()]
+    names_glossary = "\n".join(glossary_lines)
 
     prompt = f"""
     Ты — ведущий хоккейный инсайдер и спортивный блогер, пишущий о НХЛ. Твоя задача — перевести и адаптировать сухой английский инсайд в хлёсткий, живой и авторитетный пост для русскоязычных фанатов хоккея.
@@ -130,27 +117,17 @@ def translate_tweet(raw_text):
 СТРОГИЕ ПРАВИЛА:
 1. ЖЕСТКАЯ ФАКТОЛОГИЯ (ГЛАВНОЕ ПРАВИЛО): Передавай ТОЛЬКО ту информацию, которая есть в оригинальном тексте. Строго запрещено выдумывать факты, добавлять другие клубы, контракты, травмы или игроков, которых нет в источнике. Не смешивай разные новости. Если инсайд короткий — пост тоже должен быть коротким и по сути.
 
-2. Стиль, язык и терминология: Никакого машинного перевода, канцелярита и буквализма. Пиши динамично, используй активный залог и хоккейный сленг (вместо "усилить последний рубеж" пиши "закрыть вратарский вопрос", вместо "изменить баланс сил в обороне" — "прокачать топ-4 защиты", вместо "наиболее логичный вариант" — "главный претендент" и т.д.).
-
-СТРОГО соблюдай контекст хоккейного бизнеса и трансферного регламента (CBA). Избегай ловушек созвучных слов. Переводи термины профессионально:
-- "waive a clause" (NTC/NMC) — это ВСЕГДА "отказаться от пункта/права запрета на обмен" (ни в коем случае не "размахивать"!).
-- "waivers" — драфт отказов.
-- "future considerations" — будущая/скрытая компенсация.
-- "retain salary" — удерживать или брать на себя часть зарплаты.
-- "buyout" — выкуп контракта.
+2. Стиль и язык: Никакого машинного перевода и канцелярита. Пиши динамично, используй активный залог и хоккейный сленг (вместо "усилить последний рубеж" пиши "закрыть вратарский вопрос", вместо "изменить баланс сил в обороне" — "прокачать топ-4 защиты", вместо "наиболее логичный вариант" — "главный претендент" и т.д.).
 
 3. ТАБУ-фразы (ЗАПРЕЩЕНО использовать): «По ситуации с...», «Что касается...», «Вокруг [клуба/игрока]...», «По словам инсайдера», «Руководство внимательно следит/готово действовать». Начинай сразу с сути дела.
 
 4. Авторство: Формат первой строки строго такой: [Имя Автора по-английски]: [Текст поста]. Пример: Chris Johnston: Эдмонтон вовсю ищет... (Слово "Источник" не писать).
 
 5. Имена и команды: Переводи на русский язык. Названия клубов пиши БЕЗ кавычек и БЕЗ курсива (Эдмонтон, Торонто, Миннесота, Детройт), просто с заглавной буквы.
+ПРИ ПЕРЕВОДЕ И СКЛОНЕНИИ ИМЕН ИГРОКОВ СТРОГО СВЕРЯЙСЯ С ЭТИМ ГЛОССАРИЕМ. Ты должен использовать именно эти базовые варианты написания и правильно склонять их по падежам (например: Мэйсона Марчмента, Моргану Райлли, Зака Веренски и т.д.):
+{names_glossary}
 
-6. Финал (ФОРМИРОВАНИЕ ПОИСКОВОГО ЗАПРОСА): В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя и фамилия главного героя новости на английском языке] [Название его актуальной или новой команды из текста на английском языке].
-Примеры:
-- Дилан Ларкин остается в Детройте -> SEARCH_QUERY: Dylan Larkin Detroit
-- Сергей Бобровский договаривается с Флоридой -> SEARCH_QUERY: Sergei Bobrovsky Florida
-- Клода Жиру связывают с уходом из Оттавы -> SEARCH_QUERY: Claude Giroux Ottawa
-Строго запрещено добавлять лишние слова вроде "photo", "NHL", "picture" или знаки препинания. Только Имя Фамилия Команда на английском языке.
+6. Финал: В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
 
 Оригинал: "{clean_text_for_ai}"
     """
