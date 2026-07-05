@@ -3,3 +3,4 @@ feedparser
 pyTelegramBotAPI
 ddgs
 requests
+pymorphy3
