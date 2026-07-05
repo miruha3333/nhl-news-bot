@@ -4,6 +4,8 @@ import os
 import time
 import requests
 import difflib
+import pymorphy3
+import re
 from ddgs import DDGS
 
 TOKEN = os.environ.get('TOKEN') 
@@ -15,6 +17,9 @@ GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN') or os.environ.get('GITHUB_TO
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
+
+# Инициализируем морфологический анализатор для работы с падежами русского языка
+morph = pymorphy3.MorphAnalyzer()
 
 # --- БИБЛИОТЕКА ПРАВИЛЬНЫХ ИМЕН ---
 NAMES_DICT = {
@@ -51,6 +56,66 @@ def is_duplicate(new_text, existing_texts):
         if similarity > 0.8:
             return True
     return False
+
+def fix_sports_grammar(text):
+    """
+    Автоматически находит предлоги и исправляет падежные окончания 
+    стоящих за ними иностранных имен и фамилий с помощью pymorphy3.
+    """
+    if not text:
+        return text
+        
+    words = text.split()
+    # Словарь соответствия русских предлогов и падежей в pymorphy3
+    prep_cases = {
+        "за": "ablt",  # Творительный (охотиться за Клодом)
+        "к": "datv",   # Дательный (присматриваться к Клоду)
+        "ко": "datv",
+        "для": "gent", # Родительный (контракт для Клода)
+        "от": "gent",
+        "до": "gent",
+        "из": "gent",
+        "у": "gent",
+        "о": "loct",   # Предложный (слухи о Клоде)
+        "об": "loct",
+        "с": "ablt",   # Творительный (сделка с Клодом)
+        "со": "ablt"
+    }
+    
+    for i in range(len(words) - 1):
+        clean_prep = words[i].lower().strip(",.?!()\"«»")
+        if clean_prep in prep_cases:
+            target_case = prep_cases[clean_prep]
+            
+            # Проверяем следующие 2 слова (имя и фамилию)
+            for j in range(1, 3):
+                if i + j < len(words):
+                    word_with_punct = words[i+j]
+                    clean_word = word_with_punct.strip(",.?!()\"«»")
+                    if not clean_word:
+                        continue
+                    
+                    # Проверяем, является ли слово частью известного имени или просто написано с большой буквы
+                    is_name = False
+                    for eng, rus in NAMES_DICT.items():
+                        if clean_word.lower() in rus.lower():
+                            is_name = True
+                            break
+                    
+                    if clean_word and clean_word[0].isupper():
+                        is_name = True
+                        
+                    if is_name:
+                        parsed = morph.parse(clean_word)[0]
+                        inflected = parsed.inflect({target_case})
+                        if inflected:
+                            corrected_word = inflected.word.capitalize()
+                            # Сохраняем исходную пунктуацию вокруг слова
+                            prefix = re.match(r"^[^a-zA-Zа-яА-ЯёЁ]*", word_with_punct).group(0)
+                            suffix = re.search(r"[^a-zA-Zа-яА-ЯёЁ]*$", word_with_punct).group(0)
+                            words[i+j] = prefix + corrected_word + suffix
+                            
+    return " ".join(words)
 
 def download_image(query):
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
@@ -107,15 +172,31 @@ def translate_tweet(raw_text):
     else:
         clean_text_for_ai = raw_text
 
-    # Формируем список имен для интеграции в промпт нейросети
-    glossary_lines = [f"- {eng} -> {rus}" for eng, rus in NAMES_DICT.items()]
+    # Автоматически генерируем падежные формы для глоссария с помощью pymorphy3
+    glossary_lines = []
+    for eng, rus in NAMES_DICT.items():
+        try:
+            words = rus.split()
+            forms = []
+            # Генерируем Родительный (кого?), Дательный (кому?) и Творительный (кем?) падежи
+            for case in ['gent', 'datv', 'ablt']:
+                inflected_words = []
+                for w in words:
+                    parsed = morph.parse(w)[0]
+                    inflected = parsed.inflect({case})
+                    inflected_words.append(inflected.word.capitalize() if inflected else w)
+                forms.append(" ".join(inflected_words))
+            glossary_lines.append(f"- {eng} -> {rus} (кого: {forms[0]}, кому: {forms[1]}, кем/чем: {forms[2]})")
+        except Exception:
+            glossary_lines.append(f"- {eng} -> {rus}")
+            
     names_glossary = "\n".join(glossary_lines)
 
     prompt = f"""
     Ты — ведущий хоккейный инсайдер и спортивный блогер, пишущий о НХЛ. Твоя задача — перевести и адаптировать сухой английский инсайд в хлёсткий, живой и авторитетный пост для русскоязычных фанатов хоккея.
 
 СТРОГИЕ ПРАВИЛА:
-1. ЖЕСТКАЯ ФАКТОЛОГИЯ (ГЛАВНОЕ ПРАВИЛО): Передавай ТОЛЬКО ту информацию, которая есть в оригинальном тексте. Строго запрещено выдумывать факты, добавлять другие клубы, контракты, травмы или игроков, которых нет в источнике. Не смешивай разные новости. Если инсайд короткий — пост тоже должен быть коротким и по сути.
+1. ЖЕСТКАЯ ФАКТОЛОГИЯ (ГЛАВНОЕ ПРАВИЛО): Передавай ТОЛЬКО ту информацию, которая есть в оригинальном тексте. Строго запрещено выдумывать факты, добавлять другие клубы, контракты, травмы или игроков, которых нет в источнике. Не смешивай разные новости. Если инсайд короткий — пост тоже должен быть коротком и по сути.
 
 2. Стиль и язык: Никакого машинного перевода и канцелярита. Пиши динамично, используй активный залог и хоккейный сленг (вместо "усилить последний рубеж" пиши "закрыть вратарский вопрос", вместо "изменить баланс сил в обороне" — "прокачать топ-4 защиты", вместо "наиболее логичный вариант" — "главный претендент" и т.д.).
 
@@ -124,7 +205,7 @@ def translate_tweet(raw_text):
 4. Авторство: Формат первой строки строго такой: [Имя Автора по-английски]: [Текст поста]. Пример: Chris Johnston: Эдмонтон вовсю ищет... (Слово "Источник" не писать).
 
 5. Имена и команды: Переводи на русский язык. Названия клубов пиши БЕЗ кавычек и БЕЗ курсива (Эдмонтон, Торонто, Миннесота, Детройт), просто с заглавной буквы.
-ПРИ ПЕРЕВОДЕ И СКЛОНЕНИИ ИМЕН ИГРОКОВ СТРОГО СВЕРЯЙСЯ С ЭТИМ ГЛОССАРИЕМ. Ты должен использовать именно эти базовые варианты написания и правильно склонять их по падежам (например: Мэйсона Марчмента, Моргану Райлли, Зака Веренски и т.д.):
+ПРИ ПЕРЕВОДЕ И СКЛОНЕНИИ ИМЕН ИГРОКОВ СТРОГО СВЕРЯЙСЯ С ЭТИМ ГЛОССАРИЕМ И ИСПОЛЬЗУЙ ПРАВИЛЬНЫЕ ПАДЕЖНЫЕ ФОРМЫ ИЗ СКОБОК:
 {names_glossary}
 
 6. Финал: В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока из текста НА АНГЛИЙСКОМ] NHL photo.
@@ -231,6 +312,9 @@ def main():
                     search_queries.append(query_part)
             else:
                 post_text = raw_response
+            
+            # Накатываем исправление падежей на чистый текст перевода перед проверкой дубликатов и отправкой
+            post_text = fix_sports_grammar(post_text)
             
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
