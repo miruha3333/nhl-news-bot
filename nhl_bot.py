@@ -17,8 +17,6 @@ GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN') or os.environ.get('GITHUB_TO
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
-
-# Инициализируем морфологический анализатор для работы с падежами русского языка
 morph = pymorphy3.MorphAnalyzer()
 
 # --- БИБЛИОТЕКА ПРАВИЛЬНЫХ ИМЕН ---
@@ -34,7 +32,11 @@ NAMES_DICT = {
     "Connor Hellebuyck": "Коннор Хеллебайк",
     "Pat Verbeek": "Пэт Вербик",
     "Carson Carels": "Карсон Карелс",
-    "Alberts Smits": "Альберт Шмидт"
+    "Alberts Smits": "Альберт Шмидт",
+    "Claude Giroux": "Клод Жиру",
+    "Connor Bedard": "Коннор Бедард",
+    "Leo Carlsson": "Лео Карлссон",
+    "Jake DeBrusk": "Джейк Дебраск"
 }
 
 def get_history():
@@ -57,122 +59,88 @@ def is_duplicate(new_text, existing_texts):
             return True
     return False
 
-def fix_sports_grammar(text):
+def clean_bot_hallucinations(text):
     """
-    Автоматически находит предлоги и исправляет падежные окончания 
-    стоящих за ними иностранных имен и фамилий с помощью pymorphy3.
+    Жесткий Python-фильтр. Если нейросеть проигнорировала правила в промпте, 
+    этот блок принудительно вырежет и заменит все ошибки синтаксиса и прозвища.
     """
     if not text:
         return text
-        
-    words = text.split()
-    # Словарь соответствия русских предлогов и падежей в pymorphy3
-    prep_cases = {
-        "за": "ablt",  # Творительный (охотиться за Клодом)
-        "к": "datv",   # Дательный (присматриваться к Клоду)
-        "ко": "datv",
-        "для": "gent", # Родительный (контракт для Клода)
-        "от": "gent",
-        "до": "gent",
-        "из": "gent",
-        "у": "gent",
-        "о": "loct",   # Предложный (слухи о Клоде)
-        "об": "loct",
-        "с": "ablt",   # Творительный (сделка с Клодом)
-        "со": "ablt"
+    
+    replacements = {
+        "гендир": "генеральный менеджер",
+        "дженерал менеджер": "генеральный менеджер",
+        "дженерал": "генеральный менеджер",
+        "чигагских ястребов": "Чикаго",
+        "чикагские ястребы": "Чикаго",
+        "чикагских ястребах": "Чикаго",
+        "у ястребов": "у Чикаго",
+        "ястребы": "Чикаго",
+        "ястребов": "Чикаго",
+        "Лио Карлссон": "Лео Карлссон",
+        "Лио Карлссона": "Лео Карлссона",
+        "Лио Карлссону": "Лео Карлссону",
+        "Дарнеллы Нерса": "Дарнелла Нерса",
+        "сработать сделка": "провернуть сделку"
     }
     
+    for bad_word, good_word in replacements.items():
+        text = re.sub(r'\b' + re.escape(bad_word) + r'\b', good_word, text, flags=re.IGNORECASE)
+        
+    return text
+
+def fix_sports_grammar(text):
+    """Исправляет падежные окончания после предлогов."""
+    if not text: return text
+    words = text.split()
+    prep_cases = {
+        "за": "ablt", "к": "datv", "ко": "datv", "для": "gent",
+        "от": "gent", "до": "gent", "из": "gent", "у": "gent",
+        "о": "loct", "об": "loct", "с": "ablt", "со": "ablt"
+    }
     for i in range(len(words) - 1):
         clean_prep = words[i].lower().strip(",.?!()\"«»")
         if clean_prep in prep_cases:
             target_case = prep_cases[clean_prep]
-            
-            # Проверяем следующие 2 слова (имя и фамилию)
             for j in range(1, 3):
                 if i + j < len(words):
                     word_with_punct = words[i+j]
                     clean_word = word_with_punct.strip(",.?!()\"«»")
-                    if not clean_word:
-                        continue
-                    
-                    # Проверяем, является ли слово частью известного имени или просто написано с большой буквы
-                    is_name = False
-                    for eng, rus in NAMES_DICT.items():
-                        if clean_word.lower() in rus.lower():
-                            is_name = True
-                            break
-                    
-                    if clean_word and clean_word[0].isupper():
-                        is_name = True
-                        
+                    if not clean_word: continue
+                    is_name = any(clean_word.lower() in rus.lower() for eng, rus in NAMES_DICT.items()) or clean_word[0].isupper()
                     if is_name:
                         parsed = morph.parse(clean_word)[0]
                         inflected = parsed.inflect({target_case})
                         if inflected:
                             corrected_word = inflected.word.capitalize()
-                            # Сохраняем исходную пунктуацию вокруг слова
                             prefix = re.match(r"^[^a-zA-Zа-яА-ЯёЁ]*", word_with_punct).group(0)
                             suffix = re.search(r"[^a-zA-Zа-яА-ЯёЁ]*$", word_with_punct).group(0)
                             words[i+j] = prefix + corrected_word + suffix
-                            
     return " ".join(words)
 
 def download_image(query):
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
-    print(f"Ищем чистую картинку по запросу: {clean_query}")
     time.sleep(2)
-    
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"
-    }
-    
+    headers = {"User-Agent": "Mozilla/5.0"}
     bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
-    
     try:
         with DDGS() as ddgs:
             results = list(ddgs.images(query=clean_query, max_results=15))
-            
             for res in results:
-                try:
-                    img_url = res['image'].lower()
-                    if any(bad in img_url for bad in bad_url_words):
-                        print(f"Пропуск (копирайт в URL): {img_url}")
-                        continue
-                        
-                    response = requests.get(res['image'], headers=headers, timeout=10)
-                    if response.status_code != 200:
-                        continue
-                        
-                    content_type = response.headers.get('Content-Type', '').lower()
-                    if 'image/jpeg' in content_type or 'image/jpg' in content_type:
-                        img_name = "temp.jpg"
-                    elif 'image/png' in content_type:
-                        img_name = "temp.png"
-                    else:
-                        continue 
-                    
-                    if len(response.content) < 5000:
-                        continue
-
-                    with open(img_name, 'wb') as handler:
-                        handler.write(response.content)
-                    print(f"Успешно скачан рабочий файл: {img_name}")
-                    return img_name 
-                    
-                except Exception as e:
-                    continue 
+                img_url = res['image'].lower()
+                if any(bad in img_url for bad in bad_url_words): continue
+                response = requests.get(res['image'], headers=headers, timeout=10)
+                if response.status_code == 200:
+                    with open("temp.png", 'wb') as handler: handler.write(response.content)
+                    return "temp.png"
     except Exception as e:
-        print(f"Ошибка поиска картинок: {e}")
-        
+        print(f"Ошибка картинки: {e}")
     return None
 
 def translate_tweet(raw_text):
-    if ' - ' in raw_text:
-        clean_text_for_ai = raw_text.rsplit(' - ', 1)[0]
-    else:
-        clean_text_for_ai = raw_text
+    clean_text_for_ai = raw_text.rsplit(' - ', 1)[0] if ' - ' in raw_text else raw_text
 
-    # Автоматически генерируем падежные формы для глоссария с помощью pymorphy3
+    # Подготовка глоссария падежей
     glossary_lines = []
     for eng, rus in NAMES_DICT.items():
         try:
@@ -185,38 +153,46 @@ def translate_tweet(raw_text):
                     inflected = parsed.inflect({case})
                     inflected_words.append(inflected.word.capitalize() if inflected else w)
                 forms.append(" ".join(inflected_words))
-            glossary_lines.append(f"- {eng} -> {rus} (кого: {forms[0]}, кому: {forms[1]}, кем/чем: {forms[2]})")
+            glossary_lines.append(f"- {eng} -> {rus} (кого/чего: {forms[0]}, кому/чему: {forms[1]}, кем/чем: {forms[2]})")
         except Exception:
             glossary_lines.append(f"- {eng} -> {rus}")
-            
-    names_glossary = "\n".join([f"- {eng} -> {rus}" for eng, rus in NAMES_DICT.items()])
+    names_glossary = "\n".join(glossary_lines)
 
     prompt = f"""
-    Ты — строгий редактор хоккейных новостей. Твоя задача: перевести текст на русский язык, СОХРАНЯЯ ТОЧНОСТЬ, но используя живой стиль.
-    
-    СТРОГИЕ ПРАВИЛА (ВЫПОЛНЯТЬ ОБЯЗАТЕЛЬНО):
-    1. ИМЕНА И КОМАНДЫ:
-       - Используй ТОЛЬКО полные названия команд (Чикаго, Эдмонтон, Торонто, Виннипег). 
-       - ЗАПРЕЩЕНО использовать прозвища (никаких "ястребов", "листьев", "рейнджеров", "нефтяников").
-       - Если имя игрока (напр. Leo, Darnell) не склоняется уверенно — НЕ СКЛОНЯЙ его. Лучше напиши "история игрока Leo" или "ситуация с Darnell Nurse", чем придумывай "Дарнеллы" или "Лио".
-       - Транслитерируй имена стандартно (Leo -> Лео, Darnell -> Дарнелл).
-    
-    2. ЗАПРЕТЫ (ТАБУ):
-       - НИКАКИХ "гендиров", "дженерал". Используй ТОЛЬКО "генеральный менеджер".
-       - НИКАКИХ корявых конструкций вроде "сработать сделка". Если не получается красиво — пиши просто: "сделка невозможна" или "сделку сложно провернуть".
-       - НИКАКИХ додумок о КХЛ, статистике или личной жизни, если этого нет в оригинале.
-    
-    3. ПРАВИЛО ПЕРЕВОДА:
-       - Текст должен звучать как на родном русском языке. Если английская идиома переводится плохо — перефразируй, сохранив смысл, а не переводя слова по отдельности.
-    
-    4. ФОРМАТ:
-       - Первая строка: [Имя Автора]: [Текст].
-       - Последняя строка: SEARCH_QUERY: [Имя главного игрока на англ] NHL photo.
-    
-    ГЛОССАРИЙ (ИСПОЛЬЗУЙ ЭТО НАПИСАНИЕ):
-    {names_glossary}
+    Ты — ведущий хоккейный инсайдер и спортивный блогер, пишущий о НХЛ. Твоя задача — адаптировать сухой английский инсайд в хлёсткий, живой и авторитетный пост для русскоязычных фанатов хоккея.
 
-    Оригинал: "{clean_text_for_ai}"
+СТРОГИЕ ПРАВИЛА:
+1. ЖЕСТКАЯ ФАКТОЛОГИЯ (ГЛАВНОЕ ПРАВИЛО): Передавай ТОЛЬКО ту информацию, которая есть в оригинальном тексте. 
+   - СТРОГО ЗАПРЕЩЕНО выдумывать новые факты, предыстории или контекст.
+   - СТРОГО ЗАПРЕЩЕНО использовать свои фоновые знания об игроках или командах (если в тексте нет упоминания КХЛ, СКА, возраста игрока или его личной жизни — ты не имеешь права это писать).
+   - Если оригинальный инсайд короткий — твой пост должен быть таким же коротким. Никакой лишней «воды».
+
+2. ИМЕНА, КОМАНДЫ И АББРЕВИАТУРА:
+   - Используй ТОЛЬКО официальные полные названия команд или городов (Чикаго, Эдмонтон, Торонто, Виннипег). 
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать прозвища команд (никаких "ястребов", "листьев", "нефтяников", "сенаторов" и т.д.).
+   - Имя Leo переводится строго как Лео. Имя Darnell — как Дарнелл. Склоняй имена строго по правилам русского языка. Если сомневаешься в склонении — оставляй имя в начальной форме, но не коверкай.
+   - АББРЕВИАТУРЫ: GM -> генеральный менеджер (НИКОГДА не пиши "гендир" или "дженерал"). HC -> главный тренер. NTC/NMC -> пункт о запрете на обмен.
+
+3. ПРАВИЛО СИНТАКСИСА: Перевод должен быть естественным для русского языка. Не копируй английскую структуру фраз. Избегай глупых ломаных конструкций.
+
+ПРИМЕРЫ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕННОГО ПЕРЕВОДА (ТАКОЙ БРЕД ПИСАТЬ НЕЛЬЗЯ):
+- Английский оригинал: "Darnell Nurse situation in Edmonton..."
+  ❌ Плохой перевод: "История у Дарнеллы Нерса и Эдмонтона..." (Ошибка: имя Darnell соткано как женское. Правильно: ситуация с Дарнеллом Нерсом).
+- Английский оригинал: "Chicago GM Kyle Davidson started talks..."
+  ❌ Плохой перевод: "Гендир Дженерал Кайл Дэвидсон..." (Ошибка: бред в аббревиатуре GM. Правильно: Генеральный менеджер Чикаго Кайл Дэвидсон).
+- Английский оригинал: "Chicago Blackhawks are on alert..."
+  ❌ Плохой перевод: "У чикагских ястребов сейчас одна задача..." (Ошибка: использовано прозвище "ястребы". Правильно: У Чикаго сейчас одна задача...).
+- Английский оригинал: "Winnipeg showed interest but the deal is not easy to work out..."
+  ❌ Плохой перевод: "...однако сработать сделка не так просто" (Ошибка: корявый синтаксис. Правильно: ...однако провернуть эту сделку будет непросто).
+
+4. Авторство: Формат первой строки строго такой: [Имя Автора по-английски]: [Текст поста]. Пример: Chris Johnston: Эдмонтон вовсю ищет...
+
+5. Имена и команды: Склоняй игроков строго сверяясь с этим глоссарием:
+{names_glossary}
+
+6. Финал: В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока на английском] NHL photo.
+
+Оригинал: "{clean_text_for_ai}"
     """
     
     # --- ШАГ 1: GPT-4o через GitHub Models (Основной стабильный вариант) ---
@@ -227,57 +203,54 @@ def translate_tweet(raw_text):
             headers = {"Authorization": f"Bearer {GH_MODELS_TOKEN}", "Content-Type": "application/json"}
             data = {
                 "model": "gpt-4o",
-                "messages": [{"role": "user", "content": prompt}]
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
             }
             response = requests.post(url, headers=headers, json=data, timeout=15)
             if response.status_code == 200:
                 ai_text = response.json()['choices'][0]['message']['content']
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-            else:
-                print(f"❌ Ошибка Шага 1 (GitHub Models, Статус {response.status_code}): {response.text}")
         except Exception as e:
             print(f"⚠️ Сбой сети GitHub Models: {e}")
             time.sleep(1)
 
-    # --- ШАГ 2: Llama 3.3 70B через OpenRouter (Резервный) ---
+    # --- ШАГ 2: google/gemma-4-31b-it:free через OpenRouter (Резервный) ---
     if OPENROUTER_API_KEY:
         try:
-            print("🤖 Шаг 2: Пробуем Llama 3.3 70B через OpenRouter...")
+            print("🤖 Шаг 2: Пробуем google/gemma-4-31b-it:free через OpenRouter...")
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
             data = {
-                "model": "meta-llama/llama-3.3-70b-instruct:free",
-                "messages": [{"role": "user", "content": prompt}]
+                "model": "google/gemma-4-31b-it:free",
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
             }
             response = requests.post(url, headers=headers, json=data, timeout=15)
             if response.status_code == 200:
                 ai_text = response.json()['choices'][0]['message']['content']
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-            else:
-                print(f"❌ Ошибка Шага 2 (OpenRouter Llama, Статус {response.status_code})")
         except Exception as e:
-            print(f"⚠️ Сбой сети OpenRouter (Llama): {e}")
+            print(f"⚠️ Сбой сети OpenRouter (Gemma): {e}")
             time.sleep(1)
 
-    # --- ШАГ 3: GPT-OSS-120B через OpenRouter (Резервный) ---
+    # --- ШАГ 3: openai/gpt-oss-120b:free через OpenRouter (Резервный) ---
     if OPENROUTER_API_KEY:
         try:
-            print("🤖 Шаг 3: Пробуем GPT-OSS-120B через OpenRouter...")
+            print("🤖 Шаг 3: Пробуем gpt-oss-120b через OpenRouter...")
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
             data = {
                 "model": "openai/gpt-oss-120b:free",
-                "messages": [{"role": "user", "content": prompt}]
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": 0.1
             }
             response = requests.post(url, headers=headers, json=data, timeout=15)
             if response.status_code == 200:
                 ai_text = response.json()['choices'][0]['message']['content']
                 if ai_text:
                     return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-            else:
-                print(f"❌ Ошибка Шага 3 (OpenRouter GPT-OSS, Статус {response.status_code})")
         except Exception as e:
             print(f"⚠️ Сбой сети OpenRouter (GPT-OSS): {e}")
             time.sleep(1)
@@ -319,8 +292,11 @@ def main():
             else:
                 post_text = raw_response
             
-            # Накатываем исправление падежей на чистый текст перевода перед проверкой дубликатов и отправкой
+            # 1. Применяем исправление спортивной грамматики (падежи имен)
             post_text = fix_sports_grammar(post_text)
+            
+            # 2. Накатываем жесткую Python-фильтрацию против "ястребов", "гендиров" и "Лио"
+            post_text = clean_bot_hallucinations(post_text)
             
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
