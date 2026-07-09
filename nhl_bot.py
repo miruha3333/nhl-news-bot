@@ -70,8 +70,15 @@ def is_duplicate(new_text, existing_texts):
     return False
 
 def clean_bot_hallucinations(text):
-    """Жесткий фильтр терминологии и прозвищ."""
+    """Жесткий фильтр терминологии, прозвищ и вежливых фраз ИИ."""
     if not text: return text
+    
+    # Если нейросеть прислала дежурную фразу вместо новости — уничтожаем пост
+    chat_triggers = ["я понял задачу", "понял задачу", "давайте ваш текст", "вот ваш перевод", "конечно, вот", "адаптированный пост"]
+    if any(trigger in text.lower() for trigger in chat_triggers):
+        print("⚠️ Обнаружен пустой диалог нейросети вместо новости. Блокируем.")
+        return ""
+
     replacements = {
         "гендир": "генеральный менеджер",
         "дженерал менеджер": "генеральный менеджер",
@@ -123,7 +130,6 @@ def fix_sports_grammar(text):
 
 def download_image(query):
     """Ищет только качественные широкоформатные фото, полностью исключая ИИ-арт."""
-    # Жестко отсекаем вотермарки, стоковые логотипы, ИИ-генерации и рисунки
     clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark -ai -generated -midjourney -dalle -art -render -drawing -illustration"
     time.sleep(2)
     
@@ -133,7 +139,6 @@ def download_image(query):
     
     try:
         with DDGS() as ddgs:
-            # layout="Wide" и size="Large" заставляют искать большие горизонтальные фото
             results = list(ddgs.images(
                 query=clean_query, 
                 max_results=30,
@@ -143,29 +148,31 @@ def download_image(query):
             
             for res in results:
                 img_url = res['image']
-                img_url_lower = img_url.lower()
-                
-                # Защита от дубликатов: проверяем, не отправляли ли мы это фото раньше
-                if img_url in image_history:
-                    continue
-                if any(bad in img_url_lower for bad in bad_url_words): 
-                    continue
+                if img_url in image_history: continue
+                if any(bad in img_url.lower() for bad in bad_url_words): continue
                     
                 try:
                     response = requests.get(img_url, headers=headers, timeout=10)
                     if response.status_code == 200:
-                        add_to_image_history(img_url) # Запоминаем URL
+                        add_to_image_history(img_url)
                         with open("temp.png", 'wb') as handler: 
                             handler.write(response.content)
                         return "temp.png"
-                except Exception:
-                    continue
+                except Exception: continue
     except Exception as e:
         print(f"Ошибка поиска картинок: {e}")
     return None
 
 def translate_tweet(raw_text):
+    if not raw_text or not raw_text.strip():
+        return None
+        
     clean_text_for_ai = raw_text.rsplit(' - ', 1)[0] if ' - ' in raw_text else raw_text
+    
+    # ЖЕСТКАЯ ПРОВЕРКА: Если текст пустой или это просто технический обрубок, ИИ не трогаем
+    if not clean_text_for_ai.strip() or len(clean_text_for_ai.strip()) < 10:
+        print(f"⚠️ Новость слишком короткая или пустая ('{clean_text_for_ai}'), отмена запроса к ИИ.")
+        return None
 
     glossary_lines = []
     for eng, rus in NAMES_DICT.items():
@@ -190,7 +197,7 @@ def translate_tweet(raw_text):
 СТРОГИЕ ПРАВИЛА:
 1. ЖЕСТКАЯ ФАКТОЛОГИЯ (ГЛАВНОЕ ПРАВИЛО): Передавай ТОЛЬКО ту информацию, которая есть в оригинальном тексте. 
    - СТРОГО ЗАПРЕЩЕНО выдумывать новые факты, предыстории или контекст.
-   - СТРОГО ЗАПРЕЩЕНО использовать свои фоновые знания об игроках или командах (если в тексте нет упоминания КХЛ, СКА, возраста игрока — ты не имеешь права это писать).
+   - СТРОГО ЗАПРЕЩЕНО отвечать на этот промпт сообщениями в духе "Я понял задачу", "Давайте текст" или "Вот ваш перевод". Твой ответ обязан содержать ТОЛЬКО готовый новостной пост и ничего больше!
    - Если оригинальный инсайд короткий — твой пост должен быть таким же коротким. Никакой лишней «воды».
 
 2. ИМЕНА, КОМАНДЫ И АББРЕВИАТУРА:
@@ -215,6 +222,8 @@ def translate_tweet(raw_text):
 {names_glossary}
 
 6. Финал: В самой последней строке напиши строго: SEARCH_QUERY: [Имя главного игрока на английском] NHL match
+
+Оригинал для обработки: "{clean_text_for_ai}"
     """
     
     if GH_MODELS_TOKEN:
@@ -242,7 +251,7 @@ def translate_tweet(raw_text):
     return None
 
 def alternate_posts(posts):
-    """Алгоритм чередования: группирует новости по игрокам и перемешивает их, чтобы один игрок не шел подряд."""
+    """Алгоритм чередования: группирует новости по игрокам и перемешивает их."""
     if not posts: return []
     grouped = defaultdict(list)
     for p in posts:
@@ -273,7 +282,6 @@ def main():
     raw_posts_pool = []
     entries_to_save = []
     
-    # Сначала собираем и переводим все посты
     for entry in new_entries:
         raw_response = translate_tweet(entry.title)
         if raw_response:
@@ -286,6 +294,11 @@ def main():
             
             post_text = fix_sports_grammar(post_text)
             post_text = clean_bot_hallucinations(post_text)
+            
+            # Если Python-фильтр уничтожил текст из-за "чат-ботных" фраз — скипаем
+            if not post_text.strip():
+                entries_to_save.append(entry.title)
+                continue
             
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
@@ -303,7 +316,6 @@ def main():
                     'entry_title': entry.title
                 })
 
-    # Применяем алгоритм чередования игроков
     alternated_posts = alternate_posts(raw_posts_pool)
     
     combined_texts = []
@@ -329,7 +341,6 @@ def main():
         final_post = "\n\n".join(combined_texts)
         image_path = None
         
-        # Скачиваем уникальное фото по собранным поисковым запросам
         for query in search_queries:
             image_path = download_image(query)
             if image_path: break
