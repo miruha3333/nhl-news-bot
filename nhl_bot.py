@@ -6,17 +6,17 @@ import requests
 import difflib
 import pymorphy3
 import re
+from collections import defaultdict
 from ddgs import DDGS
 
 TOKEN = os.environ.get('TOKEN') 
 CHANNEL_ID = '-1004423088204' 
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
-
-# Проверяем оба возможных названия, чтобы исключить ошибку в main.yml
 GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN') or os.environ.get('GITHUB_TOKEN')
 
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
+IMAGE_HISTORY_FILE = "image_history.txt"
 morph = pymorphy3.MorphAnalyzer()
 
 # --- БИБЛИОТЕКА ПРАВИЛЬНЫХ ИМЕН ---
@@ -49,6 +49,16 @@ def add_to_history(title):
     with open(HISTORY_FILE, "a", encoding="utf-8") as f:
         f.write(title + "\n")
 
+def get_image_history():
+    if not os.path.exists(IMAGE_HISTORY_FILE): 
+        return set()
+    with open(IMAGE_HISTORY_FILE, "r", encoding="utf-8") as f:
+        return set(line.strip() for line in f)
+
+def add_to_image_history(url):
+    with open(IMAGE_HISTORY_FILE, "a", encoding="utf-8") as f:
+        f.write(url + "\n")
+
 def escape_html(text):
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
@@ -60,19 +70,14 @@ def is_duplicate(new_text, existing_texts):
     return False
 
 def clean_bot_hallucinations(text):
-    """
-    Жесткий Python-фильтр. Если нейросеть проигнорировала правила в промпте, 
-    этот блок принудительно вырежет и заменит все ошибки синтаксиса и прозвища.
-    """
-    if not text:
-        return text
-    
+    """Жесткий фильтр терминологии и прозвищ."""
+    if not text: return text
     replacements = {
         "гендир": "генеральный менеджер",
         "дженерал менеджер": "генеральный менеджер",
         "дженерал": "генеральный менеджер",
         "чигагских ястребов": "Чикаго",
-        "чикагские ястребы": "Чикаго",
+        "чикагские ястыебы": "Чикаго",
         "чикагских ястребах": "Чикаго",
         "у ястребов": "у Чикаго",
         "ястребы": "Чикаго",
@@ -83,10 +88,8 @@ def clean_bot_hallucinations(text):
         "Дарнеллы Нерса": "Дарнелла Нерса",
         "сработать сделка": "провернуть сделку"
     }
-    
     for bad_word, good_word in replacements.items():
         text = re.sub(r'\b' + re.escape(bad_word) + r'\b', good_word, text, flags=re.IGNORECASE)
-        
     return text
 
 def fix_sports_grammar(text):
@@ -119,28 +122,51 @@ def fix_sports_grammar(text):
     return " ".join(words)
 
 def download_image(query):
-    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark"
+    """Ищет только качественные широкоформатные фото, полностью исключая ИИ-арт."""
+    # Жестко отсекаем вотермарки, стоковые логотипы, ИИ-генерации и рисунки
+    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark -ai -generated -midjourney -dalle -art -render -drawing -illustration"
     time.sleep(2)
-    headers = {"User-Agent": "Mozilla/5.0"}
-    bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime']
+    
+    headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+    bad_url_words = ['alamy', 'getty', 'shutterstock', 'depositphotos', 'stock', 'dreamstime', 'vector', 'illustration']
+    image_history = get_image_history()
+    
     try:
         with DDGS() as ddgs:
-            results = list(ddgs.images(query=clean_query, max_results=15))
+            # layout="Wide" и size="Large" заставляют искать большие горизонтальные фото
+            results = list(ddgs.images(
+                query=clean_query, 
+                max_results=30,
+                layout="Wide",
+                size="Large"
+            ))
+            
             for res in results:
-                img_url = res['image'].lower()
-                if any(bad in img_url for bad in bad_url_words): continue
-                response = requests.get(res['image'], headers=headers, timeout=10)
-                if response.status_code == 200:
-                    with open("temp.png", 'wb') as handler: handler.write(response.content)
-                    return "temp.png"
+                img_url = res['image']
+                img_url_lower = img_url.lower()
+                
+                # Защита от дубликатов: проверяем, не отправляли ли мы это фото раньше
+                if img_url in image_history:
+                    continue
+                if any(bad in img_url_lower for bad in bad_url_words): 
+                    continue
+                    
+                try:
+                    response = requests.get(img_url, headers=headers, timeout=10)
+                    if response.status_code == 200:
+                        add_to_image_history(img_url) # Запоминаем URL
+                        with open("temp.png", 'wb') as handler: 
+                            handler.write(response.content)
+                        return "temp.png"
+                except Exception:
+                    continue
     except Exception as e:
-        print(f"Ошибка картинки: {e}")
+        print(f"Ошибка поиска картинок: {e}")
     return None
 
 def translate_tweet(raw_text):
     clean_text_for_ai = raw_text.rsplit(' - ', 1)[0] if ' - ' in raw_text else raw_text
 
-    # Подготовка глоссария падежей
     glossary_lines = []
     for eng, rus in NAMES_DICT.items():
         try:
@@ -164,98 +190,72 @@ def translate_tweet(raw_text):
 СТРОГИЕ ПРАВИЛА:
 1. ЖЕСТКАЯ ФАКТОЛОГИЯ (ГЛАВНОЕ ПРАВИЛО): Передавай ТОЛЬКО ту информацию, которая есть в оригинальном тексте. 
    - СТРОГО ЗАПРЕЩЕНО выдумывать новые факты, предыстории или контекст.
-   - СТРОГО ЗАПРЕЩЕНО использовать свои фоновые знания об игроках или командах (если в тексте нет упоминания КХЛ, СКА, возраста игрока или его личной жизни — ты не имеешь права это писать).
+   - СТРОГО ЗАПРЕЩЕНО использовать свои фоновые знания об игроках или командах (если в тексте нет упоминания КХЛ, СКА, возраста игрока — ты не имеешь права это писать).
    - Если оригинальный инсайд короткий — твой пост должен быть таким же коротким. Никакой лишней «воды».
 
 2. ИМЕНА, КОМАНДЫ И АББРЕВИАТУРА:
    - Используй ТОЛЬКО официальные полные названия команд или городов (Чикаго, Эдмонтон, Торонто, Виннипег). 
-   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать прозвища команд (никаких "ястребов", "листьев", "нефтяников", "сенаторов" и т.д.).
-   - Имя Leo переводится строго как Лео. Имя Darnell — как Дарнелл. Склоняй имена строго по правилам русского языка. Если сомневаешься в склонении — оставляй имя в начальной форме, но не коверкай.
-   - АББРЕВИАТУРЫ: GM -> генеральный менеджер (НИКОГДА не пиши "гендир" или "дженерал"). HC -> главный тренер. NTC/NMC -> пункт о запрете на обмен.
+   - КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО использовать прозвища команд (никаких "ястребов", "листьев", "нефтяников").
+   - Имя Leo переводится строго как Лео. Имя Darnell — как Дарнелл. Склоняй имена строго по правилам русского языка. Если сомневаешься в склонении — оставляй имя в начальной форме.
+   - АББРЕВИАТУРЫ: GM -> генеральный менеджер (НИКОГДА не пиши "гендир" или "дженерал"). HC -> главного тренера. NTC/NMC -> пункт о запрете на обмен.
 
-3. ПРАВИЛО СИНТАКСИСА: Перевод должен быть естественным для русского языка. Не копируй английскую структуру фраз. Избегай глупых ломаных конструкций.
+3. ПРАВИЛО СИНТАКСИСА: Перевод должен быть естественным для русского языка. Не копируй английскую структуру фраз. Избегай ломаных конструкций.
 
-ПРИМЕРЫ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕННОГО ПЕРЕВОДА (ТАКОЙ БРЕД ПИСАТЬ НЕЛЬЗЯ):
+ПРИМЕРЫ КАТЕГОРИЧЕСКИ ЗАПРЕЩЕННОГО ПЕРЕВОДА:
 - Английский оригинал: "Darnell Nurse situation in Edmonton..."
-  ❌ Плохой перевод: "История у Дарнеллы Нерса и Эдмонтона..." (Ошибка: имя Darnell соткано как женское. Правильно: ситуация с Дарнеллом Нерсом).
+  ❌ Плохой перевод: "История у Дарнеллы Нерса..." (Правильно: ситуация с Дарнеллом Нерсом).
 - Английский оригинал: "Chicago GM Kyle Davidson started talks..."
-  ❌ Плохой перевод: "Гендир Дженерал Кайл Дэвидсон..." (Ошибка: бред в аббревиатуре GM. Правильно: Генеральный менеджер Чикаго Кайл Дэвидсон).
+  ❌ Плохой перевод: "Гендир Дженерал Кайл Дэвидсон..." (Правильно: Генеральный менеджер Чикаго Кайл Дэвидсон).
 - Английский оригинал: "Chicago Blackhawks are on alert..."
-  ❌ Плохой перевод: "У чикагских ястребов сейчас одна задача..." (Ошибка: использовано прозвище "ястребы". Правильно: У Чикаго сейчас одна задача...).
-- Английский оригинал: "Winnipeg showed interest but the deal is not easy to work out..."
-  ❌ Плохой перевод: "...однако сработать сделка не так просто" (Ошибка: корявый синтаксис. Правильно: ...однако провернуть эту сделку будет непросто).
+  ❌ Плохой перевод: "У чикагских ястребов сейчас одна задача..." (Правильно: У Чикаго сейчас одна задача...).
 
-4. Авторство: Формат первой строки строго такой: [Имя Автора по-английски]: [Текст поста]. Пример: Chris Johnston: Эдмонтон вовсю ищет...
+4. Авторство: Формат первой строки строго такой: [Имя Автора по-английски]: [Текст поста].
 
-5. Имена и команды: Склоняй игроков строго сверяясь с этим глоссарием:
+5. Глоссарий имен:
 {names_glossary}
 
-6. Финал: В самой последней строке (с новой строки) напиши строго: SEARCH_QUERY: [Имя главного игрока на английском] NHL photo.
-
-Оригинал: "{clean_text_for_ai}"
+6. Финал: В самой последней строке напиши строго: SEARCH_QUERY: [Имя главного игрока на английском] NHL match
     """
     
-    # --- ШАГ 1: GPT-4o через GitHub Models (Основной стабильный вариант) ---
     if GH_MODELS_TOKEN:
         try:
-            print("🤖 Шаг 1: Пробуем GPT-4o через GitHub Models...")
             url = "https://models.inference.ai.azure.com/chat/completions"
             headers = {"Authorization": f"Bearer {GH_MODELS_TOKEN}", "Content-Type": "application/json"}
-            data = {
-                "model": "gpt-4o",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1
-            }
+            data = {"model": "gpt-4o", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
             response = requests.post(url, headers=headers, json=data, timeout=15)
             if response.status_code == 200:
                 ai_text = response.json()['choices'][0]['message']['content']
-                if ai_text:
-                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-        except Exception as e:
-            print(f"⚠️ Сбой сети GitHub Models: {e}")
-            time.sleep(1)
+                if ai_text: return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception: pass
 
-    # --- ШАГ 2: google/gemma-4-31b-it:free через OpenRouter (Резервный) ---
     if OPENROUTER_API_KEY:
         try:
-            print("🤖 Шаг 2: Пробуем google/gemma-4-31b-it:free через OpenRouter...")
             url = "https://openrouter.ai/api/v1/chat/completions"
             headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            data = {
-                "model": "google/gemma-4-31b-it:free",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1
-            }
+            data = {"model": "google/gemma-4-31b-it:free", "messages": [{"role": "user", "content": prompt}], "temperature": 0.1}
             response = requests.post(url, headers=headers, json=data, timeout=15)
             if response.status_code == 200:
                 ai_text = response.json()['choices'][0]['message']['content']
-                if ai_text:
-                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-        except Exception as e:
-            print(f"⚠️ Сбой сети OpenRouter (Gemma): {e}")
-            time.sleep(1)
-
-    # --- ШАГ 3: openai/gpt-oss-120b:free через OpenRouter (Резервный) ---
-    if OPENROUTER_API_KEY:
-        try:
-            print("🤖 Шаг 3: Пробуем gpt-oss-120b через OpenRouter...")
-            url = "https://openrouter.ai/api/v1/chat/completions"
-            headers = {"Authorization": f"Bearer {OPENROUTER_API_KEY}", "Content-Type": "application/json"}
-            data = {
-                "model": "openai/gpt-oss-120b:free",
-                "messages": [{"role": "user", "content": prompt}],
-                "temperature": 0.1
-            }
-            response = requests.post(url, headers=headers, json=data, timeout=15)
-            if response.status_code == 200:
-                ai_text = response.json()['choices'][0]['message']['content']
-                if ai_text:
-                    return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
-        except Exception as e:
-            print(f"⚠️ Сбой сети OpenRouter (GPT-OSS): {e}")
-            time.sleep(1)
+                if ai_text: return ai_text.replace("**", "").replace('"', "").replace("«", "").replace("»", "").strip()
+        except Exception: pass
 
     return None
+
+def alternate_posts(posts):
+    """Алгоритм чередования: группирует новости по игрокам и перемешивает их, чтобы один игрок не шел подряд."""
+    if not posts: return []
+    grouped = defaultdict(list)
+    for p in posts:
+        grouped[p['query']].append(p)
+    
+    sorted_posts = []
+    while any(grouped.values()):
+        for key in list(grouped.keys()):
+            if grouped[key]:
+                sorted_posts.append(grouped[key].pop(0))
+            else:
+                del grouped[key]
+    return sorted_posts
 
 def main():
     feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
@@ -270,67 +270,70 @@ def main():
         print("Новых постов нет.")
         return
         
-    combined_texts = []
-    pure_texts_for_diff = [] 
-    main_search_query = None
-    search_queries = [] 
+    raw_posts_pool = []
     entries_to_save = []
     
+    # Сначала собираем и переводим все посты
     for entry in new_entries:
         raw_response = translate_tweet(entry.title)
-        
         if raw_response:
+            query_part = "NHL match action"
+            post_text = raw_response
             if "SEARCH_QUERY:" in raw_response:
                 idx = raw_response.rfind("SEARCH_QUERY:")
                 post_text = raw_response[:idx].strip()
                 query_part = raw_response[idx:].replace("SEARCH_QUERY:", "").strip()
-                
-                if not main_search_query and query_part:
-                    main_search_query = query_part
-                if query_part:
-                    search_queries.append(query_part)
-            else:
-                post_text = raw_response
             
-            # 1. Применяем исправление спортивной грамматики (падежи имен)
             post_text = fix_sports_grammar(post_text)
-            
-            # 2. Накатываем жесткую Python-фильтрацию против "ястребов", "гендиров" и "Лио"
             post_text = clean_bot_hallucinations(post_text)
             
             if ": " in post_text:
                 author, text_content = post_text.split(": ", 1)
-                author = author.replace("Источник", "").strip() 
-                
-                if is_duplicate(text_content, pure_texts_for_diff):
-                    print(f"Найден дубль, пропускаем: {text_content[:30]}...")
-                    entries_to_save.append(entry.title) 
-                    continue
-                
-                pure_texts_for_diff.append(text_content)
-                formatted_text = f"<b>{escape_html(author)}</b>\n{escape_html(text_content)}"
+                raw_posts_pool.append({
+                    'author': author.replace("Источник", "").strip(),
+                    'text': text_content,
+                    'query': query_part,
+                    'entry_title': entry.title
+                })
             else:
-                if is_duplicate(post_text, pure_texts_for_diff):
-                    entries_to_save.append(entry.title)
-                    continue
-                pure_texts_for_diff.append(post_text)
-                formatted_text = escape_html(post_text)
-                
-            combined_texts.append(formatted_text)
-            entries_to_save.append(entry.title)
+                raw_posts_pool.append({
+                    'author': "",
+                    'text': post_text,
+                    'query': query_part,
+                    'entry_title': entry.title
+                })
+
+    # Применяем алгоритм чередования игроков
+    alternated_posts = alternate_posts(raw_posts_pool)
+    
+    combined_texts = []
+    pure_texts_for_diff = []
+    search_queries = []
+    
+    for p in alternated_posts:
+        if is_duplicate(p['text'], pure_texts_for_diff):
+            entries_to_save.append(p['entry_title'])
+            continue
+            
+        pure_texts_for_diff.append(p['text'])
+        if p['author']:
+            formatted_text = f"<b>{escape_html(p['author'])}</b>\n{escape_html(p['text'])}"
+        else:
+            formatted_text = escape_html(p['text'])
+            
+        combined_texts.append(formatted_text)
+        search_queries.append(p['query'])
+        entries_to_save.append(p['entry_title'])
             
     if combined_texts:
         final_post = "\n\n".join(combined_texts)
         image_path = None
         
+        # Скачиваем уникальное фото по собранным поисковым запросам
         for query in search_queries:
             image_path = download_image(query)
-            if image_path:
-                break
+            if image_path: break
                 
-        if not image_path and main_search_query:
-            image_path = download_image(main_search_query)
-            
         if not image_path:
             image_path = download_image("NHL ice hockey match action")
         
@@ -348,8 +351,7 @@ def main():
                 except Exception as e:
                     print(f"⚠️ Telegram отклонил файл: {e}")
                 finally:
-                    if os.path.exists(image_path):
-                        os.remove(image_path)
+                    if os.path.exists(image_path): os.remove(image_path)
             
             if not image_sent:
                 bot.send_message(CHANNEL_ID, final_post, parse_mode='HTML')
