@@ -25,8 +25,7 @@ jobs:
         run: python nhl_bot.py
         env:
           TOKEN: ${{ secrets.TOKEN }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
-          GITHUB_TOKEN: ${{ secrets.GH_MODELS_TOKEN }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
 
       - name: Commit history
         run: |
