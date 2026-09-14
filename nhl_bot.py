@@ -13,7 +13,13 @@ CHANNEL_ID = '-1004423088204'
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
 GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN') or os.environ.get('GITHUB_TOKEN')
 
-RSS_URL = "https://nitter.poast.org/NHLRumourReport/rss"
+RSS_URLS = [
+    "https://rss-bridge.org/bridge01/?action=display&bridge=TwitterBridge&context=By+username&u=NHLRumourReport&format=Atom",
+    "https://bridge.nodal.zone/?action=display&bridge=TwitterBridge&context=By+username&u=NHLRumourReport&format=Atom",
+    "https://rss.dresden.network/?action=display&bridge=TwitterBridge&context=By+username&u=NHLRumourReport&format=Atom",
+    "https://rssbridge.pw/?action=display&bridge=TwitterBridge&context=By+username&u=NHLRumourReport&format=Atom"
+]
+
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 IMAGE_HISTORY_FILE = "image_history.txt"
@@ -218,23 +224,29 @@ def main():
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
     }
     
-    try:
-        response = requests.get(RSS_URL, headers=headers, timeout=15)
-        response.raise_for_status()
-        feed = feedparser.parse(response.content)
-    except Exception as e:
-        print(f"❌ Ошибка загрузки RSS: {e}")
-        return
+    feed = None
+    for url in RSS_URLS:
+        try:
+            response = requests.get(url, headers=headers, timeout=15)
+            if response.status_code == 200:
+                parsed = feedparser.parse(response.content)
+                if parsed.entries:
+                    feed = parsed
+                    break
+        except Exception as e:
+            print(f"⚠️ Ошибка загрузки с {url}: {e}")
 
-    if not feed.entries:
-        print("⚠️ RSS лента пуста.")
+    if not feed or not feed.entries:
+        print("❌ Не удалось получить новости ни с одного RSS-моста.")
         return
 
     history = get_history()
     
     new_entries = []
     for entry in reversed(feed.entries[:10]):
-        if entry.title not in history:
+        title = getattr(entry, 'title', '').strip() or getattr(entry, 'summary', '').strip()
+        if title and title not in history:
+            entry.title = title
             new_entries.append(entry)
             
     if not new_entries:
