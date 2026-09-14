@@ -1,9 +1,10 @@
 import feedparser
 import os
 import sys
-import requests
+import urllib.request
 
 HISTORY_FILE = "history.txt"
+RSS_URL = "https://nitter.poast.org/NHLRumourReport/rss"
 
 def get_history():
     if not os.path.exists(HISTORY_FILE): 
@@ -12,18 +13,15 @@ def get_history():
         return set(line.strip() for line in f)
 
 def main():
-    # Используем рабочее зеркало Nitter
-    rss_url = "https://nitter.poast.org/NHLRumourReport/rss"
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-    }
+    req = urllib.request.Request(
+        RSS_URL, 
+        headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"}
+    )
     
     try:
-        # Загружаем RSS через requests, чтобы отловить ошибки HTTP
-        response = requests.get(rss_url, headers=headers, timeout=15)
-        response.raise_for_status()
-        
-        feed = feedparser.parse(response.content)
+        with urllib.request.urlopen(req, timeout=15) as response:
+            content = response.read()
+            feed = feedparser.parse(content)
         
         if not feed.entries:
             print("Ошибка: RSS лента пуста или недоступна.")
