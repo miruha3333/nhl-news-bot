@@ -1,6 +1,7 @@
 import feedparser
 import os
 import sys
+import requests
 
 HISTORY_FILE = "history.txt"
 
@@ -11,10 +12,19 @@ def get_history():
         return set(line.strip() for line in f)
 
 def main():
+    # Используем рабочее зеркало Nitter
+    rss_url = "https://nitter.poast.org/NHLRumourReport/rss"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+    
     try:
-        feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
+        # Загружаем RSS через requests, чтобы отловить ошибки HTTP
+        response = requests.get(rss_url, headers=headers, timeout=15)
+        response.raise_for_status()
         
-        # Проверяем, что лента успешно загрузилась и в ней есть записи
+        feed = feedparser.parse(response.content)
+        
         if not feed.entries:
             print("Ошибка: RSS лента пуста или недоступна.")
             sys.exit(1)
@@ -28,7 +38,6 @@ def main():
         
         if last_title not in history:
             print("Найдена новая новость!")
-            # Записываем переменную для GitHub Actions в специальный файл среды
             if "GITHUB_OUTPUT" in os.environ:
                 with open(os.environ["GITHUB_OUTPUT"], "a") as f:
                     f.write("NEW_NEWS=true\n")
