@@ -10,7 +10,11 @@ import telebot
 
 TOKEN = os.environ.get("TOKEN")
 CHANNEL_ID = "-1004423088204"
+
+# Ключи для нейросетей
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY")
+OPENROUTER_API_KEY = os.environ.get("OPENROUTER_API_KEY")
+HF_TOKEN = os.environ.get("HF_TOKEN")
 
 RSS_URL = "https://rss.app/feeds/sbl4f7OUFIrh9Wsk.xml"
 
@@ -116,51 +120,139 @@ def clean_bot_hallucinations(text):
     return text
 
 
-def download_image(query):
-    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark -ai -generated -midjourney -dalle -art -render -drawing -illustration"
-    time.sleep(2)
+def parse_final_post_text(ai_text):
+    """Извлекает блок [FINAL_POST] и очищает его от лишних символов и тегов мыслей."""
+    if not ai_text:
+        return None
 
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+    # Отрезаем размышления DeepSeek-R1, если они присутствуют
+    ai_text = re.sub(r"<think>.*?</think>", "", ai_text, flags=re.DOTALL)
+
+    if "[FINAL_POST]" in ai_text and "[/FINAL_POST]" in ai_text:
+        ai_text = ai_text.split("[FINAL_POST]")[1].split("[/FINAL_POST]")[0].strip()
+
+    cleaned = (
+        ai_text.replace("**", "")
+        .replace('"', "")
+        .replace("«", "")
+        .replace("»", "")
+        .strip()
+    )
+    return cleaned if len(cleaned) > 10 else None
+
+
+# --- БЛОКИ ОБРАЩЕНИЯ К НЕЙРОСЕТЯМ С ПОВТОРАМИ (5 РАЗ ПО 5 СЕКУНД) ---
+
+
+def request_gemini(prompt):
+    if not GEMINI_API_KEY:
+        return None
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {"temperature": 0.1},
     }
-    bad_url_words = [
-        "alamy",
-        "getty",
-        "shutterstock",
-        "depositphotos",
-        "stock",
-        "dreamstime",
-        "vector",
-        "illustration",
-    ]
-    image_history = get_image_history()
+    headers = {"Content-Type": "application/json"}
 
-    try:
-        with DDGS() as ddgs:
-            results = list(
-                ddgs.images(
-                    query=clean_query, max_results=30, layout="Wide", size="Large"
-                )
-            )
+    for attempt in range(1, 6):
+        try:
+            print(f"Попытка Gemini {attempt}/5...")
+            response = requests.post(url, headers=headers, json=payload, timeout=20)
+            if response.status_code == 200:
+                data = response.json()
+                candidates = data.get("candidates", [])
+                if candidates:
+                    parts = candidates[0].get("content", {}).get("parts", [])
+                    if parts:
+                        text = parts[0].get("text", "")
+                        result = parse_final_post_text(text)
+                        if result:
+                            return result
+            else:
+                print(f"⚠️ Gemini вернул код {response.status_code}: {response.text[:100]}")
+        except Exception as e:
+            print(f"⚠️ Ошибка запроса к Gemini: {e}")
 
-            for res in results:
-                img_url = res.get("image")
-                if not img_url or img_url in image_history:
-                    continue
-                if any(bad in img_url.lower() for bad in bad_url_words):
-                    continue
+        if attempt < 5:
+            time.sleep(5)
 
-                try:
-                    response = requests.get(img_url, headers=headers, timeout=10)
-                    if response.status_code == 200:
-                        add_to_image_history(img_url)
-                        with open("temp.png", "wb") as handler:
-                            handler.write(response.content)
-                        return "temp.png"
-                except Exception:
-                    continue
-    except Exception as e:
-        print(f"Ошибка поиска картинок: {e}")
+    return None
+
+
+def request_openrouter(prompt):
+    if not OPENROUTER_API_KEY:
+        return None
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "google/gemma-4-26b-a4b-it:free",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+    }
+
+    for attempt in range(1, 6):
+        try:
+            print(f"Попытка OpenRouter {attempt}/5...")
+            response = requests.post(url, headers=headers, json=payload, timeout=25)
+            if response.status_code == 200:
+                data = response.json()
+                choices = data.get("choices", [])
+                if choices:
+                    raw_text = choices[0].get("message", {}).get("content", "")
+                    result = parse_final_post_text(raw_text)
+                    if result:
+                        return result
+            else:
+                print(f"⚠️ OpenRouter вернул код {response.status_code}: {response.text[:100]}")
+        except Exception as e:
+            print(f"⚠️ Ошибка запроса к OpenRouter: {e}")
+
+        if attempt < 5:
+            time.sleep(5)
+
+    return None
+
+
+def request_huggingface(prompt):
+    if not HF_TOKEN:
+        return None
+
+    url = "https://router.huggingface.co/v1/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {HF_TOKEN}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": "deepseek-ai/DeepSeek-R1:novita",
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0.1,
+    }
+
+    for attempt in range(1, 6):
+        try:
+            print(f"Попытка Hugging Face {attempt}/5...")
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            if response.status_code == 200:
+                data = response.json()
+                choices = data.get("choices", [])
+                if choices:
+                    raw_text = choices[0].get("message", {}).get("content", "")
+                    result = parse_final_post_text(raw_text)
+                    if result:
+                        return result
+            else:
+                print(f"⚠️ Hugging Face вернул код {response.status_code}: {response.text[:100]}")
+        except Exception as e:
+            print(f"⚠️ Ошибка запроса к Hugging Face: {e}")
+
+        if attempt < 5:
+            time.sleep(5)
+
     return None
 
 
@@ -213,55 +305,72 @@ def translate_tweet(raw_text):
 Оригинал для обработки: "{clean_text_for_ai}"
 """
 
-    if not GEMINI_API_KEY:
-        print("❌ Ошибка: Не задана переменная GEMINI_API_KEY")
-        return None
+    # 1. Приоритет: Google Gemini
+    result = request_gemini(prompt)
+    if result:
+        return result
 
-    # Запрос к Google Gemini API (модель gemini-2.5-flash / gemini-1.5-flash)
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key={GEMINI_API_KEY}"
-    headers = {"Content-Type": "application/json"}
-    payload = {
-        "contents": [{"parts": [{"text": prompt}]}],
-        "generationConfig": {
-            "temperature": 0.1
-        }
+    # 2. Второй резерв: OpenRouter
+    print("⚠️ Gemini не ответил за 5 попыток. Переключаемся на OpenRouter...")
+    result = request_openrouter(prompt)
+    if result:
+        return result
+
+    # 3. Третий резерв: Hugging Face
+    print("⚠️ OpenRouter не ответил за 5 попыток. Переключаемся на Hugging Face...")
+    result = request_huggingface(prompt)
+    if result:
+        return result
+
+    print("❌ Ни одна из трех нейросетей не смогла обработать пост.")
+    return None
+
+
+def download_image(query):
+    clean_query = f"{query} -getty -alamy -shutterstock -stock -watermark -ai -generated -midjourney -dalle -art -render -drawing -illustration"
+    time.sleep(2)
+
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
+    bad_url_words = [
+        "alamy",
+        "getty",
+        "shutterstock",
+        "depositphotos",
+        "stock",
+        "dreamstime",
+        "vector",
+        "illustration",
+    ]
+    image_history = get_image_history()
 
     try:
-        response = requests.post(url, headers=headers, json=payload, timeout=20)
-        
-        # Если модель gemini-2.5-flash недоступна на ключе, пробуем резервную gemini-1.5-flash
-        if response.status_code != 200:
-            fallback_url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={GEMINI_API_KEY}"
-            response = requests.post(fallback_url, headers=headers, json=payload, timeout=20)
+        with DDGS() as ddgs:
+            results = list(
+                ddgs.images(
+                    query=clean_query, max_results=30, layout="Wide", size="Large"
+                )
+            )
 
-        if response.status_code == 200:
-            data = response.json()
-            candidates = data.get("candidates", [])
-            if candidates:
-                parts = candidates[0].get("content", {}).get("parts", [])
-                if parts:
-                    ai_text = parts[0].get("text", "")
-                    if "[FINAL_POST]" in ai_text and "[/FINAL_POST]" in ai_text:
-                        ai_text = (
-                            ai_text.split("[FINAL_POST]")[1]
-                            .split("[/FINAL_POST]")[0]
-                            .strip()
-                        )
-                        return (
-                            ai_text.replace("**", "")
-                            .replace('"', "")
-                            .replace("«", "")
-                            .replace("»", "")
-                            .strip()
-                        )
-                    # Если теги не вывелись, берем текст целиком
-                    return ai_text.replace("**", "").strip()
-        else:
-            print(f"Ошибка ответа Gemini API ({response.status_code}): {response.text}")
+            for res in results:
+                img_url = res.get("image")
+                if not img_url or img_url in image_history:
+                    continue
+                if any(bad in img_url.lower() for bad in bad_url_words):
+                    continue
+
+                try:
+                    response = requests.get(img_url, headers=headers, timeout=10)
+                    if response.status_code == 200:
+                        add_to_image_history(img_url)
+                        with open("temp.png", "wb") as handler:
+                            handler.write(response.content)
+                        return "temp.png"
+                except Exception:
+                    continue
     except Exception as e:
-        print(f"Ошибка вызова Gemini: {e}")
-
+        print(f"Ошибка поиска картинок: {e}")
     return None
 
 
