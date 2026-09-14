@@ -13,12 +13,11 @@ CHANNEL_ID = '-1004423088204'
 OPENROUTER_API_KEY = os.environ.get('OPENROUTER_API_KEY')
 GH_MODELS_TOKEN = os.environ.get('GH_MODELS_TOKEN') or os.environ.get('GITHUB_TOKEN')
 
+RSS_URL = "https://nitter.poast.org/NHLRumourReport/rss"
 bot = telebot.TeleBot(TOKEN)
 HISTORY_FILE = "history.txt"
 IMAGE_HISTORY_FILE = "image_history.txt"
 
-# --- БИБЛИОТЕКА ПРАВИЛЬНЫХ ИМЕН (Именительный падеж) ---
-# GPT-4o сама идеально просклоняет эти имена, если дать ей правильную базу.
 NAMES_DICT = {
     "Mason Marchment": "Мэйсон Марчмент",
     "J.J. Peterka": "Дж. Дж. Петерка",
@@ -75,7 +74,6 @@ def is_duplicate(new_text, existing_texts):
     return False
 
 def clean_bot_hallucinations(text):
-    """Очистка явных словесных артефактов и грубых ошибок."""
     if not text: return text
     
     chat_triggers = ["я понял задачу", "понял задачу", "давайте ваш текст", "вот ваш перевод", "конечно, вот", "адаптированный пост"]
@@ -136,7 +134,6 @@ def translate_tweet(raw_text):
         print(f"⚠️ Новость слишком короткая или пустая ('{clean_text_for_ai}'), отмена запроса к ИИ.")
         return None
 
-    # Генерируем простой и понятный ИИ глоссарий соответствий имен
     glossary_lines = [f"- {eng} -> {rus}" for eng, rus in NAMES_DICT.items()]
     names_glossary = "\n".join(glossary_lines)
 
@@ -171,7 +168,6 @@ def translate_tweet(raw_text):
 Оригинал для обработки: "{clean_text_for_ai}"
 """
     
-    # Сначала пытаемся использовать мощную GPT-4o
     if GH_MODELS_TOKEN:
         try:
             url = "https://models.inference.ai.azure.com/chat/completions"
@@ -186,7 +182,6 @@ def translate_tweet(raw_text):
         except Exception as e:
             print(f"Ошибка GH Models: {e}")
 
-    # Запасной вариант (Gemma на OpenRouter)
     if OPENROUTER_API_KEY:
         try:
             url = "https://openrouter.ai/api/v1/chat/completions"
@@ -219,7 +214,22 @@ def alternate_posts(posts):
     return sorted_posts
 
 def main():
-    feed = feedparser.parse("https://nitter.net/NHLRumourReport/rss")
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+    }
+    
+    try:
+        response = requests.get(RSS_URL, headers=headers, timeout=15)
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+    except Exception as e:
+        print(f"❌ Ошибка загрузки RSS: {e}")
+        return
+
+    if not feed.entries:
+        print("⚠️ RSS лента пуста.")
+        return
+
     history = get_history()
     
     new_entries = []
@@ -244,7 +254,6 @@ def main():
                 post_text = raw_response[:idx].strip()
                 query_part = raw_response[idx:].replace("SEARCH_QUERY:", "").strip()
             
-            # Больше никакой костыльной постобработки грамматики! Доверяем ИИ.
             post_text = clean_bot_hallucinations(post_text)
             
             if not post_text.strip():
