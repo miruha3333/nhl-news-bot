@@ -146,7 +146,7 @@ gemini_primary_disabled = False
 # =============================================================================
 
 def get_existing_columns(connection, table_name):
-"""
+    
 Return the existing column names for a SQLite table.
 
 ```
