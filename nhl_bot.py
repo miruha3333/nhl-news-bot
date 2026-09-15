@@ -1,4 +1,3 @@
-````python
 import os
 import re
 import time
@@ -13,9 +12,9 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 
 
-# =========================================================
+# =============================================================================
 # SETTINGS
-# =========================================================
+# =============================================================================
 
 RSS_URL = os.getenv("RSS_URL", "").strip()
 
@@ -43,17 +42,103 @@ GEMINI_DELAY = 1.0
 
 MAX_ARTICLE_TEXT = 12000
 
+# Image scoring settings.
+FRESH_DAYS = 90
+HISTORICAL_YEAR_TOLERANCE = 3
 
-# =========================================================
+
+# =============================================================================
+# IMAGE SCORING CONFIG
+# =============================================================================
+
+GOOD_DOMAINS = {
+    "nhl.com": 70,
+    "espn.com": 65,
+    "sportsnet.ca": 60,
+    "tsn.ca": 60,
+    "reuters.com": 50,
+    "apnews.com": 50,
+    "usatoday.com": 45,
+    "theathletic.com": 45,
+    "cbc.ca": 40,
+    "si.com": 40,
+    "detroitnews.com": 40,
+    "freep.com": 40,
+}
+
+BAD_DOMAINS = {
+    "gettyimages.com": -100,
+    "alamy.com": -100,
+    "shutterstock.com": -100,
+    "depositphotos.com": -100,
+    "dreamstime.com": -100,
+    "istockphoto.com": -100,
+    "123rf.com": -100,
+    "stock.adobe.com": -100,
+}
+
+BAD_WORDS = {
+    "logo": -100,
+    "infographic": -100,
+    "illustration": -80,
+    "wallpaper": -70,
+    "poster": -70,
+    "merchandise": -100,
+    "shirt": -80,
+    "jersey sale": -80,
+    "basketball": -120,
+    "football": -120,
+    "baseball": -120,
+    "soccer": -120,
+    "golf": -100,
+    "wrestling": -100,
+    "podcast": -30,
+}
+
+GOOD_WORDS = {
+    "nhl": 10,
+    "hockey": 10,
+    "ice hockey": 10,
+}
+
+OPPONENT_PATTERNS = [
+    r"\bvs\.?\b",
+    r"\bversus\b",
+    r"\bagainst\b",
+    r"\bface\b",
+    r"\bfacing\b",
+    r"\bfaces\b",
+]
+
+TEAM_CHANGE_WORDS = [
+    "sign",
+    "signed",
+    "signing",
+    "contract",
+    "joins",
+    "joined",
+    "join",
+    "acquired",
+    "traded",
+    "trade",
+    "deal",
+    "agrees",
+    "agreed",
+    "lands",
+    "new home",
+]
+
+
+# =============================================================================
 # GEMINI STATE
-# =========================================================
+# =============================================================================
 
 gemini_primary_disabled = False
 
 
-# =========================================================
+# =============================================================================
 # DATABASE
-# =========================================================
+# =============================================================================
 
 def get_db():
     connection = sqlite3.connect(
@@ -100,9 +185,9 @@ def get_db():
     return connection
 
 
-# =========================================================
+# =============================================================================
 # DATABASE HELPERS
-# =========================================================
+# =============================================================================
 
 def normalize_url(url):
     if not url:
@@ -257,7 +342,7 @@ def save_image(url, used=False):
                 used,
                 created_at
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?, ?, ?)
             ON CONFLICT(url)
             DO UPDATE SET
                 used = excluded.used
@@ -323,9 +408,9 @@ def log_error(url, error):
         connection.close()
 
 
-# =========================================================
+# =============================================================================
 # RSS
-# =========================================================
+# =============================================================================
 
 def clean_html(text):
     if not text:
@@ -401,9 +486,9 @@ def get_rss_entries():
     return entries
 
 
-# =========================================================
+# =============================================================================
 # ARTICLE TEXT
-# =========================================================
+# =============================================================================
 
 def get_article_text(entry):
     parts = []
@@ -433,9 +518,9 @@ def get_article_text(entry):
     return text[:MAX_ARTICLE_TEXT]
 
 
-# =========================================================
+# =============================================================================
 # GEMINI
-# =========================================================
+# =============================================================================
 
 def gemini_request(
     prompt,
@@ -881,10 +966,6 @@ ARTICLE:
         "[GEMINI] All models failed."
     )
 
-    # =====================================================
-    # EMERGENCY FALLBACK
-    # =====================================================
-
     fallback_query = (
         build_fallback_search_query(
             title,
@@ -898,18 +979,15 @@ ARTICLE:
             "will be used."
         )
 
-    # Если Gemini полностью недоступен,
-    # возвращаем исходный английский текст.
-    # Это лучше, чем потерять новость полностью.
     return {
         "post": article_text[:4000],
         "search_query": fallback_query
     }
 
 
-# =========================================================
+# =============================================================================
 # IMAGE SEARCH
-# =========================================================
+# =============================================================================
 
 BAD_URL_PATTERNS = [
     "getty",
@@ -952,6 +1030,250 @@ BAD_DOMAIN_PATTERNS = [
     "instagram",
     "twitter"
 ]
+
+
+def normalize_text(value):
+    if not value:
+        return ""
+
+    value = str(value).lower()
+    value = value.replace(
+        "’",
+        "'"
+    )
+
+    value = re.sub(
+        r"\s+",
+        " ",
+        value
+    )
+
+    return value.strip()
+
+
+def get_domain(url):
+    if not url:
+        return ""
+
+    try:
+        domain = urlparse(
+            url
+        ).netloc.lower()
+
+        domain = domain.replace(
+            "www.",
+            ""
+        )
+
+        return domain
+
+    except Exception:
+        return ""
+
+
+def get_base_domain(domain):
+    parts = domain.split(".")
+
+    if len(parts) >= 2:
+        return ".".join(
+            parts[-2:]
+        )
+
+    return domain
+
+
+def extract_years(text):
+    if not text:
+        return []
+
+    years = []
+
+    for match in re.findall(
+        r"\b(19\d{2}|20\d{2})\b",
+        str(text)
+    ):
+        years.append(
+            int(match)
+        )
+
+    return years
+
+
+def to_int(value):
+    if value is None:
+        return None
+
+    try:
+        return int(value)
+
+    except (
+        TypeError,
+        ValueError
+    ):
+        return None
+
+
+def parse_result_date(result):
+    possible_fields = [
+        "date",
+        "published",
+        "published_date",
+        "datetime",
+        "timestamp",
+        "title",
+        "body",
+        "snippet",
+        "source",
+        "url",
+    ]
+
+    for field in possible_fields:
+
+        value = result.get(
+            field
+        )
+
+        if not value:
+            continue
+
+        years = extract_years(
+            value
+        )
+
+        for year in years:
+
+            if (
+                1900
+                <= year
+                <= datetime.now().year + 1
+            ):
+                return year
+
+    return None
+
+
+def is_probably_valid_result(result):
+    image_url = result.get(
+        "image"
+    )
+
+    if not image_url:
+        return False
+
+    width = to_int(
+        result.get("width")
+    )
+
+    height = to_int(
+        result.get("height")
+    )
+
+    if width and width < 300:
+        return False
+
+    if height and height < 200:
+        return False
+
+    return True
+
+
+def normalize_page_url(url):
+    if not url:
+        return ""
+
+    try:
+        parsed = urlparse(
+            url
+        )
+
+        path = parsed.path.rstrip(
+            "/"
+        )
+
+        return (
+            f"{parsed.scheme.lower()}://"
+            f"{parsed.netloc.lower()}"
+            f"{path}"
+        )
+
+    except Exception:
+        return url
+
+
+def make_result_key(result):
+    page_url = normalize_page_url(
+        result.get("url")
+    )
+
+    if page_url:
+        return page_url
+
+    image_url = result.get(
+        "image",
+        ""
+    )
+
+    return image_url.split(
+        "?",
+        1
+    )[0]
+
+
+def deduplicate_results(results):
+    unique = {}
+
+    for result in results:
+
+        key = make_result_key(
+            result
+        )
+
+        if not key:
+            continue
+
+        if key not in unique:
+            unique[key] = result
+            continue
+
+        old = unique[key]
+
+        old_width = (
+            to_int(
+                old.get("width")
+            )
+            or 0
+        )
+
+        old_height = (
+            to_int(
+                old.get("height")
+            )
+            or 0
+        )
+
+        new_width = (
+            to_int(
+                result.get("width")
+            )
+            or 0
+        )
+
+        new_height = (
+            to_int(
+                result.get("height")
+            )
+            or 0
+        )
+
+        if (
+            new_width * new_height
+            > old_width * old_height
+        ):
+            unique[key] = result
+
+    return list(
+        unique.values()
+    )
 
 
 def image_is_bad(
@@ -1003,15 +1325,18 @@ def image_is_bad(
     )
 
     for pattern in BAD_URL_PATTERNS:
+
         if pattern in combined:
             return True
 
     try:
+
         domain = urlparse(
             page_url
         ).netloc.lower()
 
         for pattern in BAD_DOMAIN_PATTERNS:
+
             if pattern in domain:
                 return True
 
@@ -1021,65 +1346,877 @@ def image_is_bad(
     return False
 
 
-def image_matches_query(
-    item,
+def score_query_match(
+    text,
     query
 ):
-    if not query:
-        return 0
+    score = 0
+    reasons = []
 
-    query_words = re.findall(
-        r"[A-Za-z0-9'-]+",
-        query.lower()
+    text = normalize_text(
+        text
     )
 
-    if not query_words:
-        return 0
+    query_words = [
+        word
+        for word in normalize_text(
+            query
+        ).split()
+        if len(word) >= 3
+    ]
 
-    title = str(
-        item.get(
-            "title",
-            ""
+    matched = 0
+
+    for word in query_words:
+
+        if word in text:
+            matched += 1
+
+    if query_words:
+
+        if matched == len(
+            query_words
+        ):
+
+            score += 25
+
+            reasons.append(
+                f"query_match:all "
+                f"{matched}/{len(query_words)}"
+            )
+
+        elif (
+            matched / len(query_words)
+            >= 0.75
+        ):
+
+            score += 18
+
+            reasons.append(
+                f"query_match:high "
+                f"{matched}/{len(query_words)}"
+            )
+
+        elif (
+            matched / len(query_words)
+            >= 0.5
+        ):
+
+            score += 10
+
+            reasons.append(
+                f"query_match:medium "
+                f"{matched}/{len(query_words)}"
+            )
+
+        else:
+
+            score -= 10
+
+            reasons.append(
+                f"query_match:low "
+                f"{matched}/{len(query_words)}"
+            )
+
+    return score, reasons
+
+
+def score_source(domain):
+    domain = get_base_domain(
+        domain
+    )
+
+    if domain in GOOD_DOMAINS:
+
+        return (
+            GOOD_DOMAINS[domain],
+            f"source:{domain}"
         )
-    ).lower()
 
-    source = str(
-        item.get(
-            "source",
-            ""
+    if domain in BAD_DOMAINS:
+
+        return (
+            BAD_DOMAINS[domain],
+            f"source:{domain}"
         )
-    ).lower()
 
-    page_url = str(
-        item.get(
-            "url",
-            ""
+    return 0, None
+
+
+def score_bad_words(text):
+    score = 0
+    reasons = []
+
+    normalized = normalize_text(
+        text
+    )
+
+    for word, penalty in BAD_WORDS.items():
+
+        if word in normalized:
+
+            score += penalty
+
+            reasons.append(
+                f"bad:{word}"
+            )
+
+    return score, reasons
+
+
+def score_good_words(text):
+    score = 0
+    reasons = []
+
+    normalized = normalize_text(
+        text
+    )
+
+    for word, bonus in GOOD_WORDS.items():
+
+        if word in normalized:
+
+            score += bonus
+
+            reasons.append(
+                f"good:{word}"
+            )
+
+    return score, reasons
+
+
+def score_dimensions(
+    width,
+    height
+):
+    score = 0
+    reasons = []
+
+    if width:
+
+        if width >= 1200:
+
+            score += 10
+
+            reasons.append(
+                f"width:{width}"
+            )
+
+        elif width >= 800:
+
+            score += 6
+
+            reasons.append(
+                f"width:{width}"
+            )
+
+        elif width >= 600:
+
+            score += 3
+
+            reasons.append(
+                f"width:{width}"
+            )
+
+    if height:
+
+        if height >= 700:
+
+            score += 10
+
+            reasons.append(
+                f"height:{height}"
+            )
+
+        elif height >= 500:
+
+            score += 6
+
+            reasons.append(
+                f"height:{height}"
+            )
+
+        elif height >= 400:
+
+            score += 3
+
+            reasons.append(
+                f"height:{height}"
+            )
+
+    if width and height:
+
+        ratio = width / height
+
+        if 1.3 <= ratio <= 2.0:
+
+            score += 10
+
+            reasons.append(
+                f"ratio:{ratio:.2f}"
+            )
+
+        elif 1.15 <= ratio <= 2.2:
+
+            score += 5
+
+            reasons.append(
+                f"ratio:{ratio:.2f}"
+            )
+
+        elif ratio < 0.8:
+
+            score -= 10
+
+            reasons.append(
+                f"portrait_ratio:{ratio:.2f}"
+            )
+
+    return score, reasons
+
+
+def title_has_team_change_context(
+    title
+):
+    normalized = normalize_text(
+        title
+    )
+
+    for word in TEAM_CHANGE_WORDS:
+
+        if word in normalized:
+            return True
+
+    return False
+
+
+def get_query_phrases(query):
+    """
+    Build meaningful multi-word phrases from the image search query.
+
+    The longest phrases are useful for identifying a team/entity mentioned
+    in the query without requiring a hardcoded player/team database.
+    """
+    words = re.findall(
+        r"[A-Za-z0-9'-]+",
+        normalize_text(query)
+    )
+
+    if not words:
+        return []
+
+    phrases = []
+
+    for size in (4, 3, 2):
+
+        for index in range(
+            len(words) - size + 1
+        ):
+
+            phrase = " ".join(
+                words[
+                    index:index + size
+                ]
+            )
+
+            if phrase not in phrases:
+                phrases.append(
+                    phrase
+                )
+
+    return phrases
+
+
+def is_phrase_opponent_in_title(
+    title,
+    phrase
+):
+    normalized_title = normalize_text(
+        title
+    )
+
+    normalized_phrase = normalize_text(
+        phrase
+    )
+
+    if (
+        not normalized_title
+        or not normalized_phrase
+    ):
+        return False
+
+    position = normalized_title.find(
+        normalized_phrase
+    )
+
+    if position == -1:
+        return False
+
+    start = max(
+        0,
+        position - 80
+    )
+
+    end = min(
+        len(normalized_title),
+        position
+        + len(normalized_phrase)
+        + 30
+    )
+
+    context = normalized_title[
+        start:end
+    ]
+
+    for pattern in OPPONENT_PATTERNS:
+
+        if re.search(
+            pattern,
+            context
+        ):
+            return True
+
+    return False
+
+
+def score_title_context(
+    title,
+    query,
+    historical_year=None
+):
+    """
+    Analyze the image-result title.
+
+    The search query contains the semantic context supplied by Gemini.
+    We use that context to distinguish a destination/team-change story
+    from an old game/opponent story.
+
+    Example:
+
+        "Chris Kreider Montreal Canadiens signing"
+        + title mentioning Montreal in a signing context
+            -> positive
+
+        "Chris Kreider vs Montreal Canadiens"
+            -> opponent penalty
+    """
+    score = 0
+    reasons = []
+
+    normalized = normalize_text(
+        title
+    )
+
+    if not normalized:
+        return score, reasons
+
+    query_normalized = normalize_text(
+        query
+    )
+
+    query_words = [
+        word
+        for word in query_normalized.split()
+        if len(word) >= 3
+    ]
+
+    # -------------------------------------------------------------------------
+    # QUERY PHRASES
+    # -------------------------------------------------------------------------
+
+    phrases = get_query_phrases(
+        query
+    )
+
+    opponent_found = False
+
+    for phrase in phrases:
+
+        if len(
+            phrase.split()
+        ) < 2:
+            continue
+
+        if phrase in normalized:
+
+            if is_phrase_opponent_in_title(
+                title,
+                phrase
+            ):
+
+                score -= 35
+
+                reasons.append(
+                    f"title:query_phrase:"
+                    f"opponent:{phrase}"
+                )
+
+                opponent_found = True
+
+                break
+
+    # -------------------------------------------------------------------------
+    # SEARCH-QUERY TERMS
+    # -------------------------------------------------------------------------
+
+    matched = 0
+
+    for word in query_words:
+
+        if word in normalized:
+            matched += 1
+
+    if query_words:
+
+        if matched == len(
+            query_words
+        ):
+
+            score += 20
+
+            reasons.append(
+                f"title:query_match:"
+                f"all {matched}/{len(query_words)}"
+            )
+
+        elif (
+            matched / len(query_words)
+            >= 0.75
+        ):
+
+            score += 12
+
+            reasons.append(
+                f"title:query_match:"
+                f"high {matched}/{len(query_words)}"
+            )
+
+        elif (
+            matched / len(query_words)
+            >= 0.5
+        ):
+
+            score += 6
+
+            reasons.append(
+                f"title:query_match:"
+                f"medium {matched}/{len(query_words)}"
+            )
+
+    # -------------------------------------------------------------------------
+    # TEAM-CHANGE CONTEXT
+    # -------------------------------------------------------------------------
+
+    if title_has_team_change_context(
+        title
+    ):
+
+        if not opponent_found:
+
+            score += 25
+
+            reasons.append(
+                "title:team_change"
+            )
+
+    # -------------------------------------------------------------------------
+    # CURRENT NEWS CONTEXT
+    # -------------------------------------------------------------------------
+
+    if historical_year:
+
+        if str(
+            historical_year
+        ) in normalized:
+
+            score += 60
+
+            reasons.append(
+                f"title:historical_year:"
+                f"{historical_year}"
+            )
+
+        historical_words = [
+            "goal",
+            "scored",
+            "scoring",
+            "hat trick",
+            "historic",
+            "history",
+            "classic",
+            "legendary",
+            "highlights",
+            "throwback",
+            "retro",
+        ]
+
+        for word in historical_words:
+
+            if word in normalized:
+
+                score += 8
+
+                reasons.append(
+                    f"title:event:{word}"
+                )
+
+    else:
+
+        current_words = [
+            "2026",
+            "2025",
+            "2024",
+            "signing",
+            "signed",
+            "contract",
+            "trade",
+            "traded",
+            "acquired",
+            "joins",
+            "joined",
+            "debut",
+        ]
+
+        for word in current_words:
+
+            if word in normalized:
+
+                score += 4
+
+                reasons.append(
+                    f"title:current:{word}"
+                )
+
+    return score, reasons
+
+
+def score_date(
+    result,
+    historical_year=None
+):
+    """
+    Current news:
+        recent results are preferred but not mandatory.
+
+    Historical news:
+        results close to the event year receive a strong bonus.
+    """
+    score = 0
+    reasons = []
+
+    result_year = parse_result_date(
+        result
+    )
+
+    if result_year is None:
+
+        possible_text = " ".join(
+            [
+                str(
+                    result.get("title")
+                    or ""
+                ),
+                str(
+                    result.get("body")
+                    or ""
+                ),
+                str(
+                    result.get("snippet")
+                    or ""
+                ),
+                str(
+                    result.get("url")
+                    or ""
+                ),
+            ]
         )
-    ).lower()
 
-    text = " ".join(
+        years = extract_years(
+            possible_text
+        )
+
+        if years:
+
+            result_year = max(
+                years
+            )
+
+    if not result_year:
+
+        return 0, [
+            "date:unknown"
+        ]
+
+    current_year = datetime.now().year
+
+    # -------------------------------------------------------------------------
+    # HISTORICAL
+    # -------------------------------------------------------------------------
+
+    if historical_year:
+
+        difference = abs(
+            result_year
+            - historical_year
+        )
+
+        if difference == 0:
+
+            score += 80
+
+            reasons.append(
+                f"historical_date:"
+                f"exact:{result_year}"
+            )
+
+        elif difference == 1:
+
+            score += 55
+
+            reasons.append(
+                f"historical_date:"
+                f"+-1:{result_year}"
+            )
+
+        elif (
+            difference
+            <= HISTORICAL_YEAR_TOLERANCE
+        ):
+
+            score += 30
+
+            reasons.append(
+                f"historical_date:"
+                f"near:{result_year}"
+            )
+
+        elif difference <= 10:
+
+            score += 5
+
+            reasons.append(
+                f"historical_date:"
+                f"far:{result_year}"
+            )
+
+        else:
+
+            score -= 45
+
+            reasons.append(
+                f"historical_date:"
+                f"mismatch:{result_year}"
+            )
+
+        return score, reasons
+
+    # -------------------------------------------------------------------------
+    # CURRENT
+    # -------------------------------------------------------------------------
+
+    age_years = (
+        current_year
+        - result_year
+    )
+
+    if age_years <= 0:
+
+        score += 30
+
+        reasons.append(
+            f"date:current:{result_year}"
+        )
+
+    elif age_years == 1:
+
+        score += 20
+
+        reasons.append(
+            f"date:recent:{result_year}"
+        )
+
+    elif age_years == 2:
+
+        score += 10
+
+        reasons.append(
+            f"date:fairly_recent:"
+            f"{result_year}"
+        )
+
+    elif age_years <= 5:
+
+        reasons.append(
+            f"date:older:{result_year}"
+        )
+
+    else:
+
+        score -= 20
+
+        reasons.append(
+            f"date:old:{result_year}"
+        )
+
+    return score, reasons
+
+
+def score_result(
+    result,
+    query,
+    historical_year=None
+):
+    title = result.get(
+        "title"
+    ) or ""
+
+    body = (
+        result.get("body")
+        or result.get("snippet")
+        or ""
+    )
+
+    source = result.get(
+        "source"
+    ) or ""
+
+    url = result.get(
+        "url"
+    ) or ""
+
+    image = result.get(
+        "image"
+    ) or ""
+
+    width = to_int(
+        result.get("width")
+    )
+
+    height = to_int(
+        result.get("height")
+    )
+
+    domain = get_domain(
+        url
+    )
+
+    combined_text = " ".join(
         [
-            title,
-            source,
-            page_url
+            str(title),
+            str(body),
+            str(source),
+            str(url),
+            str(image),
         ]
     )
 
     score = 0
+    reasons = []
 
-    for word in query_words:
+    # -------------------------------------------------------------------------
+    # QUERY MATCH
+    # -------------------------------------------------------------------------
 
-        if len(word) < 3:
-            continue
+    points, why = score_query_match(
+        combined_text,
+        query
+    )
 
-        if word in text:
-            score += 1
+    score += points
+    reasons.extend(
+        why
+    )
 
-    return score
+    # -------------------------------------------------------------------------
+    # TITLE CONTEXT
+    # -------------------------------------------------------------------------
+
+    points, why = score_title_context(
+        title,
+        query,
+        historical_year
+    )
+
+    score += points
+    reasons.extend(
+        why
+    )
+
+    # -------------------------------------------------------------------------
+    # SOURCE
+    # -------------------------------------------------------------------------
+
+    points, why = score_source(
+        domain
+    )
+
+    score += points
+
+    if why:
+        reasons.append(
+            why
+        )
+
+    # -------------------------------------------------------------------------
+    # BAD WORDS
+    # -------------------------------------------------------------------------
+
+    points, why = score_bad_words(
+        combined_text
+    )
+
+    score += points
+    reasons.extend(
+        why
+    )
+
+    # -------------------------------------------------------------------------
+    # GOOD WORDS
+    # -------------------------------------------------------------------------
+
+    points, why = score_good_words(
+        combined_text
+    )
+
+    score += points
+    reasons.extend(
+        why
+    )
+
+    # -------------------------------------------------------------------------
+    # DIMENSIONS
+    # -------------------------------------------------------------------------
+
+    points, why = score_dimensions(
+        width,
+        height
+    )
+
+    score += points
+    reasons.extend(
+        why
+    )
+
+    # -------------------------------------------------------------------------
+    # DATE
+    # -------------------------------------------------------------------------
+
+    points, why = score_date(
+        result,
+        historical_year
+    )
+
+    score += points
+    reasons.extend(
+        why
+    )
+
+    return score, reasons
 
 
 def download_image(
-    query
+    query,
+    historical_year=None
 ):
     if not query:
         return None
@@ -1088,6 +2225,12 @@ def download_image(
         f"[IMAGE] Search query: "
         f"{query}"
     )
+
+    if historical_year:
+        print(
+            f"[IMAGE] Historical year: "
+            f"{historical_year}"
+        )
 
     searches = [
         {
@@ -1103,6 +2246,8 @@ def download_image(
             "label": "all time"
         }
     ]
+
+    all_results = []
 
     for search in searches:
 
@@ -1123,6 +2268,7 @@ def download_image(
             }
 
             if search["timelimit"]:
+
                 kwargs["timelimit"] = (
                     search["timelimit"]
                 )
@@ -1140,212 +2286,15 @@ def download_image(
                 f"{len(results)}"
             )
 
-            candidates = []
-
             for item in results:
 
-                image_url = item.get(
-                    "image"
+                item["_search_query"] = (
+                    query
                 )
 
-                if not image_url:
-                    continue
-
-                if image_is_bad(
+                all_results.append(
                     item
-                ):
-                    continue
-
-                if is_image_used(
-                    image_url
-                ):
-                    continue
-
-                relevance = (
-                    image_matches_query(
-                        item,
-                        query
-                    )
                 )
-
-                width = int(
-                    item.get(
-                        "width",
-                        0
-                    ) or 0
-                )
-
-                height = int(
-                    item.get(
-                        "height",
-                        0
-                    ) or 0
-                )
-
-                if width <= 0 or height <= 0:
-                    continue
-
-                ratio = (
-                    width /
-                    max(height, 1)
-                )
-
-                # Предпочитаем горизонтальные
-                # изображения, но не делаем
-                # это жёстким фильтром.
-                ratio_bonus = 0
-
-                if ratio >= 1.3:
-                    ratio_bonus = 2
-
-                score = (
-                    relevance * 5
-                    + ratio_bonus
-                )
-
-                candidates.append(
-                    (
-                        score,
-                        relevance,
-                        item
-                    )
-                )
-
-            if not candidates:
-                print(
-                    "[IMAGE] No acceptable "
-                    "candidates."
-                )
-
-                continue
-
-            candidates.sort(
-                key=lambda x: (
-                    x[0],
-                    x[1]
-                ),
-                reverse=True
-            )
-
-            # Проверяем несколько лучших
-            # кандидатов, потому что первый
-            # URL может не скачиваться.
-            for (
-                score,
-                relevance,
-                item
-            ) in candidates[:10]:
-
-                image_url = item.get(
-                    "image"
-                )
-
-                print(
-                    "[IMAGE] Candidate: "
-                    f"{item.get('title', '')}"
-                )
-
-                print(
-                    "[IMAGE] Source: "
-                    f"{item.get('source', '')}"
-                )
-
-                try:
-
-                    response = requests.get(
-                        image_url,
-                        timeout=
-                        IMAGE_DOWNLOAD_TIMEOUT,
-                        headers={
-                            "User-Agent":
-                                (
-                                    "Mozilla/5.0 "
-                                    "(Windows NT 10.0; "
-                                    "Win64; x64) "
-                                    "AppleWebKit/537.36 "
-                                    "Chrome/124 "
-                                    "Safari/537.36"
-                                )
-                        }
-                    )
-
-                    if response.status_code != 200:
-                        continue
-
-                    content_type = (
-                        response.headers
-                        .get(
-                            "Content-Type",
-                            ""
-                        )
-                        .lower()
-                    )
-
-                    if (
-                        "image" not in
-                        content_type
-                    ):
-                        continue
-
-                    content = response.content
-
-                    if len(content) < 10_000:
-                        continue
-
-                    extension = ".jpg"
-
-                    if "png" in content_type:
-                        extension = ".png"
-
-                    elif "webp" in content_type:
-                        extension = ".webp"
-
-                    image_hash = hashlib.md5(
-                        image_url.encode(
-                            "utf-8"
-                        )
-                    ).hexdigest()
-
-                    filename = (
-                        f"/tmp/"
-                        f"nhl_{image_hash}"
-                        f"{extension}"
-                    )
-
-                    with open(
-                        filename,
-                        "wb"
-                    ) as file:
-                        file.write(
-                            content
-                        )
-
-                    print(
-                        "[IMAGE] Downloaded: "
-                        f"{filename}"
-                    )
-
-                    # ВАЖНО:
-                    # здесь пока НЕ помечаем
-                    # изображение как used.
-                    #
-                    # Оно будет отмечено только
-                    # после успешной публикации
-                    # в Telegram.
-
-                    return {
-                        "file": filename,
-                        "url": image_url
-                    }
-
-                except Exception as error:
-
-                    print(
-                        "[IMAGE] Download error: "
-                        f"{error}"
-                    )
-
-                    continue
 
         except Exception as error:
 
@@ -1356,12 +2305,310 @@ def download_image(
 
             continue
 
+    if not all_results:
+
+        print(
+            "[IMAGE] No search results."
+        )
+
+        return None
+
+    print(
+        f"[IMAGE] Total raw results: "
+        f"{len(all_results)}"
+    )
+
+    unique_results = (
+        deduplicate_results(
+            all_results
+        )
+    )
+
+    print(
+        f"[IMAGE] Unique article/image "
+        f"groups: {len(unique_results)}"
+    )
+
+    valid_results = []
+
+    for result in unique_results:
+
+        if not is_probably_valid_result(
+            result
+        ):
+            continue
+
+        if image_is_bad(
+            result
+        ):
+            continue
+
+        image_url = result.get(
+            "image"
+        )
+
+        if not image_url:
+            continue
+
+        if is_image_used(
+            image_url
+        ):
+            continue
+
+        valid_results.append(
+            result
+        )
+
+    print(
+        f"[IMAGE] Valid candidates: "
+        f"{len(valid_results)}"
+    )
+
+    if not valid_results:
+
+        print(
+            "[IMAGE] No acceptable "
+            "candidates."
+        )
+
+        return None
+
+    scored = []
+
+    for result in valid_results:
+
+        result_query = (
+            result.get(
+                "_search_query",
+                query
+            )
+        )
+
+        score, reasons = score_result(
+            result,
+            result_query,
+            historical_year
+        )
+
+        result["_score"] = score
+        result["_reasons"] = reasons
+
+        scored.append(
+            result
+        )
+
+    scored.sort(
+        key=lambda item: (
+            item.get(
+                "_score",
+                0
+            )
+        ),
+        reverse=True
+    )
+
+    print()
+    print(
+        "[IMAGE] TOP CANDIDATES"
+    )
+
+    for index, result in enumerate(
+        scored[:10],
+        start=1
+    ):
+
+        print(
+            f"[{index}] "
+            f"SCORE: "
+            f"{result.get('_score', 0)}"
+        )
+
+        print(
+            "      TITLE: "
+            f"{result.get('title', '')}"
+        )
+
+        print(
+            "      SOURCE: "
+            f"{result.get('source', '')}"
+        )
+
+        print(
+            "      SIZE: "
+            f"{to_int(result.get('width'))}x"
+            f"{to_int(result.get('height'))}"
+        )
+
+        print(
+            "      DATE: "
+            f"{parse_result_date(result)}"
+        )
+
+        print(
+            "      PAGE: "
+            f"{result.get('url', '')}"
+        )
+
+        for reason in result.get(
+            "_reasons",
+            []
+        ):
+
+            print(
+                f"      + {reason}"
+            )
+
+    # -------------------------------------------------------------------------
+    # DOWNLOAD BEST CANDIDATES
+    # -------------------------------------------------------------------------
+
+    for result in scored[:10]:
+
+        image_url = result.get(
+            "image"
+        )
+
+        if not image_url:
+            continue
+
+        print()
+        print(
+            "[IMAGE] Trying candidate:"
+        )
+
+        print(
+            f"[IMAGE] Title: "
+            f"{result.get('title', '')}"
+        )
+
+        print(
+            f"[IMAGE] Source: "
+            f"{result.get('source', '')}"
+        )
+
+        print(
+            f"[IMAGE] Score: "
+            f"{result.get('_score', 0)}"
+        )
+
+        try:
+
+            response = requests.get(
+                image_url,
+                timeout=
+                IMAGE_DOWNLOAD_TIMEOUT,
+                headers={
+                    "User-Agent":
+                        (
+                            "Mozilla/5.0 "
+                            "(Windows NT 10.0; "
+                            "Win64; x64) "
+                            "AppleWebKit/537.36 "
+                            "Chrome/124 "
+                            "Safari/537.36"
+                        )
+                }
+            )
+
+            if response.status_code != 200:
+
+                print(
+                    "[IMAGE] HTTP status: "
+                    f"{response.status_code}"
+                )
+
+                continue
+
+            content_type = (
+                response.headers
+                .get(
+                    "Content-Type",
+                    ""
+                )
+                .lower()
+            )
+
+            if "image" not in content_type:
+
+                print(
+                    "[IMAGE] Not an image: "
+                    f"{content_type}"
+                )
+
+                continue
+
+            content = response.content
+
+            if len(content) < 10_000:
+
+                print(
+                    "[IMAGE] Image too small."
+                )
+
+                continue
+
+            extension = ".jpg"
+
+            if "png" in content_type:
+                extension = ".png"
+
+            elif "webp" in content_type:
+                extension = ".webp"
+
+            image_hash = hashlib.md5(
+                image_url.encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+
+            filename = (
+                f"/tmp/"
+                f"nhl_{image_hash}"
+                f"{extension}"
+            )
+
+            with open(
+                filename,
+                "wb"
+            ) as file:
+
+                file.write(
+                    content
+                )
+
+            print(
+                "[IMAGE] Downloaded: "
+                f"{filename}"
+            )
+
+            # Image is deliberately NOT marked as used here.
+            # It is marked only after successful Telegram publication.
+
+            return {
+                "file": filename,
+                "url": image_url
+            }
+
+        except Exception as error:
+
+            print(
+                "[IMAGE] Download error: "
+                f"{error}"
+            )
+
+            continue
+
+    print(
+        "[IMAGE] All candidates failed "
+        "to download."
+    )
+
     return None
 
 
-# =========================================================
+# =============================================================================
 # TELEGRAM
-# =========================================================
+# =============================================================================
 
 def telegram_send_photo(
     image_file,
@@ -1403,6 +2650,7 @@ def telegram_send_photo(
         )
 
     if response.status_code != 200:
+
         raise RuntimeError(
             f"Telegram HTTP "
             f"{response.status_code}: "
@@ -1415,6 +2663,7 @@ def telegram_send_photo(
         "ok",
         False
     ):
+
         raise RuntimeError(
             f"Telegram error: "
             f"{data}"
@@ -1423,9 +2672,9 @@ def telegram_send_photo(
     return data
 
 
-# =========================================================
+# =============================================================================
 # POST CLEANING
-# =========================================================
+# =============================================================================
 
 def clean_post(
     text
@@ -1453,9 +2702,9 @@ def clean_post(
     return text.strip()
 
 
-# =========================================================
+# =============================================================================
 # PROCESS ONE NEWS
-# =========================================================
+# =============================================================================
 
 def process_news(
     entry
@@ -1497,6 +2746,7 @@ def process_news(
     )
 
     if not url:
+
         print(
             "[SKIP] Empty URL."
         )
@@ -1506,6 +2756,7 @@ def process_news(
     if is_news_processed(
         url
     ):
+
         print(
             "[SKIP] Already processed."
         )
@@ -1614,7 +2865,7 @@ def process_news(
             "[TELEGRAM] Published."
         )
 
-        # Только после успешной публикации.
+        # Only after successful publication.
         mark_news_processed(
             url
         )
@@ -1651,9 +2902,9 @@ def process_news(
         return False
 
 
-# =========================================================
+# =============================================================================
 # MAIN
-# =========================================================
+# =============================================================================
 
 def main():
 
@@ -1683,6 +2934,11 @@ def main():
     print(
         f"[CONFIG] Gemini fallback: "
         f"{GEMINI_FALLBACK_MODEL}"
+    )
+
+    print(
+        "[CONFIG] Image search: "
+        "context + source + date scoring"
     )
 
     print(
@@ -1751,15 +3007,7 @@ def main():
 
         return
 
-    # -----------------------------------------------------
-    # Старые новости из RSS сначала,
-    # свежие — после них.
-    #
-    # Это позволяет при большом количестве
-    # накопившихся материалов публиковать
-    # их последовательно.
-    # -----------------------------------------------------
-
+    # Older RSS items first, newer items later.
     new_entries.reverse()
 
     published = 0
@@ -1804,7 +3052,6 @@ def main():
                 error
             )
 
-        # Небольшая пауза между новостями.
         time.sleep(
             GEMINI_DELAY
         )
@@ -1833,4 +3080,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-````
