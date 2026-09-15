@@ -3,20 +3,10 @@ import sys
 import urllib.request
 import feedparser
 
-HISTORY_FILE = "history.txt"
+from database import init_db, news_exists
+
+
 RSS_URL = "https://rss.app/feeds/sbl4f7OUFIrh9Wsk.xml"
-
-
-def get_history():
-    if not os.path.exists(HISTORY_FILE):
-        return set()
-    with open(HISTORY_FILE, "r", encoding="utf-8") as f:
-        return set(line.strip() for line in f if line.strip())
-
-
-def append_history(item_id):
-    with open(HISTORY_FILE, "a", encoding="utf-8") as f:
-        f.write(f"{item_id}\n")
 
 
 def set_github_output(key, value):
@@ -25,59 +15,99 @@ def set_github_output(key, value):
             f.write(f"{key}={value}\n")
 
 
+def clean_raw_rss_text(raw_text):
+    if not raw_text:
+        return ""
+
+    return raw_text.strip()
+
+
+def get_entry_id(entry):
+    return (
+        getattr(entry, "id", None)
+        or getattr(entry, "guid", None)
+        or getattr(entry, "link", None)
+        or clean_raw_rss_text(getattr(entry, "title", ""))
+    )
+
+
 def main():
+    init_db()
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/122.0.0.0 Safari/537.36"
+        )
     }
 
     try:
         print(f"Подключение к RSS: {RSS_URL}...")
-        req = urllib.request.Request(RSS_URL, headers=headers)
+
+        req = urllib.request.Request(
+            RSS_URL,
+            headers=headers,
+        )
+
         with urllib.request.urlopen(req, timeout=15) as response:
             content = response.read()
             feed = feedparser.parse(content)
+
     except Exception as e:
         print(f"Ошибка при загрузке RSS: {e}")
+        set_github_output("NEW_NEWS", "false")
         sys.exit(1)
 
     if not feed or not feed.entries:
-        print("Ошибка: Поток пуст или не содержит записей.")
+        print("Ошибка: RSS-поток пуст или не содержит записей.")
+        set_github_output("NEW_NEWS", "false")
         sys.exit(1)
 
-    last_entry = feed.entries[0]
+    print(f"Получено записей из RSS: {len(feed.entries)}")
 
-    # Идентификатор поста (обычно ссылка или guid — надежнее, чем просто заголовок)
-    entry_id = getattr(last_entry, "id", None) or getattr(last_entry, "link", None)
+    new_entries = []
 
-    # Получаем заголовок или текст записи
-    last_title = getattr(last_entry, "title", "").strip()
-    if not last_title and hasattr(last_entry, "summary"):
-        last_title = last_entry.summary.strip()
+    for entry in feed.entries[:30]:
+        entry_id = get_entry_id(entry)
 
-    # Для сверки с историей используем id (если его нет — заголовок)
-    check_item = entry_id if entry_id else last_title
+        title = (
+            getattr(entry, "title", "").strip()
+            or getattr(entry, "summary", "").strip()
+        )
 
-    print(f"Последняя новость: {last_title}")
+        if not entry_id:
+            print("⚠️ У записи отсутствует ID. Пропускаем.")
+            continue
 
-    history = get_history()
+        if not title:
+            print(f"⚠️ У записи {entry_id} отсутствует заголовок. Пропускаем.")
+            continue
 
-    if check_item not in history:
-        print("Найдена новая новость!")
-        # Добавляем в историю, чтобы при следующем запуске новость не считалась новой
-        append_history(check_item)
+        if news_exists(entry_id):
+            continue
 
-        # Передаем переменные в GitHub Actions
-        set_github_output("NEW_NEWS", "true")
-        
-        # Очищаем переносы строк для безопасной передачи одной строкой в Actions
-        clean_title = last_title.replace("\n", " ").replace("\r", " ")
-        set_github_output("NEWS_TITLE", clean_title)
-        
-        entry_link = getattr(last_entry, "link", "")
-        set_github_output("NEWS_LINK", entry_link)
-    else:
-        print("Новых новостей нет. Спим дальше.")
+        new_entries.append(
+            {
+                "id": entry_id,
+                "title": title,
+            }
+        )
+
+    if not new_entries:
+        print("Новых новостей нет.")
         set_github_output("NEW_NEWS", "false")
+        return
+
+    print(f"Найдено новых новостей: {len(new_entries)}")
+
+    latest = new_entries[0]
+
+    print(f"Последняя новая новость: {latest['title']}")
+
+    set_github_output("NEW_NEWS", "true")
+    set_github_output("NEWS_TITLE", latest["title"].replace("\n", " ").replace("\r", " "))
+    set_github_output("NEWS_LINK", "")
 
 
 if __name__ == "__main__":
