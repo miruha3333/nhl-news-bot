@@ -161,7 +161,6 @@ return {
     row[1]
     for row in cursor.fetchall()
 }
-```
 
 def add_column_if_missing(
 connection,
@@ -169,10 +168,9 @@ table_name,
 column_name,
 column_definition
 ):
-"""
+
 Add a column only if it does not already exist.
 
-```
 SQLite supports ALTER TABLE ... ADD COLUMN, which is enough
 for the schema changes used by this bot.
 """
@@ -202,7 +200,6 @@ def migrate_database(connection):
 """
 Migrate databases created by older versions of the bot.
 
-```
 Existing rows are preserved.
 
 The current bot expects:
@@ -335,7 +332,7 @@ connection.commit()
 print(
     "[DATABASE] Schema check complete."
 )
-```
+
 
 def get_db():
 connection = sqlite3.connect(
@@ -799,7 +796,6 @@ def clean_gemini_response(text):
 if not text:
 return ""
 
-````
 text = str(text).strip()
 
 text = re.sub(
@@ -815,7 +811,6 @@ text = text.replace(
 )
 
 return text.strip()
-````
 
 def extract_field(
 text,
