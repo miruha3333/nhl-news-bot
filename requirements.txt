@@ -4,4 +4,4 @@ pyTelegramBotAPI
 ddgs
 requests
 pymorphy3
-pip install feedparser requests beautifulsoup4 ddgs
+beautifulsoup4
