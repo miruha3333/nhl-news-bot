@@ -11,6 +11,11 @@ import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
+
+# =============================================================================
+# CONFIG
+# =============================================================================
+
 RSS_URL = os.getenv("RSS_URL", "").strip()
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "").strip()
@@ -24,11 +29,9 @@ GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
 GEMINI_TIMEOUT = 90
-
 TELEGRAM_TIMEOUT = 60
 
 IMAGE_RESULTS_LIMIT = 30
-
 IMAGE_DOWNLOAD_TIMEOUT = 20
 
 GEMINI_DELAY = 1.0
@@ -37,6 +40,8 @@ MAX_ARTICLE_TEXT = 12000
 
 FRESH_DAYS = 90
 HISTORICAL_YEAR_TOLERANCE = 3
+
+gemini_primary_disabled = False
 
 
 GOOD_DOMAINS = {
@@ -122,9 +127,6 @@ TEAM_CHANGE_WORDS = [
 ]
 
 
-gemini_primary_disabled = False
-
-
 BAD_URL_PATTERNS = [
     "getty",
     "alamy",
@@ -173,7 +175,6 @@ BAD_DOMAIN_PATTERNS = [
 # =============================================================================
 
 def get_existing_columns(connection, table_name):
-    """Return existing SQLite column names."""
     cursor = connection.execute(
         f"PRAGMA table_info({table_name})"
     )
@@ -184,13 +185,40 @@ def get_existing_columns(connection, table_name):
     }
 
 
+def table_exists(connection, table_name):
+    row = connection.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'table'
+        AND name = ?
+        """,
+        (table_name,)
+    ).fetchone()
+
+    return row is not None
+
+
+def index_exists(connection, index_name):
+    row = connection.execute(
+        """
+        SELECT name
+        FROM sqlite_master
+        WHERE type = 'index'
+        AND name = ?
+        """,
+        (index_name,)
+    ).fetchone()
+
+    return row is not None
+
+
 def add_column_if_missing(
     connection,
     table_name,
     column_name,
     column_definition
 ):
-    """Add a missing column to an existing table."""
     columns = get_existing_columns(
         connection,
         table_name
@@ -205,17 +233,135 @@ def add_column_if_missing(
     )
 
     connection.execute(
-        f"ALTER TABLE {table_name} "
-        f"ADD COLUMN {column_name} "
-        f"{column_definition}"
+        f"""
+        ALTER TABLE {table_name}
+        ADD COLUMN {column_name}
+        {column_definition}
+        """
     )
 
     return True
 
 
-def migrate_database(connection):
-    """Create or migrate the SQLite schema without deleting existing data."""
+def remove_duplicate_news(connection):
+    """
+    Remove duplicate news rows while keeping the oldest record.
 
+    This is necessary before creating a UNIQUE index on news.url.
+    """
+
+    if not table_exists(
+        connection,
+        "news"
+    ):
+        return
+
+    print(
+        "[DATABASE] Checking duplicate news URLs..."
+    )
+
+    connection.execute(
+        """
+        DELETE FROM news
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM news
+            WHERE url IS NOT NULL
+            GROUP BY url
+        )
+        AND url IS NOT NULL
+        """
+    )
+
+    connection.commit()
+
+
+def remove_duplicate_images(connection):
+    """
+    Remove duplicate image URLs while keeping the oldest record.
+    """
+
+    if not table_exists(
+        connection,
+        "images"
+    ):
+        return
+
+    print(
+        "[DATABASE] Checking duplicate image URLs..."
+    )
+
+    connection.execute(
+        """
+        DELETE FROM images
+        WHERE id NOT IN (
+            SELECT MIN(id)
+            FROM images
+            WHERE url IS NOT NULL
+            GROUP BY url
+        )
+        AND url IS NOT NULL
+        """
+    )
+
+    connection.commit()
+
+
+def ensure_unique_indexes(connection):
+    """
+    Ensure URL uniqueness for old and new databases.
+
+    Existing duplicate rows are removed before indexes are created.
+    """
+
+    remove_duplicate_news(
+        connection
+    )
+
+    remove_duplicate_images(
+        connection
+    )
+
+    if not index_exists(
+        connection,
+        "idx_news_url_unique"
+    ):
+
+        print(
+            "[DATABASE] Creating unique index "
+            "for news.url..."
+        )
+
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_news_url_unique
+            ON news(url)
+            """
+        )
+
+    if not index_exists(
+        connection,
+        "idx_images_url_unique"
+    ):
+
+        print(
+            "[DATABASE] Creating unique index "
+            "for images.url..."
+        )
+
+        connection.execute(
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS
+            idx_images_url_unique
+            ON images(url)
+            """
+        )
+
+    connection.commit()
+
+
+def migrate_database(connection):
     print(
         "[DATABASE] Checking database schema..."
     )
@@ -249,16 +395,17 @@ def migrate_database(connection):
     )
 
     if "processed" not in existing_news_columns:
+
+        print(
+            "[DATABASE] Adding news.processed; "
+            "existing rows marked as processed."
+        )
+
         connection.execute(
             """
             ALTER TABLE news
             ADD COLUMN processed INTEGER DEFAULT 1
             """
-        )
-
-        print(
-            "[DATABASE] Added news.processed; "
-            "existing rows marked as processed."
         )
 
     add_column_if_missing(
@@ -307,6 +454,7 @@ def migrate_database(connection):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT,
             error TEXT,
+            stage TEXT NOT NULL DEFAULT 'unknown',
             created_at TEXT
         )
         """
@@ -329,8 +477,25 @@ def migrate_database(connection):
     add_column_if_missing(
         connection,
         "errors",
+        "stage",
+        "TEXT NOT NULL DEFAULT 'unknown'"
+    )
+
+    add_column_if_missing(
+        connection,
+        "errors",
         "created_at",
         "TEXT"
+    )
+
+    connection.commit()
+
+    # -------------------------------------------------------------------------
+    # UNIQUE INDEXES
+    # -------------------------------------------------------------------------
+
+    ensure_unique_indexes(
+        connection
     )
 
     connection.commit()
@@ -354,7 +519,7 @@ def get_db():
 
 
 # =============================================================================
-# DATABASE HELPERS
+# URL / NEWS DATABASE HELPERS
 # =============================================================================
 
 def normalize_url(url):
@@ -364,7 +529,10 @@ def normalize_url(url):
     url = str(url).strip()
 
     if "#" in url:
-        url = url.split("#", 1)[0]
+        url = url.split(
+            "#",
+            1
+        )[0]
 
     url = url.replace(
         "https://www.",
@@ -380,7 +548,9 @@ def normalize_url(url):
 
 
 def is_news_processed(url):
-    url = normalize_url(url)
+    url = normalize_url(
+        url
+    )
 
     if not url:
         return True
@@ -393,6 +563,8 @@ def is_news_processed(url):
             SELECT processed
             FROM news
             WHERE url = ?
+            ORDER BY id ASC
+            LIMIT 1
             """,
             (url,)
         ).fetchone()
@@ -400,7 +572,9 @@ def is_news_processed(url):
         if not row:
             return False
 
-        return bool(row[0])
+        return bool(
+            row[0]
+        )
 
     finally:
         connection.close()
@@ -411,7 +585,9 @@ def save_news(
     title="",
     processed=False
 ):
-    url = normalize_url(url)
+    url = normalize_url(
+        url
+    )
 
     if not url:
         return
@@ -419,27 +595,52 @@ def save_news(
     connection = get_db()
 
     try:
-        connection.execute(
+        existing = connection.execute(
             """
-            INSERT INTO news (
-                url,
-                title,
-                processed,
-                created_at
-            )
-            VALUES (?, ?, ?, ?)
-            ON CONFLICT(url)
-            DO UPDATE SET
-                title = excluded.title,
-                processed = excluded.processed
+            SELECT id
+            FROM news
+            WHERE url = ?
+            ORDER BY id ASC
+            LIMIT 1
             """,
-            (
-                url,
-                title,
-                1 if processed else 0,
-                datetime.utcnow().isoformat()
+            (url,)
+        ).fetchone()
+
+        if existing:
+
+            connection.execute(
+                """
+                UPDATE news
+                SET title = ?,
+                    processed = ?
+                WHERE id = ?
+                """,
+                (
+                    title,
+                    1 if processed else 0,
+                    existing[0]
+                )
             )
-        )
+
+        else:
+
+            connection.execute(
+                """
+                INSERT INTO news (
+                    url,
+                    title,
+                    processed,
+                    created_at
+                )
+                VALUES (?, ?, ?, ?)
+                """,
+                (
+                    url,
+                    title,
+                    1 if processed else 0,
+                    datetime.utcnow().isoformat()
+                )
+            )
 
         connection.commit()
 
@@ -448,7 +649,9 @@ def save_news(
 
 
 def mark_news_processed(url):
-    url = normalize_url(url)
+    url = normalize_url(
+        url
+    )
 
     if not url:
         return
@@ -471,6 +674,10 @@ def mark_news_processed(url):
         connection.close()
 
 
+# =============================================================================
+# IMAGE DATABASE HELPERS
+# =============================================================================
+
 def is_image_used(url):
     if not url:
         return False
@@ -483,6 +690,8 @@ def is_image_used(url):
             SELECT used
             FROM images
             WHERE url = ?
+            ORDER BY id ASC
+            LIMIT 1
             """,
             (url,)
         ).fetchone()
@@ -490,7 +699,9 @@ def is_image_used(url):
         if not row:
             return False
 
-        return bool(row[0])
+        return bool(
+            row[0]
+        )
 
     finally:
         connection.close()
@@ -506,24 +717,48 @@ def save_image(
     connection = get_db()
 
     try:
-        connection.execute(
+        existing = connection.execute(
             """
-            INSERT INTO images (
-                url,
-                used,
-                created_at
-            )
-            VALUES (?, ?, ?)
-            ON CONFLICT(url)
-            DO UPDATE SET
-                used = excluded.used
+            SELECT id
+            FROM images
+            WHERE url = ?
+            ORDER BY id ASC
+            LIMIT 1
             """,
-            (
-                url,
-                1 if used else 0,
-                datetime.utcnow().isoformat()
+            (url,)
+        ).fetchone()
+
+        if existing:
+
+            connection.execute(
+                """
+                UPDATE images
+                SET used = ?
+                WHERE id = ?
+                """,
+                (
+                    1 if used else 0,
+                    existing[0]
+                )
             )
-        )
+
+        else:
+
+            connection.execute(
+                """
+                INSERT INTO images (
+                    url,
+                    used,
+                    created_at
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    url,
+                    1 if used else 0,
+                    datetime.utcnow().isoformat()
+                )
+            )
 
         connection.commit()
 
@@ -553,9 +788,14 @@ def mark_image_used(url):
         connection.close()
 
 
+# =============================================================================
+# ERROR LOGGING
+# =============================================================================
+
 def log_error(
     url,
-    error
+    error,
+    stage="unknown"
 ):
     connection = get_db()
 
@@ -565,13 +805,15 @@ def log_error(
             INSERT INTO errors (
                 url,
                 error,
+                stage,
                 created_at
             )
-            VALUES (?, ?, ?)
+            VALUES (?, ?, ?, ?)
             """,
             (
                 normalize_url(url),
                 str(error)[:4000],
+                str(stage)[:100],
                 datetime.utcnow().isoformat()
             )
         )
@@ -583,7 +825,7 @@ def log_error(
 
 
 # =============================================================================
-# RSS
+# HTML / RSS
 # =============================================================================
 
 def clean_html(text):
@@ -622,7 +864,9 @@ def get_rss_entries():
 
     entries = []
 
-    for entry in feed.entries[:MAX_RSS_ENTRIES]:
+    for entry in feed.entries[
+        :MAX_RSS_ENTRIES
+    ]:
 
         title = clean_html(
             getattr(
@@ -941,7 +1185,10 @@ def build_fallback_search_query(
         if len(result) >= 8:
             break
 
-    if "NHL" not in result:
+    if not any(
+        word.lower() == "nhl"
+        for word in result
+    ):
         result.append(
             "NHL"
         )
@@ -983,7 +1230,7 @@ def translate_tweet(
 
 ВАЖНО:
 
-SEARCH_QUERY должен описывать СМЫСЛ
+SEARCH_QUERY должен описывать смысл
 конкретной новости.
 
 Не делай запрос просто в формате:
@@ -1145,7 +1392,7 @@ ARTICLE:
 
 
 # =============================================================================
-# IMAGE SEARCH
+# IMAGE SEARCH HELPERS
 # =============================================================================
 
 def normalize_text(value):
@@ -1175,17 +1422,14 @@ def get_domain(url):
         return ""
 
     try:
-
         domain = urlparse(
             url
         ).netloc.lower()
 
-        domain = domain.replace(
+        return domain.replace(
             "www.",
             ""
         )
-
-        return domain
 
     except Exception:
         return ""
@@ -1206,18 +1450,13 @@ def extract_years(text):
     if not text:
         return []
 
-    years = []
-
-    for match in re.findall(
-        r"\b(19\d{2}|20\d{2})\b",
-        str(text)
-    ):
-
-        years.append(
-            int(match)
+    return [
+        int(match)
+        for match in re.findall(
+            r"\b(19\d{2}|20\d{2})\b",
+            str(text)
         )
-
-    return years
+    ]
 
 
 def to_int(value):
@@ -1268,7 +1507,6 @@ def parse_result_date(result):
                 <= year
                 <= datetime.now().year + 1
             ):
-
                 return year
 
     return None
@@ -1308,7 +1546,6 @@ def normalize_page_url(url):
         return ""
 
     try:
-
         parsed = urlparse(
             url
         )
@@ -1363,7 +1600,6 @@ def deduplicate_results(results):
         if key not in unique:
 
             unique[key] = result
-
             continue
 
         old = unique[key]
@@ -1400,7 +1636,6 @@ def deduplicate_results(results):
             new_width * new_height
             > old_width * old_height
         ):
-
             unique[key] = result
 
     return list(
@@ -1498,12 +1733,11 @@ def score_query_match(
     if not query_words:
         return 0, []
 
-    matched = 0
-
-    for word in query_words:
-
-        if word in text:
-            matched += 1
+    matched = sum(
+        1
+        for word in query_words
+        if word in text
+    )
 
     ratio = matched / len(
         query_words
@@ -1624,19 +1858,15 @@ def score_dimensions(
     if width:
 
         if width >= 1200:
-
             score += 10
 
         elif width >= 800:
-
             score += 6
 
         elif width >= 600:
-
             score += 3
 
         if width >= 600:
-
             reasons.append(
                 f"width:{width}"
             )
@@ -1644,19 +1874,15 @@ def score_dimensions(
     if height:
 
         if height >= 700:
-
             score += 10
 
         elif height >= 500:
-
             score += 6
 
         elif height >= 400:
-
             score += 3
 
         if height >= 400:
-
             reasons.append(
                 f"height:{height}"
             )
@@ -1666,15 +1892,12 @@ def score_dimensions(
         ratio = width / height
 
         if 1.3 <= ratio <= 2.0:
-
             score += 10
 
         elif 1.15 <= ratio <= 2.2:
-
             score += 5
 
         elif ratio < 0.8:
-
             score -= 10
 
         reasons.append(
@@ -1684,9 +1907,7 @@ def score_dimensions(
     return score, reasons
 
 
-def title_has_team_change_context(
-    title
-):
+def title_has_team_change_context(title):
     normalized = normalize_text(
         title
     )
@@ -1727,7 +1948,6 @@ def get_query_phrases(query):
             )
 
             if phrase not in phrases:
-
                 phrases.append(
                     phrase
                 )
@@ -1782,7 +2002,6 @@ def is_phrase_opponent_in_title(
             pattern,
             context
         ):
-
             return True
 
     return False
@@ -1844,12 +2063,11 @@ def score_title_context(
 
     if query_words:
 
-        matched = 0
-
-        for word in query_words:
-
-            if word in normalized:
-                matched += 1
+        matched = sum(
+            1
+            for word in query_words
+            if word in normalized
+        )
 
         ratio = matched / len(
             query_words
@@ -2003,7 +2221,6 @@ def score_date(
         )
 
         if years:
-
             result_year = max(
                 years
             )
@@ -2041,10 +2258,7 @@ def score_date(
                 f"+-1:{result_year}"
             )
 
-        elif (
-            difference
-            <= HISTORICAL_YEAR_TOLERANCE
-        ):
+        elif difference <= HISTORICAL_YEAR_TOLERANCE:
 
             score += 30
 
@@ -2103,18 +2317,18 @@ def score_date(
             f"{result_year}"
         )
 
-    elif age_years <= 5:
-
-        reasons.append(
-            f"date:older:{result_year}"
-        )
-
-    else:
+    elif age_years > 5:
 
         score -= 20
 
         reasons.append(
             f"date:old:{result_year}"
+        )
+
+    else:
+
+        reasons.append(
+            f"date:older:{result_year}"
         )
 
     return score, reasons
@@ -2253,6 +2467,10 @@ def score_result(
     return score, reasons
 
 
+# =============================================================================
+# IMAGE SEARCH / DOWNLOAD
+# =============================================================================
+
 def download_image(
     query,
     historical_year=None
@@ -2299,15 +2517,13 @@ def download_image(
 
             kwargs = {
                 "query": query,
-                "max_results":
-                    IMAGE_RESULTS_LIMIT,
+                "max_results": IMAGE_RESULTS_LIMIT,
                 "safesearch": "moderate",
                 "layout": "Wide",
                 "size": "Large"
             }
 
             if search["timelimit"]:
-
                 kwargs["timelimit"] = (
                     search["timelimit"]
                 )
@@ -2341,8 +2557,6 @@ def download_image(
                 "[IMAGE SEARCH ERROR] "
                 f"{error}"
             )
-
-            continue
 
     if not all_results:
 
@@ -2537,7 +2751,8 @@ def download_image(
                         "(Windows NT 10.0; "
                         "Win64; x64) "
                         "AppleWebKit/537.36 "
-                        "Chrome/124 "
+                        "(KHTML, like Gecko) "
+                        "Chrome/124.0 "
                         "Safari/537.36"
                     )
                 }
@@ -2583,12 +2798,13 @@ def download_image(
             extension = ".jpg"
 
             if "png" in content_type:
-
                 extension = ".png"
 
             elif "webp" in content_type:
-
                 extension = ".webp"
+
+            elif "gif" in content_type:
+                extension = ".gif"
 
             image_hash = hashlib.md5(
                 image_url.encode(
@@ -2627,8 +2843,6 @@ def download_image(
                 "[IMAGE] Download error: "
                 f"{error}"
             )
-
-            continue
 
     print(
         "[IMAGE] All candidates failed "
@@ -2669,14 +2883,11 @@ def telegram_send_photo(
         response = requests.post(
             url,
             data={
-                "chat_id":
-                    TELEGRAM_CHAT_ID,
-                "caption":
-                    caption
+                "chat_id": TELEGRAM_CHAT_ID,
+                "caption": caption
             },
             files={
-                "photo":
-                    image
+                "photo": image
             },
             timeout=TELEGRAM_TIMEOUT
         )
@@ -2708,9 +2919,7 @@ def telegram_send_photo(
 # POST CLEANING
 # =============================================================================
 
-def clean_post(
-    text
-):
+def clean_post(text):
     if not text:
         return ""
 
@@ -2735,12 +2944,10 @@ def clean_post(
 
 
 # =============================================================================
-# PROCESS ONE NEWS
+# PROCESS NEWS
 # =============================================================================
 
-def process_news(
-    entry
-):
+def process_news(entry):
     title = entry.get(
         "title",
         ""
@@ -2800,6 +3007,10 @@ def process_news(
         entry
     )
 
+    # -------------------------------------------------------------------------
+    # GEMINI
+    # -------------------------------------------------------------------------
+
     try:
 
         ai_result = translate_tweet(
@@ -2837,16 +3048,21 @@ def process_news(
     except Exception as error:
 
         print(
-            "[PROCESS ERROR] "
+            "[GEMINI PROCESS ERROR] "
             f"{error}"
         )
 
         log_error(
             url,
-            error
+            error,
+            stage="gemini"
         )
 
         return False
+
+    # -------------------------------------------------------------------------
+    # IMAGE
+    # -------------------------------------------------------------------------
 
     try:
 
@@ -2863,7 +3079,8 @@ def process_news(
 
         log_error(
             url,
-            error
+            error,
+            stage="image"
         )
 
         image = None
@@ -2876,10 +3093,15 @@ def process_news(
 
         log_error(
             url,
-            "No suitable image found"
+            "No suitable image found",
+            stage="image"
         )
 
         return False
+
+    # -------------------------------------------------------------------------
+    # TELEGRAM
+    # -------------------------------------------------------------------------
 
     try:
 
@@ -2891,6 +3113,27 @@ def process_news(
         print(
             "[TELEGRAM] Published."
         )
+
+    except Exception as error:
+
+        print(
+            "[TELEGRAM ERROR] "
+            f"{error}"
+        )
+
+        log_error(
+            url,
+            error,
+            stage="telegram"
+        )
+
+        return False
+
+    # -------------------------------------------------------------------------
+    # MARK SUCCESS
+    # -------------------------------------------------------------------------
+
+    try:
 
         mark_news_processed(
             url
@@ -2911,21 +3154,22 @@ def process_news(
             "as used."
         )
 
-        return True
-
     except Exception as error:
 
         print(
-            "[TELEGRAM ERROR] "
+            "[DATABASE ERROR] "
             f"{error}"
         )
 
         log_error(
             url,
-            error
+            error,
+            stage="database"
         )
 
         return False
+
+    return True
 
 
 # =============================================================================
@@ -2971,6 +3215,10 @@ def main():
         "=" * 70
     )
 
+    # -------------------------------------------------------------------------
+    # RSS
+    # -------------------------------------------------------------------------
+
     try:
 
         entries = get_rss_entries()
@@ -2984,7 +3232,8 @@ def main():
 
         log_error(
             "",
-            error
+            error,
+            stage="rss"
         )
 
         return
@@ -2996,6 +3245,10 @@ def main():
         )
 
         return
+
+    # -------------------------------------------------------------------------
+    # FILTER PROCESSED NEWS
+    # -------------------------------------------------------------------------
 
     new_entries = []
 
@@ -3033,10 +3286,15 @@ def main():
 
         return
 
+    # Oldest first.
     new_entries.reverse()
 
     published = 0
     failed = 0
+
+    # -------------------------------------------------------------------------
+    # PROCESS
+    # -------------------------------------------------------------------------
 
     for index, entry in enumerate(
         new_entries,
@@ -3070,17 +3328,31 @@ def main():
                 f"{error}"
             )
 
-            log_error(
-                entry.get(
-                    "link",
-                    ""
-                ),
-                error
-            )
+            try:
+
+                log_error(
+                    entry.get(
+                        "link",
+                        ""
+                    ),
+                    error,
+                    stage="process_news"
+                )
+
+            except Exception as logging_error:
+
+                print(
+                    "[ERROR LOGGER FAILURE] "
+                    f"{logging_error}"
+                )
 
         time.sleep(
             GEMINI_DELAY
         )
+
+    # -------------------------------------------------------------------------
+    # SUMMARY
+    # -------------------------------------------------------------------------
 
     print()
     print(
