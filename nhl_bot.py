@@ -13,6 +13,10 @@ from bs4 import BeautifulSoup
 from ddgs import DDGS
 
 
+# =========================================================
+# CONFIG
+# =========================================================
+
 RSS_URL = os.getenv("RSS_URL", "").strip()
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "").strip()
@@ -462,6 +466,8 @@ def save_news(item):
         )
 
     else:
+        created_at = datetime.now(timezone.utc).isoformat()
+
         cursor = conn.execute(
             """
             INSERT INTO news (
@@ -469,15 +475,17 @@ def save_news(item):
                 title,
                 source,
                 published,
-                processed
+                processed,
+                created_at
             )
-            VALUES (?, ?, ?, ?, 0)
+            VALUES (?, ?, ?, ?, 0, ?)
             """,
             (
                 url,
                 item.get("title", ""),
                 item.get("source", ""),
                 item.get("published", ""),
+                created_at,
             ),
         )
 
@@ -559,17 +567,21 @@ def save_image(url, used=0):
         )
 
     else:
+        created_at = datetime.now(timezone.utc).isoformat()
+
         conn.execute(
             """
             INSERT INTO images (
                 url,
-                used
+                used,
+                created_at
             )
-            VALUES (?, ?)
+            VALUES (?, ?, ?)
             """,
             (
                 url,
                 used,
+                created_at,
             ),
         )
 
@@ -1276,9 +1288,9 @@ def process_news(
 
     url = item["url"]
 
-    save_news(item)
-
     try:
+        save_news(item)
+
         article = fetch_article(
             url,
             item.get(
@@ -1343,6 +1355,13 @@ def process_news(
             or "HTTP" in message
         ):
             stage = "article"
+
+        elif (
+            "database" in message.lower()
+            or "sqlite" in message.lower()
+            or "constraint" in message.lower()
+        ):
+            stage = "database"
 
         print(
             "[FATAL ITEM ERROR] "
