@@ -1390,28 +1390,35 @@ def generate_post(
 
 
 def check_post_language(post):
-    """Use Gemini as a final grammar/spelling gate before publication."""
+    """Final content gate. Only clear publication-blocking problems are checked."""
     prompt = f"""
-Проверь готовый русский Telegram-пост ниже перед публикацией.
+Проверь готовый пост перед публикацией. Это пост русскоязычного Telegram-канала о хоккейной новости.
 
-Нужно проверить:
-- орфографию;
-- пунктуацию;
-- грамматику;
-- согласование слов;
-- падежи;
-- очевидные опечатки;
-- очевидные смысловые ошибки, возникшие из-за неправильной формулировки.
+Отклоняй пост ТОЛЬКО если есть хотя бы одна из этих проблем:
+1. Абракадабра, бессмысленный или явно повреждённый текст.
+2. Странные, случайные или явно технические символы/фрагменты, которые не должны быть в обычном посте.
+3. Пост написан не на русском языке или большая его часть не на русском языке.
+4. Пост не относится к исходной хоккейной новости или не передаёт её содержание.
+5. В пост попала техническая информация: системные сообщения, ошибки API, промпты, служебные инструкции, код, JSON и тому подобное.
 
-Не оценивай стиль и не предлагай улучшения, если текст просто можно написать иначе.
-Проверяй только наличие реальных ошибок.
+НЕ отклоняй пост за:
+- стиль или авторскую манеру;
+- разговорные формулировки;
+- длину;
+- структуру;
+- отсутствие идеальной пунктуации;
+- спорный, но допустимый перевод хоккейных терминов;
+- факт, который нельзя проверить только по самому посту.
 
-Если ошибок нет, ответь ровно: OK.
-Если есть хотя бы одна однозначная орфографическая, пунктуационная или грамматическая ошибка, ответь ровно: ERROR.
-Не считай ошибкой стилистический выбор, разговорную подачу, допустимый перевод хоккейных терминов или факт, который нельзя проверить только по этому тексту.
-Если сомневаешься — ответь OK.
+Если пост нормальный и пригоден для публикации, ответь ровно:
+OK
 
-Пост:
+Если есть явная причина из пяти пунктов выше, ответь ровно:
+REJECT
+
+Если не уверен — ответь OK.
+
+Исходная новость:
 {post}
 """.strip()
 
@@ -1427,7 +1434,7 @@ def check_post_language(post):
             )
         except Exception as exc:
             print(
-                "[GEMINI LANGUAGE PRIMARY ERROR] "
+                "[GEMINI CONTENT PRIMARY ERROR] "
                 f"{exc}"
             )
 
@@ -1446,6 +1453,10 @@ def check_post_language(post):
                     "unavailable",
                     "resource_exhausted",
                     "rate limit",
+                    "timeout",
+                    "timed out",
+                    "network error",
+                    "connection timeout",
                     "404",
                     "not found",
                 )
@@ -1454,7 +1465,7 @@ def check_post_language(post):
 
     if result is None:
         print(
-            "[GEMINI LANGUAGE FALLBACK] Using "
+            "[GEMINI CONTENT FALLBACK] Using "
             f"{GEMINI_FALLBACK_MODEL}"
         )
 
@@ -1465,23 +1476,25 @@ def check_post_language(post):
             )
         except Exception as exc:
             raise PostValidationServiceError(
-                f"Language validation service failed: {exc}"
+                f"Content validation service failed: {exc}"
             ) from exc
 
     answer = clean_post(result).upper()
 
-    if answer != "OK":
+    if answer == "OK":
+        print(
+            "[POST VALIDATION] Content check: OK"
+        )
+        return
+
+    if answer == "REJECT":
         raise PostRejected(
-            "Gemini language validation failed: "
-            f"{clean_post(result)[:200]}"
+            "Gemini content validation rejected the post"
         )
 
-    time.sleep(
-        GEMINI_DELAY
-    )
-
-    print(
-        "[POST VALIDATION] Language check: OK"
+    raise PostValidationServiceError(
+        "Content validator returned ambiguous result: "
+        f"{clean_post(result)[:200]}"
     )
 
 
