@@ -1,7 +1,6 @@
 import os
 import re
 import hashlib
-import json
 import sqlite3
 import tempfile
 import time
@@ -12,12 +11,7 @@ import requests
 from bs4 import BeautifulSoup
 
 
-# =========================================================
-# CONFIG
-# =========================================================
-
 SOURCE_URL = "https://heavy.com/sports/nhl/"
-
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
@@ -31,6 +25,7 @@ GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
 GEMINI_TIMEOUT = 90
 TELEGRAM_TIMEOUT = 60
+
 SOURCE_IMAGE_DOWNLOAD_TIMEOUT = 15
 MIN_IMAGE_BYTES = 5000
 
@@ -65,16 +60,8 @@ def normalize_url(url):
     try:
         parsed = urlparse(url)
 
-        host = (
-            parsed.netloc
-            .lower()
-            .replace("www.", "")
-        )
-
-        path = (
-            parsed.path.rstrip("/")
-            or "/"
-        )
+        host = parsed.netloc.lower().replace("www.", "")
+        path = parsed.path.rstrip("/") or "/"
 
         return urlunparse(
             (
@@ -95,40 +82,34 @@ def normalize_url(url):
 # DATABASE
 # =========================================================
 
-def table_exists(
-    conn,
-    table,
-):
-    row = conn.execute(
+def table_exists(conn, table):
+    cursor = conn.execute(
         """
-        SELECT 1
+        SELECT name
         FROM sqlite_master
         WHERE type = 'table'
-        AND name = ?
+          AND name = ?
         """,
         (table,),
-    ).fetchone()
+    )
 
-    return row is not None
+    return cursor.fetchone() is not None
 
 
-def get_existing_columns(
-    conn,
-    table,
-):
+def get_existing_columns(conn, table):
     if not table_exists(
         conn,
         table,
     ):
         return set()
 
-    rows = conn.execute(
-        f'PRAGMA table_info("{table}")'
-    ).fetchall()
+    cursor = conn.execute(
+        f"PRAGMA table_info({table})"
+    )
 
     return {
         row[1]
-        for row in rows
+        for row in cursor.fetchall()
     }
 
 
@@ -138,14 +119,54 @@ def add_column_if_missing(
     column,
     definition,
 ):
-    if column not in get_existing_columns(
+    columns = get_existing_columns(
         conn,
         table,
-    ):
+    )
+
+    if column not in columns:
         conn.execute(
-            f'ALTER TABLE "{table}" '
-            f'ADD COLUMN "{column}" {definition}'
+            f"ALTER TABLE {table} "
+            f"ADD COLUMN {column} {definition}"
         )
+
+
+def remove_duplicate_news(conn):
+    if not table_exists(
+        conn,
+        "news",
+    ):
+        return
+
+    conn.execute(
+        """
+        DELETE FROM news
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM news
+            GROUP BY url
+        )
+        """
+    )
+
+
+def remove_duplicate_images(conn):
+    if not table_exists(
+        conn,
+        "images",
+    ):
+        return
+
+    conn.execute(
+        """
+        DELETE FROM images
+        WHERE rowid NOT IN (
+            SELECT MIN(rowid)
+            FROM images
+            GROUP BY url
+        )
+        """
+    )
 
 
 def normalize_existing_urls(
@@ -158,70 +179,29 @@ def normalize_existing_urls(
     ):
         return
 
-    if "url" not in get_existing_columns(
-        conn,
-        table,
-    ):
-        return
+    cursor = conn.execute(
+        f"SELECT rowid, url FROM {table}"
+    )
 
-    rows = conn.execute(
-        f'SELECT rowid, url FROM "{table}"'
-    ).fetchall()
+    rows = cursor.fetchall()
 
     for rowid, url in rows:
-        normalized = normalize_url(url)
+        normalized = normalize_url(
+            url
+        )
 
-        if normalized and normalized != url:
+        if normalized != url:
             conn.execute(
-                f'''
-                UPDATE "{table}"
+                f"""
+                UPDATE {table}
                 SET url = ?
                 WHERE rowid = ?
-                ''',
+                """,
                 (
                     normalized,
                     rowid,
                 ),
             )
-
-
-def remove_duplicate_rows(
-    conn,
-    table,
-):
-    if not table_exists(
-        conn,
-        table,
-    ):
-        return
-
-    rows = conn.execute(
-        f'''
-        SELECT rowid, url
-        FROM "{table}"
-        ORDER BY rowid
-        '''
-    ).fetchall()
-
-    seen = set()
-
-    for rowid, url in rows:
-        normalized = normalize_url(url)
-
-        if not normalized:
-            continue
-
-        if normalized in seen:
-            conn.execute(
-                f'''
-                DELETE FROM "{table}"
-                WHERE rowid = ?
-                ''',
-                (rowid,),
-            )
-
-        else:
-            seen.add(normalized)
 
 
 def migrate_database(conn):
@@ -235,55 +215,25 @@ def migrate_database(conn):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT NOT NULL,
             title TEXT,
-            source TEXT,
-            published TEXT,
-            processed INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            summary TEXT,
+            published_at TEXT,
+            processed INTEGER DEFAULT 0,
+            created_at TEXT
         )
         """
     )
-
-    for column, definition in (
-        ("title", "TEXT"),
-        ("source", "TEXT"),
-        ("published", "TEXT"),
-        (
-            "processed",
-            "INTEGER NOT NULL DEFAULT 0",
-        ),
-        ("created_at", "TEXT"),
-    ):
-        add_column_if_missing(
-            conn,
-            "news",
-            column,
-            definition,
-        )
 
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT NOT NULL,
-            used INTEGER NOT NULL DEFAULT 0,
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            source TEXT,
+            used INTEGER DEFAULT 0,
+            created_at TEXT
         )
         """
     )
-
-    for column, definition in (
-        (
-            "used",
-            "INTEGER NOT NULL DEFAULT 0",
-        ),
-        ("created_at", "TEXT"),
-    ):
-        add_column_if_missing(
-            conn,
-            "images",
-            column,
-            definition,
-        )
 
     conn.execute(
         """
@@ -291,29 +241,67 @@ def migrate_database(conn):
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT,
             error TEXT,
-            error_message TEXT,
-            stage TEXT NOT NULL DEFAULT 'unknown',
-            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            stage TEXT,
+            created_at TEXT
         )
         """
     )
 
-    for column, definition in (
-        ("url", "TEXT"),
-        ("error", "TEXT"),
-        ("error_message", "TEXT"),
-        (
-            "stage",
-            "TEXT NOT NULL DEFAULT 'unknown'",
-        ),
-        ("created_at", "TEXT"),
-    ):
-        add_column_if_missing(
-            conn,
-            "errors",
-            column,
-            definition,
-        )
+    add_column_if_missing(
+        conn,
+        "news",
+        "title",
+        "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
+        "news",
+        "summary",
+        "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
+        "news",
+        "published_at",
+        "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
+        "news",
+        "processed",
+        "INTEGER DEFAULT 0",
+    )
+
+    add_column_if_missing(
+        conn,
+        "news",
+        "created_at",
+        "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
+        "images",
+        "source",
+        "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
+        "images",
+        "used",
+        "INTEGER DEFAULT 0",
+    )
+
+    add_column_if_missing(
+        conn,
+        "images",
+        "created_at",
+        "TEXT",
+    )
 
     normalize_existing_urls(
         conn,
@@ -325,14 +313,12 @@ def migrate_database(conn):
         "images",
     )
 
-    remove_duplicate_rows(
-        conn,
-        "news",
+    remove_duplicate_news(
+        conn
     )
 
-    remove_duplicate_rows(
-        conn,
-        "images",
+    remove_duplicate_images(
+        conn
     )
 
     conn.execute(
@@ -348,6 +334,22 @@ def migrate_database(conn):
         CREATE UNIQUE INDEX IF NOT EXISTS
         idx_images_url_unique
         ON images(url)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_news_processed
+        ON news(processed)
+        """
+    )
+
+    conn.execute(
+        """
+        CREATE INDEX IF NOT EXISTS
+        idx_errors_url
+        ON errors(url)
         """
     )
 
@@ -375,7 +377,9 @@ def get_db():
     )
 
     if not DATABASE_READY:
-        migrate_database(conn)
+        migrate_database(
+            conn
+        )
         DATABASE_READY = True
 
     return conn
@@ -391,104 +395,68 @@ def save_news(item):
         )
     )
 
-    row = conn.execute(
+    now = datetime.now(
+        timezone.utc
+    ).isoformat()
+
+    conn.execute(
         """
-        SELECT id
-        FROM news
-        WHERE url = ?
+        INSERT INTO news (
+            url,
+            title,
+            summary,
+            published_at,
+            processed,
+            created_at
+        )
+        VALUES (?, ?, ?, ?, 0, ?)
+        ON CONFLICT(url) DO UPDATE SET
+            title = excluded.title,
+            summary = excluded.summary,
+            published_at = excluded.published_at
         """,
-        (url,),
-    ).fetchone()
-
-    if row:
-        news_id = row[0]
-
-        conn.execute(
-            """
-            UPDATE news
-            SET title = ?,
-                source = ?,
-                published = ?
-            WHERE id = ?
-            """,
-            (
-                item.get(
-                    "title",
-                    "",
-                ),
-                item.get(
-                    "source",
-                    "",
-                ),
-                item.get(
-                    "published",
-                    "",
-                ),
-                news_id,
+        (
+            url,
+            item.get(
+                "title",
+                "",
             ),
-        )
-
-    else:
-        cursor = conn.execute(
-            """
-            INSERT INTO news (
-                url,
-                title,
-                source,
-                published,
-                processed,
-                created_at
-            )
-            VALUES (
-                ?,
-                ?,
-                ?,
-                ?,
-                0,
-                ?
-            )
-            """,
-            (
-                url,
-                item.get(
-                    "title",
-                    "",
-                ),
-                item.get(
-                    "source",
-                    "",
-                ),
-                item.get(
-                    "published",
-                    "",
-                ),
-                datetime.now(
-                    timezone.utc
-                ).isoformat(),
+            item.get(
+                "summary",
+                "",
             ),
-        )
-
-        news_id = cursor.lastrowid
+            item.get(
+                "published_at",
+                "",
+            ),
+            now,
+        ),
+    )
 
     conn.commit()
     conn.close()
 
-    return news_id
-
 
 def is_processed(url):
+    normalized = normalize_url(
+        url
+    )
+
     conn = get_db()
 
-    row = conn.execute(
+    cursor = conn.execute(
         """
         SELECT processed
         FROM news
         WHERE url = ?
+        LIMIT 1
         """,
         (
-            normalize_url(url),
+            normalized,
         ),
-    ).fetchone()
+    )
+
+    row = cursor.fetchone()
 
     conn.close()
 
@@ -499,6 +467,10 @@ def is_processed(url):
 
 
 def mark_processed(url):
+    normalized = normalize_url(
+        url
+    )
+
     conn = get_db()
 
     conn.execute(
@@ -508,7 +480,79 @@ def mark_processed(url):
         WHERE url = ?
         """,
         (
-            normalize_url(url),
+            normalized,
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def save_image(
+    url,
+    used=0,
+):
+    if not url:
+        return
+
+    conn = get_db()
+
+    normalized = normalize_url(
+        url
+    )
+
+    conn.execute(
+        """
+        INSERT INTO images (
+            url,
+            source,
+            used,
+            created_at
+        )
+        VALUES (?, ?, ?, ?)
+        ON CONFLICT(url) DO UPDATE SET
+            used = excluded.used
+        """,
+        (
+            normalized,
+            "article",
+            used,
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
+        ),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def log_error(
+    url,
+    error,
+    stage,
+):
+    conn = get_db()
+
+    conn.execute(
+        """
+        INSERT INTO errors (
+            url,
+            error,
+            stage,
+            created_at
+        )
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            normalize_url(
+                url
+            ),
+            str(error),
+            stage,
+            datetime.now(
+                timezone.utc
+            ).isoformat(),
         ),
     )
 
@@ -517,178 +561,39 @@ def mark_processed(url):
 
 
 # =========================================================
-# IMAGE DATABASE
-# =========================================================
-
-def save_image(
-    url,
-    used=0,
-):
-    url = normalize_url(url)
-
-    if not url:
-        return
-
-    conn = get_db()
-
-    row = conn.execute(
-        """
-        SELECT id
-        FROM images
-        WHERE url = ?
-        """,
-        (url,),
-    ).fetchone()
-
-    if row:
-        conn.execute(
-            """
-            UPDATE images
-            SET used = ?
-            WHERE id = ?
-            """,
-            (
-                used,
-                row[0],
-            ),
-        )
-
-    else:
-        created_at = datetime.now(
-            timezone.utc
-        ).isoformat()
-
-        conn.execute(
-            """
-            INSERT INTO images (
-                url,
-                used,
-                created_at
-            )
-            VALUES (
-                ?,
-                ?,
-                ?
-            )
-            """,
-            (
-                url,
-                used,
-                created_at,
-            ),
-        )
-
-    conn.commit()
-    conn.close()
-
-
-# =========================================================
-# ERROR LOGGING
-# =========================================================
-
-def log_error(
-    url,
-    error,
-    stage="unknown",
-):
-    message = str(error)[:4000]
-
-    try:
-        conn = get_db()
-
-        columns = get_existing_columns(
-            conn,
-            "errors",
-        )
-
-        fields = []
-        values = []
-
-        if "url" in columns:
-            fields.append("url")
-            values.append(url)
-
-        if "error" in columns:
-            fields.append("error")
-            values.append(message)
-
-        if "error_message" in columns:
-            fields.append(
-                "error_message"
-            )
-            values.append(message)
-
-        if "stage" in columns:
-            fields.append("stage")
-            values.append(
-                stage or "unknown"
-            )
-
-        if "created_at" in columns:
-            fields.append(
-                "created_at"
-            )
-            values.append(
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-            )
-
-        placeholders = ",".join(
-            "?"
-            for _ in fields
-        )
-
-        conn.execute(
-            f"""
-            INSERT INTO errors (
-                {",".join(fields)}
-            )
-            VALUES (
-                {placeholders}
-            )
-            """,
-            tuple(values),
-        )
-
-        conn.commit()
-        conn.close()
-
-    except Exception as exc:
-        print(
-            "[ERROR LOGGER FAILURE] "
-            f"{exc}"
-        )
-
-
-# =========================================================
-# HEAVY LISTING PAGE
+# HEAVY
 # =========================================================
 
 def is_heavy_article_url(url):
-    normalized = normalize_url(url)
+    try:
+        parsed = urlparse(
+            url
+        )
 
-    parsed = urlparse(
-        normalized
-    )
+        host = parsed.netloc.lower().replace(
+            "www.",
+            "",
+        )
 
-    if parsed.netloc != "heavy.com":
+        path = parsed.path.rstrip(
+            "/"
+        )
+
+        if host != "heavy.com":
+            return False
+
+        if not path.startswith(
+            "/sports/nhl/"
+        ):
+            return False
+
+        if path == "/sports/nhl":
+            return False
+
+        return True
+
+    except Exception:
         return False
-
-    path = parsed.path.rstrip("/")
-
-    if not path.startswith(
-        "/sports/nhl/"
-    ):
-        return False
-
-    if path in (
-        "/sports/nhl",
-        "/sports/nhl/",
-    ):
-        return False
-
-    return True
 
 
 def extract_listing_title(anchor):
@@ -700,12 +605,11 @@ def extract_listing_title(anchor):
         or anchor.get(
             "aria-label",
             "",
-        )
+        ).strip()
         or anchor.get(
             "title",
             "",
-        )
-        or ""
+        ).strip()
     )
 
     return re.sub(
@@ -717,20 +621,21 @@ def extract_listing_title(anchor):
 
 def load_news():
     print(
-        "[HEAVY] Loading source page: "
+        f"[HEAVY] Loading source page: "
         f"{SOURCE_URL}"
     )
 
     response = requests.get(
         SOURCE_URL,
         headers={
-            "User-Agent":
+            "User-Agent": (
                 "Mozilla/5.0 "
                 "(X11; Linux x86_64) "
                 "AppleWebKit/537.36 "
                 "(KHTML, like Gecko) "
-                "Chrome/140.0 Safari/537.36 "
-                "NHLNewsBot/1.0"
+                "Chrome/140.0.0.0 "
+                "Safari/537.36"
+            )
         },
         timeout=30,
     )
@@ -742,20 +647,22 @@ def load_news():
         "html.parser",
     )
 
-    result = []
+    items = []
     seen = set()
 
     for anchor in soup.find_all(
         "a",
         href=True,
     ):
+        raw_url = anchor.get(
+            "href",
+            "",
+        ).strip()
+
         url = normalize_url(
             urljoin(
-                response.url,
-                anchor.get(
-                    "href",
-                    "",
-                ),
+                SOURCE_URL,
+                raw_url,
             )
         )
 
@@ -774,28 +681,29 @@ def load_news():
         if not title:
             continue
 
-        seen.add(url)
+        seen.add(
+            url
+        )
 
-        result.append(
+        items.append(
             {
-                "url": url,
                 "title": title,
-                "source": "heavy.com",
-                "published": "",
+                "url": url,
                 "summary": "",
+                "published_at": "",
             }
         )
 
-        if len(result) >= MAX_NEWS:
+        if len(items) >= MAX_NEWS:
             break
 
     print(
-        "[HEAVY] Articles found: "
-        f"{len(result)}"
+        f"[HEAVY] Articles found: "
+        f"{len(items)}"
     )
 
     for index, item in enumerate(
-        result,
+        items,
         1,
     ):
         print(
@@ -804,38 +712,34 @@ def load_news():
             f"{item['url']}"
         )
 
-    return result
+    return items
 
 
 # =========================================================
-# ARTICLE
+# ARTICLE IMAGES
 # =========================================================
 
 def normalize_image_url(
     image_url,
     page_url,
 ):
-    image_url = (
-        image_url or ""
-    ).strip()
-
     if not image_url:
         return ""
+
+    image_url = image_url.strip()
+
+    if image_url.startswith(
+        "//"
+    ):
+        image_url = (
+            "https:"
+            + image_url
+        )
 
     image_url = urljoin(
         page_url,
         image_url,
     )
-
-    parsed = urlparse(
-        image_url
-    )
-
-    if parsed.scheme not in (
-        "http",
-        "https",
-    ):
-        return ""
 
     return image_url
 
@@ -844,7 +748,7 @@ def extract_jsonld_images(
     value,
     page_url,
 ):
-    images = []
+    results = []
 
     if isinstance(
         value,
@@ -856,64 +760,45 @@ def extract_jsonld_images(
         )
 
         if normalized:
-            images.append(
+            results.append(
                 normalized
             )
 
-    elif isinstance(
+        return results
+
+    if isinstance(
         value,
         list,
     ):
         for item in value:
-            images.extend(
+            results.extend(
                 extract_jsonld_images(
                     item,
                     page_url,
                 )
             )
 
-    elif isinstance(
+        return results
+
+    if isinstance(
         value,
         dict,
     ):
-        for key in (
-            "url",
-            "contentUrl",
-            "thumbnailUrl",
-        ):
-            if key in value:
-                images.extend(
-                    extract_jsonld_images(
-                        value[key],
-                        page_url,
-                    )
-                )
+        image = value.get(
+            "image"
+        )
 
-        for key in (
-            "image",
-            "images",
-            "thumbnail",
-        ):
-            if key in value:
-                images.extend(
-                    extract_jsonld_images(
-                        value[key],
-                        page_url,
-                    )
-                )
-
-        for item in value.get(
-            "@graph",
-            [],
-        ):
-            images.extend(
+        if image:
+            results.extend(
                 extract_jsonld_images(
-                    item,
+                    image,
                     page_url,
                 )
             )
 
-    return images
+        return results
+
+    return results
 
 
 def extract_source_images(
@@ -922,105 +807,106 @@ def extract_source_images(
 ):
     candidates = []
 
-    for meta in soup.find_all(
-        "meta"
-    ):
-        prop = (
-            meta.get(
-                "property",
+    meta_selectors = [
+        (
+            "meta",
+            {
+                "property": "og:image"
+            },
+        ),
+        (
+            "meta",
+            {
+                "property": "og:image:url"
+            },
+        ),
+        (
+            "meta",
+            {
+                "property": "og:image:secure_url"
+            },
+        ),
+        (
+            "meta",
+            {
+                "name": "twitter:image"
+            },
+        ),
+        (
+            "meta",
+            {
+                "name": "twitter:image:src"
+            },
+        ),
+    ]
+
+    for tag_name, attrs in meta_selectors:
+        tag = soup.find(
+            tag_name,
+            attrs=attrs,
+        )
+
+        if not tag:
+            continue
+
+        value = (
+            tag.get(
+                "content",
                 "",
             )
-            or meta.get(
-                "name",
+            or ""
+        ).strip()
+
+        normalized = normalize_image_url(
+            value,
+            page_url,
+        )
+
+        if normalized:
+            candidates.append(
+                (
+                    normalized,
+                    "article_meta",
+                )
+            )
+
+    link_tag = soup.find(
+        "link",
+        rel=lambda value: (
+            value
+            and "image_src" in value
+        ),
+    )
+
+    if link_tag:
+        normalized = normalize_image_url(
+            link_tag.get(
+                "href",
                 "",
-            )
-        ).lower().strip()
+            ),
+            page_url,
+        )
 
-        if prop in (
-            "og:image",
-            "og:image:url",
-            "og:image:secure_url",
-        ):
-            image_url = normalize_image_url(
-                meta.get(
-                    "content",
-                    "",
-                ),
-                page_url,
-            )
-
-            if image_url:
-                candidates.append(
-                    (
-                        image_url,
-                        "og:image",
-                    )
+        if normalized:
+            candidates.append(
+                (
+                    normalized,
+                    "article_link",
                 )
-
-        elif prop in (
-            "twitter:image",
-            "twitter:image:src",
-        ):
-            image_url = normalize_image_url(
-                meta.get(
-                    "content",
-                    "",
-                ),
-                page_url,
             )
-
-            if image_url:
-                candidates.append(
-                    (
-                        image_url,
-                        "twitter:image",
-                    )
-                )
-
-    for link in soup.find_all(
-        "link"
-    ):
-        rel = [
-            str(value).lower()
-            for value in link.get(
-                "rel",
-                [],
-            )
-        ]
-
-        if "image_src" in rel:
-            image_url = normalize_image_url(
-                link.get(
-                    "href",
-                    "",
-                ),
-                page_url,
-            )
-
-            if image_url:
-                candidates.append(
-                    (
-                        image_url,
-                        "link:image_src",
-                    )
-                )
 
     for script in soup.find_all(
         "script",
-        attrs={
-            "type":
-                "application/ld+json"
-        },
+        type="application/ld+json",
     ):
-        raw = (
-            script.string
-            or script.get_text()
-        )
+        raw = script.string
 
-        if not raw.strip():
+        if not raw:
             continue
 
         try:
+            import json
+
             data = json.loads(
                 raw
             )
@@ -1035,27 +921,29 @@ def extract_source_images(
             candidates.append(
                 (
                     image_url,
-                    "json-ld",
+                    "article_jsonld",
                 )
             )
 
-    unique = []
+    result = []
     seen = set()
 
     for image_url, source in candidates:
         if image_url in seen:
             continue
 
-        seen.add(image_url)
+        seen.add(
+            image_url
+        )
 
-        unique.append(
+        result.append(
             (
                 image_url,
                 source,
             )
         )
 
-    return unique
+    return result
 
 
 def fetch_article(
@@ -1063,23 +951,22 @@ def fetch_article(
     fallback_summary="",
 ):
     print(
-        "[ARTICLE] Loading: "
+        f"[ARTICLE] Loading: "
         f"{url}"
     )
 
-    headers = {
-        "User-Agent":
-            "Mozilla/5.0 "
-            "(X11; Linux x86_64) "
-            "AppleWebKit/537.36 "
-            "(KHTML, like Gecko) "
-            "Chrome/140.0 Safari/537.36 "
-            "NHLNewsBot/1.0"
-    }
-
     response = requests.get(
         url,
-        headers=headers,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0.0.0 "
+                "Safari/537.36"
+            )
+        },
         timeout=30,
     )
 
@@ -1092,161 +979,148 @@ def fetch_article(
 
     source_images = extract_source_images(
         soup,
-        response.url or url,
+        url,
     )
 
     print(
-        "[IMAGE] Article source image "
-        "candidates: "
+        f"[IMAGE] Article source image candidates: "
         f"{len(source_images)}"
     )
 
-    text_soup = BeautifulSoup(
-        response.text,
-        "html.parser",
+    article_node = soup.find(
+        "article"
     )
 
-    for tag in text_soup(
+    if article_node is None:
+        article_node = soup.find(
+            "main"
+        )
+
+    if article_node is None:
+        article_node = soup
+
+    for unwanted in article_node.find_all(
         [
             "script",
             "style",
             "noscript",
             "svg",
+            "nav",
+            "footer",
+            "header",
         ]
     ):
-        tag.decompose()
+        unwanted.decompose()
 
-    article_node = (
-        text_soup.find(
-            "article"
-        )
-        or text_soup.find(
-            "main"
-        )
+    article_text = article_node.get_text(
+        " ",
+        strip=True,
     )
 
-    if article_node:
-        text = article_node.get_text(
-            " ",
-            strip=True,
-        )
-    else:
-        text = text_soup.get_text(
-            " ",
-            strip=True,
-        )
-
-    if len(text) < 300:
-        text = fallback_summary
-
-    text = re.sub(
+    article_text = re.sub(
         r"\s+",
         " ",
-        text,
+        article_text,
     ).strip()
 
-    if len(text) < 300:
+    if len(article_text) < 300:
+        fallback = re.sub(
+            r"\s+",
+            " ",
+            fallback_summary or "",
+        ).strip()
+
+        if fallback:
+            article_text = (
+                article_text
+                + " "
+                + fallback
+            ).strip()
+
+    if len(article_text) < 300:
         raise RuntimeError(
             "Article text is too short"
         )
 
     return (
-        text[:MAX_ARTICLE_TEXT],
+        article_text[:MAX_ARTICLE_TEXT],
         source_images,
     )
 
 
-# =========================================================
-# SOURCE IMAGE
-# =========================================================
-
 def download_source_image(
     image_url,
-    article_url,
+    page_url,
     image_source,
 ):
     if not image_url:
         return None
 
-    print(
-        "[IMAGE] Trying article image: "
-        f"{image_source}"
-    )
-
-    print(
-        "[IMAGE] URL: "
-        f"{image_url}"
-    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 "
+            "(X11; Linux x86_64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0.0.0 "
+            "Safari/537.36"
+        ),
+        "Referer": page_url,
+    }
 
     try:
         response = requests.get(
             image_url,
-            headers={
-                "User-Agent":
-                    "Mozilla/5.0 "
-                    "(NHLNewsBot/1.0)",
-                "Referer":
-                    article_url,
-            },
+            headers=headers,
             timeout=SOURCE_IMAGE_DOWNLOAD_TIMEOUT,
         )
 
         response.raise_for_status()
 
         content_type = (
-            response.headers
-            .get(
+            response.headers.get(
                 "Content-Type",
                 "",
             )
-            .split(
-                ";",
-                1,
-            )[0]
-            .strip()
             .lower()
+            .strip()
         )
 
         if not content_type.startswith(
             "image/"
         ):
             print(
-                "[IMAGE] URL is not an image: "
-                f"{content_type or 'unknown'}"
+                "[IMAGE] Skipping non-image response: "
+                f"{image_url}"
             )
-
             return None
 
-        if len(response.content) < MIN_IMAGE_BYTES:
+        content = response.content
+
+        if len(content) < MIN_IMAGE_BYTES:
             print(
                 "[IMAGE] Image is too small: "
-                f"{len(response.content)} bytes"
+                f"{len(content)} bytes"
             )
-
             return None
 
-        suffix = ".jpg"
+        extension = ".jpg"
 
         if "png" in content_type:
-            suffix = ".png"
-
+            extension = ".png"
         elif "webp" in content_type:
-            suffix = ".webp"
-
+            extension = ".webp"
         elif "gif" in content_type:
-            suffix = ".gif"
-
-        elif "jpeg" in content_type:
-            suffix = ".jpg"
+            extension = ".gif"
 
         filename = (
-            "nhl_source_"
-            + hashlib.md5(
+            "nhl_"
+            + hashlib.sha256(
                 image_url.encode(
                     "utf-8"
                 )
-            ).hexdigest()
-            + suffix
+            ).hexdigest()[:16]
+            + extension
         )
 
         path = os.path.join(
@@ -1259,24 +1133,25 @@ def download_source_image(
             "wb",
         ) as image_file:
             image_file.write(
-                response.content
+                content
             )
 
         save_image(
             image_url,
-            1,
+            used=0,
         )
 
         print(
-            "[IMAGE] Downloaded from article: "
-            f"{path}"
+            "[IMAGE] Downloaded source image: "
+            f"{image_source}"
         )
 
         return path
 
     except Exception as exc:
         print(
-            "[IMAGE SOURCE ERROR] "
+            "[IMAGE ERROR] "
+            f"{image_url}: "
             f"{exc}"
         )
 
@@ -1305,14 +1180,16 @@ def gemini_request(
                     }
                 ]
             }
-        ]
+        ],
+        "generationConfig": {
+            "maxOutputTokens": 500,
+        },
     }
 
     response = requests.post(
         url,
         params={
-            "key":
-                GEMINI_API_KEY
+            "key": GEMINI_API_KEY
         },
         json=payload,
         timeout=GEMINI_TIMEOUT,
@@ -1339,21 +1216,12 @@ def gemini_request(
 
     parts = (
         candidates[0]
-        .get(
-            "content",
-            {},
-        )
-        .get(
-            "parts",
-            [],
-        )
+        .get("content", {})
+        .get("parts", [])
     )
 
     text = "".join(
-        part.get(
-            "text",
-            "",
-        )
+        part.get("text", "")
         for part in parts
     ).strip()
 
@@ -1392,19 +1260,18 @@ def clean_post(text):
 
 
 def validate_post_structure(text):
-    """
-    Deterministic checks for the Telegram post format.
-    """
+    """Deterministic checks for the Telegram post format."""
+    text = clean_post(
+        text
+    )
 
-    text = clean_post(text)
-
-    length = len(text)
+    length = len(
+        text
+    )
 
     if length < 400 or length > 600:
         raise PostRejected(
-            "Post length is "
-            f"{length} characters; "
-            "required 400-600"
+            f"Post length is {length} characters; required 400-600"
         )
 
     paragraphs = [
@@ -1418,8 +1285,8 @@ def validate_post_structure(text):
 
     if len(paragraphs) != 3:
         raise PostRejected(
-            "Post must contain exactly "
-            f"3 paragraphs; found {len(paragraphs)}"
+            "Post must contain exactly 3 paragraphs; "
+            f"found {len(paragraphs)}"
         )
 
     paragraph_lengths = [
@@ -1427,7 +1294,9 @@ def validate_post_structure(text):
         for paragraph in paragraphs
     ]
 
-    if min(paragraph_lengths) < 80:
+    if min(
+        paragraph_lengths
+    ) < 80:
         raise PostRejected(
             "One of the paragraphs is too short"
         )
@@ -1437,11 +1306,13 @@ def validate_post_structure(text):
         > min(paragraph_lengths) * 1.8
     ):
         raise PostRejected(
-            "Paragraphs are not approximately "
-            "equal in length"
+            "Paragraphs are not approximately equal in length"
         )
 
-    if "«" in text or "»" in text:
+    if (
+        "«" in text
+        or "»" in text
+    ):
         raise PostRejected(
             "Post contains Russian quotation marks"
         )
@@ -1451,8 +1322,7 @@ def validate_post_structure(text):
         or text.startswith("•")
     ):
         raise PostRejected(
-            "Post looks like a list instead "
-            "of a normal Telegram post"
+            "Post looks like a list instead of a normal Telegram post"
         )
 
     return text
@@ -1469,30 +1339,18 @@ def generate_post_prompt(
 
 ЖЁСТКИЕ ТРЕБОВАНИЯ:
 
-1. Итоговый текст должен содержать от 400 до 600 символов включительно. Считай все символы, включая пробелы и знаки препинания.
-
+1. Итоговый текст должен содержать от 400 до 600 символов включительно. Целься в 460-520 символов, чтобы не выйти за предел. Считай все символы, включая пробелы и знаки препинания.
 2. Сделай ровно 3 органичных абзаца.
-
-3. Абзацы должны быть примерно равными по объёму.
-
+3. Каждый абзац должен быть примерно 140-180 символов. Не делай один абзац заметно длиннее остальных.
 4. Не растягивай текст ради достижения лимита. Убери всё второстепенное.
-
 5. Сохрани главное событие, ключевые детали, цифры, имена и последствия, если они есть в материале.
-
 6. Не добавляй ни одного факта, которого нет в исходном материале.
-
 7. Не выдумывай цитаты и не меняй смысл существующих цитат.
-
 8. Не переводи дословно. Пиши естественно по-русски, как живой автор Telegram-канала.
-
 9. Не начинай с шаблонных фраз вроде «Стало известно», «Похоже, что», «Вот это поворот».
-
 10. Названия хоккейных команд пиши без кавычек. Не используй «» вокруг названий команд.
-
 11. Не используй списки, подзаголовки, эмодзи и служебные пометки.
-
 12. Перед отправкой обязательно проверь русский язык: орфографию, пунктуацию, грамматику, согласование, падежи и естественность формулировок.
-
 13. Если в исходнике есть сомнительная или противоречивая информация, не додумывай её. Передай только то, что прямо подтверждается материалом.
 
 Заголовок статьи:
@@ -1501,8 +1359,7 @@ def generate_post_prompt(
 Материал статьи:
 {article}
 
-Верни только готовый текст поста.
-Никаких пояснений.
+Верни только готовый текст поста. Никаких пояснений.
 """.strip()
 
 
@@ -1522,26 +1379,101 @@ def generate_post(
         article,
     )
 
+    def repair_prompt(
+        previous_post,
+    ):
+        return f"""
+Твой предыдущий вариант поста не прошёл техническую проверку.
+
+Исправь ЕГО, а не пиши новый материал с нуля. Сохрани все важные факты, имена, цифры и смысл.
+
+ЖЁСТКИЕ ОГРАНИЧЕНИЯ:
+
+- итоговый текст: 400-600 символов включительно; ЦЕЛЬ — 460-520 символов;
+- ровно 3 абзаца;
+- каждый абзац примерно 140-180 символов;
+- без кавычек «»;
+- без списков, заголовков, эмодзи и пояснений;
+- только русский текст поста;
+- не добавляй факты, которых нет в исходнике;
+- не растягивай текст: убирай второстепенные детали;
+- проверь орфографию, пунктуацию и грамматику.
+
+Заголовок:
+{title}
+
+Исходный материал:
+{article}
+
+Предыдущий вариант:
+{previous_post}
+
+Верни только исправленный пост.
+""".strip()
+
+    def generate_with_model(
+        model,
+        label,
+        request_prompt,
+    ):
+        print(
+            f"[GEMINI {label}] Using {model}"
+        )
+
+        result = gemini_request(
+            model,
+            request_prompt,
+        )
+
+        time.sleep(
+            GEMINI_DELAY
+        )
+
+        return result
+
+    # -----------------------------------------------------
+    # PRIMARY MODEL
+    # -----------------------------------------------------
+
     if not GEMINI_PRIMARY_DISABLED:
         try:
-            result = gemini_request(
+            result = generate_with_model(
                 GEMINI_PRIMARY_MODEL,
+                "PRIMARY",
                 prompt,
             )
 
-            time.sleep(
-                GEMINI_DELAY
-            )
+            try:
+                return validate_post_structure(
+                    result
+                )
 
-            return validate_post_structure(
-                result
-            )
+            except PostRejected as exc:
+                print(
+                    "[POST FORMAT ERROR] "
+                    f"{exc}"
+                )
+
+                repaired = generate_with_model(
+                    GEMINI_PRIMARY_MODEL,
+                    "PRIMARY REPAIR",
+                    repair_prompt(
+                        clean_post(
+                            result
+                        )
+                    ),
+                )
+
+                return validate_post_structure(
+                    repaired
+                )
 
         except PostRejected as exc:
             print(
-                "[GEMINI PRIMARY FORMAT ERROR] "
+                "[POST REPAIR FAILED] "
                 f"{exc}"
             )
+            raise
 
         except Exception as exc:
             print(
@@ -1573,9 +1505,8 @@ def generate_post(
                 GEMINI_PRIMARY_DISABLED = True
 
                 print(
-                    "[GEMINI] Primary disabled "
-                    "for the remainder of this run; "
-                    "using fallback model."
+                    "[GEMINI] Primary disabled for the remainder "
+                    "of this run; using fallback model."
                 )
 
             elif (
@@ -1589,39 +1520,57 @@ def generate_post(
                     "using fallback model."
                 )
 
-    print(
-        "[GEMINI FALLBACK] Using "
-        f"{GEMINI_FALLBACK_MODEL}"
-    )
+            else:
+                raise
+
+    # -----------------------------------------------------
+    # FALLBACK MODEL
+    # -----------------------------------------------------
 
     try:
-        result = gemini_request(
+        result = generate_with_model(
             GEMINI_FALLBACK_MODEL,
+            "FALLBACK",
             prompt,
         )
 
-    except Exception as exc:
+        try:
+            return validate_post_structure(
+                result
+            )
+
+        except PostRejected as exc:
+            print(
+                "[POST FORMAT ERROR] Fallback output failed: "
+                f"{exc}"
+            )
+
+            repaired = generate_with_model(
+                GEMINI_FALLBACK_MODEL,
+                "FALLBACK REPAIR",
+                repair_prompt(
+                    clean_post(
+                        result
+                    )
+                ),
+            )
+
+            return validate_post_structure(
+                repaired
+            )
+
+    except PostRejected as exc:
         print(
-            "[GEMINI FALLBACK ERROR] "
+            "[POST REPAIR FAILED] Fallback: "
             f"{exc}"
         )
-
         raise
 
-    time.sleep(
-        GEMINI_DELAY
-    )
 
-    return validate_post_structure(
-        result
-    )
-
-
-def check_post_language(post):
-    """
-    Use Gemini as a final grammar/spelling
-    gate before publication.
-    """
+def check_post_language(
+    post,
+):
+    """Use Gemini as a final grammar/spelling gate before publication."""
 
     prompt = f"""
 Проверь готовый русский Telegram-пост ниже перед публикацией.
@@ -1640,13 +1589,18 @@ def check_post_language(post):
 
 Проверяй только наличие реальных ошибок.
 
-Если ошибок нет, ответь ровно:
+Если ошибок нет, ответь строго:
+
 OK
 
-Если есть хотя бы одна реальная ошибка, ответь ровно:
+Если есть хотя бы одна реальная ошибка, ответь строго:
+
 ERROR
 
+Никаких пояснений.
+
 Пост:
+
 {post}
 """.strip()
 
@@ -1723,8 +1677,7 @@ ERROR
     )
 
     print(
-        "[POST VALIDATION] "
-        "Language check: OK"
+        "[POST VALIDATION] Language check: OK"
     )
 
 
@@ -1751,27 +1704,34 @@ def send_telegram(
         f"bot{TELEGRAM_TOKEN}"
     )
 
-    if not image_path:
-        raise RuntimeError(
-            "No article image available"
-        )
+    if image_path:
+        with open(
+            image_path,
+            "rb",
+        ) as image_file:
+            response = requests.post(
+                f"{base_url}/sendPhoto",
+                data={
+                    "chat_id":
+                        TELEGRAM_CHAT_ID,
+                    "caption":
+                        post,
+                },
+                files={
+                    "photo":
+                        image_file
+                },
+                timeout=TELEGRAM_TIMEOUT,
+            )
 
-    with open(
-        image_path,
-        "rb",
-    ) as image_file:
-
+    else:
         response = requests.post(
-            f"{base_url}/sendPhoto",
+            f"{base_url}/sendMessage",
             data={
                 "chat_id":
                     TELEGRAM_CHAT_ID,
-                "caption":
+                "text":
                     post,
-            },
-            files={
-                "photo":
-                    image_file
             },
             timeout=TELEGRAM_TIMEOUT,
         )
@@ -1801,7 +1761,9 @@ def process_news(
     url = item["url"]
 
     try:
-        save_news(item)
+        save_news(
+            item
+        )
 
         article, source_images = fetch_article(
             url,
@@ -1823,8 +1785,7 @@ def process_news(
 
         except PostRejected as exc:
             print(
-                "[POST SKIPPED] "
-                "Validation failed: "
+                "[POST SKIPPED] Validation failed: "
                 f"{exc}"
             )
 
@@ -1856,11 +1817,7 @@ def process_news(
 
         image = None
 
-        for (
-            source_image_url,
-            image_source,
-        ) in source_images:
-
+        for source_image_url, image_source in source_images:
             image = download_source_image(
                 source_image_url,
                 url,
@@ -1872,8 +1829,7 @@ def process_news(
 
         if image is None:
             raise RuntimeError(
-                "Could not download any image "
-                "from the article page"
+                "Could not download any image from the article page"
             )
 
         send_telegram(
@@ -1881,12 +1837,20 @@ def process_news(
             image,
         )
 
+        save_image(
+            source_images[0][0]
+            if source_images
+            else "",
+            used=1,
+        )
+
         mark_processed(
             url
         )
 
         print(
-            "[BOT] Published successfully"
+            "[POST PUBLISHED] "
+            f"{item['title']}"
         )
 
         return True
@@ -1900,7 +1864,7 @@ def process_news(
         log_error(
             url,
             str(exc),
-            "post_validation",
+            "post_generation",
         )
 
         mark_processed(
@@ -1910,53 +1874,15 @@ def process_news(
         return False
 
     except Exception as exc:
-        message = str(exc)
-
-        stage = "processing"
-
-        if (
-            "CHAT_ID" in message
-            or "Telegram" in message
-        ):
-            stage = "telegram"
-
-            print(
-                "[TELEGRAM ERROR] "
-                f"{message}"
-            )
-
-        elif (
-            "Gemini" in message
-            or "GEMINI" in message
-        ):
-            stage = "gemini"
-
-        elif (
-            "image" in message.lower()
-        ):
-            stage = "image"
-
-        elif (
-            "post" in message.lower()
-            or "language" in message.lower()
-        ):
-            stage = "post_validation"
-
-        elif (
-            "article" in message.lower()
-            or "HTTP" in message
-        ):
-            stage = "article"
-
         print(
-            "[FATAL ITEM ERROR] "
-            f"{message}"
+            "[BOT ERROR] "
+            f"{exc}"
         )
 
         log_error(
             url,
-            message,
-            stage,
+            str(exc),
+            "processing",
         )
 
         return False
@@ -1967,9 +1893,17 @@ def process_news(
 # =========================================================
 
 def main():
-    print("=" * 70)
-    print("NHL NEWS BOT START")
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
+
+    print(
+        "NHL NEWS BOT START"
+    )
+
+    print(
+        "=" * 70
+    )
 
     print(
         f"[CONFIG] Heavy articles limit: "
@@ -1993,11 +1927,12 @@ def main():
 
     print(
         "[CONFIG] Post length: "
-        "400-600 characters; "
-        "3 paragraphs"
+        "400-600 characters; 3 paragraphs"
     )
 
-    print("=" * 70)
+    print(
+        "=" * 70
+    )
 
     # -----------------------------------------------------
     # DATABASE INITIALIZATION
@@ -2080,24 +2015,25 @@ def main():
         else:
             failed += 1
 
-    # -----------------------------------------------------
-    # FINISH
-    # -----------------------------------------------------
-
-    print("=" * 70)
-    print("NHL NEWS BOT FINISHED")
-
     print(
-        f"Published: "
-        f"{published}"
+        "=" * 70
     )
 
     print(
-        f"Failed: "
-        f"{failed}"
+        "NHL NEWS BOT FINISHED"
     )
 
-    print("=" * 70)
+    print(
+        f"Published: {published}"
+    )
+
+    print(
+        f"Failed: {failed}"
+    )
+
+    print(
+        "=" * 70
+    )
 
 
 if __name__ == "__main__":
