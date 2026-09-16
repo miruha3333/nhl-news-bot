@@ -1,43 +1,40 @@
 import os
 import re
 import hashlib
+import json
 import sqlite3
 import tempfile
 import time
 from datetime import datetime, timezone
 from urllib.parse import urljoin, urlparse, urlunparse
 
-import feedparser
 import requests
 from bs4 import BeautifulSoup
-from ddgs import DDGS
 
 
-RSS_URL = os.getenv("RSS_URL", "").strip()
+# =========================================================
+# CONFIG
+# =========================================================
+
+SOURCE_URL = "https://heavy.com/sports/nhl/"
+
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 
 DATABASE_FILE = "nhl_bot.db"
 
-MAX_RSS_ENTRIES = 30
-
+MAX_NEWS = 30
 GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
 GEMINI_TIMEOUT = 90
 TELEGRAM_TIMEOUT = 60
-
-IMAGE_RESULTS_LIMIT = 30
-IMAGE_DOWNLOAD_TIMEOUT = 20
-SOURCE_IMAGE_DOWNLOAD_TIMEOUT = 15
+ARTICLE_TIMEOUT = 30
+IMAGE_TIMEOUT = 20
 MIN_IMAGE_BYTES = 5000
-
 GEMINI_DELAY = 1.0
 MAX_ARTICLE_TEXT = 12000
-
-FRESH_DAYS = 90
-HISTORICAL_YEAR_TOLERANCE = 3
 
 DATABASE_READY = False
 GEMINI_PRIMARY_DISABLED = False
@@ -55,7 +52,6 @@ def normalize_url(url):
 
     try:
         parsed = urlparse(url)
-
         host = parsed.netloc.lower().replace("www.", "")
         path = parsed.path.rstrip("/") or "/"
 
@@ -69,13 +65,12 @@ def normalize_url(url):
                 "",
             )
         )
-
     except Exception:
         return url
 
 
 # =========================================================
-# DATABASE HELPERS
+# DATABASE
 # =========================================================
 
 def table_exists(conn, table):
@@ -103,95 +98,18 @@ def get_existing_columns(conn, table):
     return {row[1] for row in rows}
 
 
-def add_column_if_missing(
-    conn,
-    table,
-    column,
-    definition,
-):
-    columns = get_existing_columns(conn, table)
-
-    if column not in columns:
-        print(
-            f"[DATABASE] Adding missing column "
-            f"{table}.{column}"
-        )
-
+def add_column_if_missing(conn, table, column, definition):
+    if column not in get_existing_columns(conn, table):
         conn.execute(
-            f'ALTER TABLE "{table}" '
-            f'ADD COLUMN "{column}" {definition}'
+            f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}'
         )
-
-
-# =========================================================
-# DATABASE MIGRATION
-# =========================================================
-
-def remove_duplicate_news(conn):
-    if not table_exists(conn, "news"):
-        return
-
-    rows = conn.execute(
-        """
-        SELECT rowid, url
-        FROM news
-        ORDER BY rowid
-        """
-    ).fetchall()
-
-    seen = set()
-
-    for rowid, url in rows:
-        normalized = normalize_url(url)
-
-        if not normalized:
-            continue
-
-        if normalized in seen:
-            conn.execute(
-                "DELETE FROM news WHERE rowid = ?",
-                (rowid,),
-            )
-        else:
-            seen.add(normalized)
-
-
-def remove_duplicate_images(conn):
-    if not table_exists(conn, "images"):
-        return
-
-    rows = conn.execute(
-        """
-        SELECT rowid, url
-        FROM images
-        ORDER BY rowid
-        """
-    ).fetchall()
-
-    seen = set()
-
-    for rowid, url in rows:
-        normalized = normalize_url(url)
-
-        if not normalized:
-            continue
-
-        if normalized in seen:
-            conn.execute(
-                "DELETE FROM images WHERE rowid = ?",
-                (rowid,),
-            )
-        else:
-            seen.add(normalized)
 
 
 def normalize_existing_urls(conn, table):
     if not table_exists(conn, table):
         return
 
-    columns = get_existing_columns(conn, table)
-
-    if "url" not in columns:
+    if "url" not in get_existing_columns(conn, table):
         return
 
     rows = conn.execute(
@@ -208,12 +126,33 @@ def normalize_existing_urls(conn, table):
             )
 
 
+def remove_duplicate_rows(conn, table):
+    if not table_exists(conn, table):
+        return
+
+    rows = conn.execute(
+        f'SELECT rowid, url FROM "{table}" ORDER BY rowid'
+    ).fetchall()
+
+    seen = set()
+
+    for rowid, url in rows:
+        normalized = normalize_url(url)
+
+        if not normalized:
+            continue
+
+        if normalized in seen:
+            conn.execute(
+                f'DELETE FROM "{table}" WHERE rowid = ?',
+                (rowid,),
+            )
+        else:
+            seen.add(normalized)
+
+
 def migrate_database(conn):
     print("[DATABASE] Checking database schema...")
-
-    # -----------------------------------------------------
-    # NEWS
-    # -----------------------------------------------------
 
     conn.execute(
         """
@@ -229,37 +168,14 @@ def migrate_database(conn):
         """
     )
 
-    add_column_if_missing(
-        conn,
-        "news",
-        "source",
-        "TEXT",
-    )
-
-    add_column_if_missing(
-        conn,
-        "news",
-        "published",
-        "TEXT",
-    )
-
-    add_column_if_missing(
-        conn,
-        "news",
-        "processed",
-        "INTEGER NOT NULL DEFAULT 0",
-    )
-
-    add_column_if_missing(
-        conn,
-        "news",
-        "created_at",
-        "TEXT",
-    )
-
-    # -----------------------------------------------------
-    # IMAGES
-    # -----------------------------------------------------
+    for column, definition in (
+        ("title", "TEXT"),
+        ("source", "TEXT"),
+        ("published", "TEXT"),
+        ("processed", "INTEGER NOT NULL DEFAULT 0"),
+        ("created_at", "TEXT"),
+    ):
+        add_column_if_missing(conn, "news", column, definition)
 
     conn.execute(
         """
@@ -272,23 +188,11 @@ def migrate_database(conn):
         """
     )
 
-    add_column_if_missing(
-        conn,
-        "images",
-        "used",
-        "INTEGER NOT NULL DEFAULT 0",
-    )
-
-    add_column_if_missing(
-        conn,
-        "images",
-        "created_at",
-        "TEXT",
-    )
-
-    # -----------------------------------------------------
-    # ERRORS
-    # -----------------------------------------------------
+    for column, definition in (
+        ("used", "INTEGER NOT NULL DEFAULT 0"),
+        ("created_at", "TEXT"),
+    ):
+        add_column_if_missing(conn, "images", column, definition)
 
     conn.execute(
         """
@@ -303,108 +207,36 @@ def migrate_database(conn):
         """
     )
 
-    add_column_if_missing(
-        conn,
-        "errors",
-        "url",
-        "TEXT",
-    )
+    for column, definition in (
+        ("url", "TEXT"),
+        ("error", "TEXT"),
+        ("error_message", "TEXT"),
+        ("stage", "TEXT NOT NULL DEFAULT 'unknown'"),
+        ("created_at", "TEXT"),
+    ):
+        add_column_if_missing(conn, "errors", column, definition)
 
-    add_column_if_missing(
-        conn,
-        "errors",
-        "error",
-        "TEXT",
-    )
-
-    add_column_if_missing(
-        conn,
-        "errors",
-        "error_message",
-        "TEXT",
-    )
-
-    add_column_if_missing(
-        conn,
-        "errors",
-        "stage",
-        "TEXT NOT NULL DEFAULT 'unknown'",
-    )
-
-    add_column_if_missing(
-        conn,
-        "errors",
-        "created_at",
-        "TEXT",
-    )
-
-    # -----------------------------------------------------
-    # NORMALIZE URLS
-    # -----------------------------------------------------
-
-    print(
-        "[DATABASE] Normalizing existing URLs..."
-    )
-
-    normalize_existing_urls(
-        conn,
-        "news",
-    )
-
-    normalize_existing_urls(
-        conn,
-        "images",
-    )
-
-    # -----------------------------------------------------
-    # REMOVE DUPLICATES
-    # -----------------------------------------------------
-
-    print(
-        "[DATABASE] Checking duplicate news URLs..."
-    )
-
-    remove_duplicate_news(conn)
-
-    print(
-        "[DATABASE] Checking duplicate image URLs..."
-    )
-
-    remove_duplicate_images(conn)
-
-    # -----------------------------------------------------
-    # UNIQUE INDEXES
-    # -----------------------------------------------------
-
-    print(
-        "[DATABASE] Creating unique index for news.url..."
-    )
+    normalize_existing_urls(conn, "news")
+    normalize_existing_urls(conn, "images")
+    remove_duplicate_rows(conn, "news")
+    remove_duplicate_rows(conn, "images")
 
     conn.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS
-        idx_news_url_unique
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_news_url_unique
         ON news(url)
         """
     )
 
-    print(
-        "[DATABASE] Creating unique index for images.url..."
-    )
-
     conn.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS
-        idx_images_url_unique
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_images_url_unique
         ON images(url)
         """
     )
 
     conn.commit()
-
-    print(
-        "[DATABASE] Schema check complete."
-    )
+    print("[DATABASE] Schema check complete.")
 
 
 def get_db():
@@ -415,13 +247,8 @@ def get_db():
         timeout=30,
     )
 
-    conn.execute(
-        "PRAGMA journal_mode=WAL"
-    )
-
-    conn.execute(
-        "PRAGMA busy_timeout=30000"
-    )
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=30000")
 
     if not DATABASE_READY:
         migrate_database(conn)
@@ -430,23 +257,13 @@ def get_db():
     return conn
 
 
-# =========================================================
-# NEWS DATABASE
-# =========================================================
-
 def save_news(item):
     conn = get_db()
 
-    url = normalize_url(
-        item.get("url", "")
-    )
+    url = normalize_url(item.get("url", ""))
 
     row = conn.execute(
-        """
-        SELECT id
-        FROM news
-        WHERE url = ?
-        """,
+        "SELECT id FROM news WHERE url = ?",
         (url,),
     ).fetchone()
 
@@ -456,9 +273,7 @@ def save_news(item):
         conn.execute(
             """
             UPDATE news
-            SET title = ?,
-                source = ?,
-                published = ?
+            SET title = ?, source = ?, published = ?
             WHERE id = ?
             """,
             (
@@ -468,21 +283,11 @@ def save_news(item):
                 news_id,
             ),
         )
-
     else:
-        created_at = datetime.now(
-            timezone.utc
-        ).isoformat()
-
         cursor = conn.execute(
             """
             INSERT INTO news (
-                url,
-                title,
-                source,
-                published,
-                processed,
-                created_at
+                url, title, source, published, processed, created_at
             )
             VALUES (?, ?, ?, ?, 0, ?)
             """,
@@ -491,7 +296,7 @@ def save_news(item):
                 item.get("title", ""),
                 item.get("source", ""),
                 item.get("published", ""),
-                created_at,
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
 
@@ -507,19 +312,13 @@ def is_processed(url):
     conn = get_db()
 
     row = conn.execute(
-        """
-        SELECT processed
-        FROM news
-        WHERE url = ?
-        """,
+        "SELECT processed FROM news WHERE url = ?",
         (normalize_url(url),),
     ).fetchone()
 
     conn.close()
 
-    return bool(
-        row and row[0]
-    )
+    return bool(row and row[0])
 
 
 def mark_processed(url):
@@ -538,10 +337,6 @@ def mark_processed(url):
     conn.close()
 
 
-# =========================================================
-# IMAGE DATABASE
-# =========================================================
-
 def save_image(url, used=0):
     url = normalize_url(url)
 
@@ -551,45 +346,25 @@ def save_image(url, used=0):
     conn = get_db()
 
     row = conn.execute(
-        """
-        SELECT id
-        FROM images
-        WHERE url = ?
-        """,
+        "SELECT id FROM images WHERE url = ?",
         (url,),
     ).fetchone()
 
     if row:
         conn.execute(
-            """
-            UPDATE images
-            SET used = ?
-            WHERE id = ?
-            """,
-            (
-                used,
-                row[0],
-            ),
+            "UPDATE images SET used = ? WHERE id = ?",
+            (used, row[0]),
         )
-
     else:
-        created_at = datetime.now(
-            timezone.utc
-        ).isoformat()
-
         conn.execute(
             """
-            INSERT INTO images (
-                url,
-                used,
-                created_at
-            )
+            INSERT INTO images (url, used, created_at)
             VALUES (?, ?, ?)
             """,
             (
                 url,
                 used,
-                created_at,
+                datetime.now(timezone.utc).isoformat(),
             ),
         )
 
@@ -597,24 +372,12 @@ def save_image(url, used=0):
     conn.close()
 
 
-# =========================================================
-# ERROR LOGGING
-# =========================================================
-
-def log_error(
-    url,
-    error,
-    stage="unknown",
-):
+def log_error(url, error, stage="unknown"):
     message = str(error)[:4000]
 
     try:
         conn = get_db()
-
-        columns = get_existing_columns(
-            conn,
-            "errors",
-        )
+        columns = get_existing_columns(conn, "errors")
 
         fields = []
         values = []
@@ -627,39 +390,24 @@ def log_error(
             fields.append("error")
             values.append(message)
 
-        # Поддерживаем старую схему БД.
         if "error_message" in columns:
             fields.append("error_message")
             values.append(message)
 
         if "stage" in columns:
             fields.append("stage")
-            values.append(stage)
+            values.append(stage or "unknown")
 
         if "created_at" in columns:
             fields.append("created_at")
-            values.append(
-                datetime.now(
-                    timezone.utc
-                ).isoformat()
-            )
+            values.append(datetime.now(timezone.utc).isoformat())
 
-        placeholders = ", ".join(
-            ["?"] * len(fields)
-        )
-
-        field_sql = ", ".join(
-            fields
-        )
+        placeholders = ",".join("?" for _ in fields)
 
         conn.execute(
             f"""
-            INSERT INTO errors (
-                {field_sql}
-            )
-            VALUES (
-                {placeholders}
-            )
+            INSERT INTO errors ({",".join(fields)})
+            VALUES ({placeholders})
             """,
             tuple(values),
         )
@@ -668,85 +416,138 @@ def log_error(
         conn.close()
 
     except Exception as exc:
-        print(
-            f"[ERROR LOGGER FAILURE] {exc}"
-        )
+        print(f"[ERROR LOGGER FAILURE] {exc}")
 
 
 # =========================================================
-# RSS
+# HEAVY LISTING PAGE
 # =========================================================
 
-def load_rss():
-    if not RSS_URL:
-        raise RuntimeError(
-            "RSS_URL is not configured"
-        )
+def is_heavy_article_url(url):
+    normalized = normalize_url(url)
+    parsed = urlparse(normalized)
 
-    print(
-        "[RSS] Loading feed..."
+    if parsed.netloc != "heavy.com":
+        return False
+
+    path = parsed.path.rstrip("/")
+
+    if not path.startswith("/sports/nhl/"):
+        return False
+
+    if path in (
+        "/sports/nhl",
+        "/sports/nhl/",
+    ):
+        return False
+
+    return True
+
+
+def extract_listing_title(anchor):
+    title = (
+        anchor.get_text(" ", strip=True)
+        or anchor.get("aria-label", "")
+        or anchor.get("title", "")
+        or ""
     )
 
-    feed = feedparser.parse(
-        RSS_URL
+    return re.sub(
+        r"\s+",
+        " ",
+        title,
+    ).strip()
+
+
+def load_news():
+    print(
+        f"[HEAVY] Loading source page: "
+        f"{SOURCE_URL}"
     )
 
-    entries = list(
-        feed.entries
-    )[:MAX_RSS_ENTRIES]
+    response = requests.get(
+        SOURCE_URL,
+        headers={
+            "User-Agent":
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0 Safari/537.36 "
+                "NHLNewsBot/1.0"
+        },
+        timeout=30,
+    )
 
-    print(
-        f"[RSS] Entries received: "
-        f"{len(entries)}"
+    response.raise_for_status()
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
     )
 
     result = []
+    seen = set()
 
-    for entry in entries:
+    for anchor in soup.find_all(
+        "a",
+        href=True,
+    ):
         url = normalize_url(
-            entry.get("link", "")
+            urljoin(
+                response.url,
+                anchor.get("href", ""),
+            )
         )
 
-        if not url:
+        if not is_heavy_article_url(url):
             continue
 
-        summary = BeautifulSoup(
-            entry.get(
-                "summary",
-                "",
-            ),
-            "html.parser",
-        ).get_text(
-            " ",
-            strip=True,
+        if url in seen:
+            continue
+
+        title = extract_listing_title(
+            anchor
         )
+
+        if not title:
+            continue
+
+        seen.add(url)
 
         result.append(
             {
                 "url": url,
-                "title": entry.get(
-                    "title",
-                    "",
-                ).strip(),
-                "source": urlparse(
-                    url
-                ).netloc,
-                "published": entry.get(
-                    "published",
-                    entry.get(
-                        "updated",
-                        "",
-                    ),
-                ),
-                "summary": summary,
+                "title": title,
+                "source": "heavy.com",
+                "published": "",
+                "summary": "",
             }
+        )
+
+        if len(result) >= MAX_NEWS:
+            break
+
+    print(
+        f"[HEAVY] Articles found: "
+        f"{len(result)}"
+    )
+
+    for index, item in enumerate(
+        result,
+        1,
+    ):
+        print(
+            f"[HEAVY] {index}. "
+            f"{item['title']} | "
+            f"{item['url']}"
         )
 
     return result
 
 
 # =========================================================
-# ARTICLE / SOURCE IMAGE
+# ARTICLE
 # =========================================================
 
 def normalize_image_url(
@@ -950,12 +751,9 @@ def extract_source_images(
             continue
 
         try:
-            import json
-
             data = json.loads(
                 raw
             )
-
         except Exception:
             continue
 
@@ -977,9 +775,7 @@ def extract_source_images(
         if image_url in seen:
             continue
 
-        seen.add(
-            image_url
-        )
+        seen.add(image_url)
 
         unique.append(
             (
@@ -991,38 +787,23 @@ def extract_source_images(
     return unique
 
 
-def is_social_post_url(url):
-    host = urlparse(
-        url
-    ).netloc.lower()
-
-    host = host.split(
-        ":",
-        1,
-    )[0]
-
-    return host in {
-        "x.com",
-        "twitter.com",
-        "mobile.twitter.com",
-        "www.x.com",
-        "www.twitter.com",
-    }
-
-
-def fetch_article(
-    url,
-    fallback_summary="",
-):
-    headers = {
-        "User-Agent":
-            "Mozilla/5.0 "
-            "(NHLNewsBot/1.0)"
-    }
+def fetch_article(url):
+    print(
+        f"[ARTICLE] Loading: "
+        f"{url}"
+    )
 
     response = requests.get(
         url,
-        headers=headers,
+        headers={
+            "User-Agent":
+                "Mozilla/5.0 "
+                "(X11; Linux x86_64) "
+                "AppleWebKit/537.36 "
+                "(KHTML, like Gecko) "
+                "Chrome/140.0 Safari/537.36 "
+                "NHLNewsBot/1.0"
+        },
         timeout=30,
     )
 
@@ -1033,16 +814,23 @@ def fetch_article(
         "html.parser",
     )
 
-    source_images = extract_source_images(
-        soup,
-        response.url or url,
+    final_url = (
+        response.url
+        or url
     )
 
-    if source_images:
-        print(
-            "[IMAGE] Source page image candidates: "
-            f"{len(source_images)}"
+    source_images = (
+        extract_source_images(
+            soup,
+            final_url,
         )
+    )
+
+    print(
+        "[IMAGE] Article source image "
+        "candidates: "
+        f"{len(source_images)}"
+    )
 
     text_soup = BeautifulSoup(
         response.text,
@@ -1055,17 +843,32 @@ def fetch_article(
             "style",
             "noscript",
             "svg",
+            "nav",
+            "footer",
+            "form",
         ]
     ):
         tag.decompose()
 
-    text = text_soup.get_text(
-        " ",
-        strip=True,
+    article_node = (
+        text_soup.find(
+            "article"
+        )
+        or text_soup.find(
+            "main"
+        )
     )
 
-    if len(text) < 300:
-        text = fallback_summary
+    if article_node:
+        text = article_node.get_text(
+            " ",
+            strip=True,
+        )
+    else:
+        text = text_soup.get_text(
+            " ",
+            strip=True,
+        )
 
     text = re.sub(
         r"\s+",
@@ -1073,10 +876,139 @@ def fetch_article(
         text,
     ).strip()
 
+    if len(text) < 300:
+        raise RuntimeError(
+            "Article text is too short"
+        )
+
     return (
         text[:MAX_ARTICLE_TEXT],
         source_images,
     )
+
+
+# =========================================================
+# SOURCE IMAGE
+# =========================================================
+
+def download_source_image(
+    image_url,
+    article_url,
+    image_source,
+):
+    if not image_url:
+        return None
+
+    print(
+        "[IMAGE] Trying article image: "
+        f"{image_source}"
+    )
+
+    print(
+        "[IMAGE] URL: "
+        f"{image_url}"
+    )
+
+    try:
+        response = requests.get(
+            image_url,
+            headers={
+                "User-Agent":
+                    "Mozilla/5.0 "
+                    "(NHLNewsBot/1.0)",
+                "Referer":
+                    article_url,
+            },
+            timeout=20,
+        )
+
+        response.raise_for_status()
+
+        content_type = (
+            response.headers
+            .get(
+                "Content-Type",
+                "",
+            )
+            .split(
+                ";",
+                1,
+            )[0]
+            .strip()
+            .lower()
+        )
+
+        if not content_type.startswith(
+            "image/"
+        ):
+            print(
+                "[IMAGE] URL is not an image: "
+                f"{content_type or 'unknown'}"
+            )
+
+            return None
+
+        if len(response.content) < MIN_IMAGE_BYTES:
+            print(
+                "[IMAGE] Image is too small: "
+                f"{len(response.content)} bytes"
+            )
+
+            return None
+
+        suffix = ".jpg"
+
+        if "png" in content_type:
+            suffix = ".png"
+
+        elif "webp" in content_type:
+            suffix = ".webp"
+
+        elif "gif" in content_type:
+            suffix = ".gif"
+
+        filename = (
+            "nhl_source_"
+            + hashlib.md5(
+                image_url.encode(
+                    "utf-8"
+                )
+            ).hexdigest()
+            + suffix
+        )
+
+        path = os.path.join(
+            tempfile.gettempdir(),
+            filename,
+        )
+
+        with open(
+            path,
+            "wb",
+        ) as image_file:
+            image_file.write(
+                response.content
+            )
+
+        save_image(
+            image_url,
+            1,
+        )
+
+        print(
+            "[IMAGE] Downloaded from article: "
+            f"{path}"
+        )
+
+        return path
+
+    except Exception as exc:
+        print(
+            "[IMAGE SOURCE ERROR] "
+            f"{exc}"
+        )
+
+        return None
 
 
 # =========================================================
@@ -1092,25 +1024,24 @@ def gemini_request(
         f"v1beta/models/{model}:generateContent"
     )
 
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {
-                        "text": prompt
-                    }
-                ]
-            }
-        ]
-    }
-
     response = requests.post(
         url,
         params={
             "key":
                 GEMINI_API_KEY
         },
-        json=payload,
+        json={
+            "contents": [
+                {
+                    "parts": [
+                        {
+                            "text":
+                                prompt
+                        }
+                    ]
+                }
+            ]
+        },
         timeout=GEMINI_TIMEOUT,
     )
 
@@ -1270,8 +1201,9 @@ def generate_post(
                 GEMINI_PRIMARY_DISABLED = True
 
                 print(
-                    "[GEMINI] Primary disabled for the remainder "
-                    "of this run; using fallback model."
+                    "[GEMINI] Primary disabled "
+                    "for the remainder of this run; "
+                    "using fallback model."
                 )
 
             elif (
@@ -1290,19 +1222,10 @@ def generate_post(
         f"{GEMINI_FALLBACK_MODEL}"
     )
 
-    try:
-        result = gemini_request(
-            GEMINI_FALLBACK_MODEL,
-            prompt,
-        )
-
-    except Exception as exc:
-        print(
-            "[GEMINI FALLBACK ERROR] "
-            f"{exc}"
-        )
-
-        raise
+    result = gemini_request(
+        GEMINI_FALLBACK_MODEL,
+        prompt,
+    )
 
     time.sleep(
         GEMINI_DELAY
@@ -1314,385 +1237,12 @@ def generate_post(
 
 
 # =========================================================
-# IMAGE SEARCH
-# =========================================================
-
-def parse_date_year(value):
-    match = re.search(
-        r"\b(20\d{2})\b",
-        value or "",
-    )
-
-    if match:
-        return int(
-            match.group(1)
-        )
-
-    return None
-
-
-def image_score(
-    result,
-    query,
-    historical_year=None,
-):
-    title = (
-        result.get(
-            "title",
-            "",
-        )
-        or ""
-    ).lower()
-
-    source = (
-        result.get(
-            "source",
-            "",
-        )
-        or ""
-    ).lower()
-
-    image_url = (
-        result.get(
-            "image",
-            "",
-        )
-        or ""
-    )
-
-    score = 0
-
-    words = re.findall(
-        r"[a-zA-Z0-9À-ÿ]+",
-        query,
-    )
-
-    query_words = [
-        word.lower()
-        for word in words
-        if len(word) > 2
-    ]
-
-    score += min(
-        50,
-        sum(
-            5
-            for word in query_words
-            if word in title
-        ),
-    )
-
-    if source:
-        score += 3
-
-    if image_url:
-        score += 5
-
-    result_year = parse_date_year(
-        result.get(
-            "title",
-            "",
-        )
-    )
-
-    if (
-        historical_year
-        and result_year
-    ):
-        score += max(
-            0,
-            20
-            - abs(
-                result_year
-                - historical_year
-            ) * 5,
-        )
-
-    return score
-
-
-def download_source_image(
-    image_url,
-    article_url,
-    image_source,
-):
-    if not image_url:
-        return None
-
-    print(
-        "[IMAGE] Trying source page image: "
-        f"{image_source}"
-    )
-
-    print(
-        "[IMAGE] URL: "
-        f"{image_url}"
-    )
-
-    try:
-        response = requests.get(
-            image_url,
-            headers={
-                "User-Agent":
-                    "Mozilla/5.0 "
-                    "(NHLNewsBot/1.0)",
-                "Referer":
-                    article_url,
-            },
-            timeout=SOURCE_IMAGE_DOWNLOAD_TIMEOUT,
-        )
-
-        response.raise_for_status()
-
-        content_type = (
-            response.headers
-            .get(
-                "Content-Type",
-                "",
-            )
-            .split(
-                ";",
-                1,
-            )[0]
-            .strip()
-            .lower()
-        )
-
-        if not content_type.startswith(
-            "image/"
-        ):
-            print(
-                "[IMAGE] Source URL is not an image: "
-                f"{content_type or 'unknown'}"
-            )
-
-            return None
-
-        if len(response.content) < MIN_IMAGE_BYTES:
-            print(
-                "[IMAGE] Source image is too small: "
-                f"{len(response.content)} bytes"
-            )
-
-            return None
-
-        suffix = ".jpg"
-
-        if "png" in content_type:
-            suffix = ".png"
-
-        elif "webp" in content_type:
-            suffix = ".webp"
-
-        elif "gif" in content_type:
-            suffix = ".gif"
-
-        elif "jpeg" in content_type:
-            suffix = ".jpg"
-
-        filename = (
-            "nhl_source_"
-            + hashlib.md5(
-                image_url.encode(
-                    "utf-8"
-                )
-            ).hexdigest()
-            + suffix
-        )
-
-        path = os.path.join(
-            tempfile.gettempdir(),
-            filename,
-        )
-
-        with open(
-            path,
-            "wb",
-        ) as image_file:
-            image_file.write(
-                response.content
-            )
-
-        save_image(
-            image_url,
-            1,
-        )
-
-        print(
-            "[IMAGE] Downloaded from source: "
-            f"{path}"
-        )
-
-        return path
-
-    except Exception as exc:
-        print(
-            "[IMAGE SOURCE ERROR] "
-            f"{exc}"
-        )
-
-        return None
-
-
-def download_image(
-    search_query,
-    historical_year=None,
-):
-    print(
-        f"[IMAGE] Searching: "
-        f"{search_query}"
-    )
-
-    try:
-        with DDGS() as ddgs:
-            results = list(
-                ddgs.images(
-                    search_query,
-                    max_results=IMAGE_RESULTS_LIMIT,
-                )
-            )
-
-    except Exception as exc:
-        print(
-            f"[IMAGE SEARCH ERROR] "
-            f"{exc}"
-        )
-
-        return None
-
-    if not results:
-        print(
-            "[IMAGE] No results found."
-        )
-
-        return None
-
-    scored = sorted(
-        results,
-        key=lambda result:
-            image_score(
-                result,
-                search_query,
-                historical_year,
-            ),
-        reverse=True,
-    )
-
-    for candidate in scored:
-        image_url = (
-            candidate.get(
-                "image"
-            )
-            or candidate.get(
-                "thumbnail"
-            )
-        )
-
-        if not image_url:
-            continue
-
-        print(
-            "[IMAGE] Trying candidate:"
-        )
-
-        print(
-            "[IMAGE] Title: "
-            f"{candidate.get('title', '')}"
-        )
-
-        print(
-            "[IMAGE] Source: "
-            f"{candidate.get('source', '')}"
-        )
-
-        print(
-            "[IMAGE] Score: "
-            f"{image_score(candidate, search_query, historical_year)}"
-        )
-
-        try:
-            response = requests.get(
-                image_url,
-                headers={
-                    "User-Agent":
-                        "Mozilla/5.0"
-                },
-                timeout=IMAGE_DOWNLOAD_TIMEOUT,
-            )
-
-            response.raise_for_status()
-
-            content_type = (
-                response.headers
-                .get(
-                    "Content-Type",
-                    "",
-                )
-            )
-
-            if not content_type.startswith(
-                "image/"
-            ):
-                continue
-
-            suffix = ".jpg"
-
-            if "png" in content_type:
-                suffix = ".png"
-
-            filename = (
-                "nhl_"
-                + hashlib.md5(
-                    image_url.encode()
-                ).hexdigest()
-                + suffix
-            )
-
-            path = os.path.join(
-                tempfile.gettempdir(),
-                filename,
-            )
-
-            with open(
-                path,
-                "wb",
-            ) as image_file:
-                image_file.write(
-                    response.content
-                )
-
-            save_image(
-                image_url,
-                1,
-            )
-
-            print(
-                "[IMAGE] Downloaded: "
-                f"{path}"
-            )
-
-            return path
-
-        except Exception as exc:
-            print(
-                f"[IMAGE ERROR] "
-                f"{exc}"
-            )
-
-    print(
-        "[IMAGE] No usable image found."
-    )
-
-    return None
-
-
-# =========================================================
 # TELEGRAM
 # =========================================================
 
 def send_telegram(
     post,
-    image_path=None,
+    image_path,
 ):
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
@@ -1709,37 +1259,28 @@ def send_telegram(
         f"bot{TELEGRAM_TOKEN}"
     )
 
-    if image_path:
-        with open(
-            image_path,
-            "rb",
-        ) as image_file:
+    if not image_path:
+        raise RuntimeError(
+            "No article image available"
+        )
 
-            response = requests.post(
-                f"{base_url}/sendPhoto",
-                data={
-                    "chat_id":
-                        TELEGRAM_CHAT_ID,
-                    "caption":
-                        post,
-                },
-                files={
-                    "photo":
-                        image_file
-                },
-                timeout=TELEGRAM_TIMEOUT,
-            )
-
-    else:
+    with open(
+        image_path,
+        "rb",
+    ) as image_file:
         response = requests.post(
-            f"{base_url}/sendMessage",
+            f"{base_url}/sendPhoto",
             data={
                 "chat_id":
                     TELEGRAM_CHAT_ID,
-                "text":
+                "caption":
                     post,
             },
-            timeout=TELEGRAM_TIMEOUT,
+            files={
+                "photo":
+                    image_file
+            },
+            timeout=60,
         )
 
     if response.status_code >= 400:
@@ -1751,7 +1292,7 @@ def send_telegram(
 
 
 # =========================================================
-# PROCESS NEWS
+# PROCESS
 # =========================================================
 
 def process_news(
@@ -1770,11 +1311,7 @@ def process_news(
         save_news(item)
 
         article, source_images = fetch_article(
-            url,
-            item.get(
-                "summary",
-                "",
-            ),
+            url
         )
 
         post = generate_post(
@@ -1784,40 +1321,25 @@ def process_news(
 
         image = None
 
-        if is_social_post_url(url):
-            print(
-                "[IMAGE] Social/X/Twitter source detected; "
-                "using image search."
-            )
+        for (
+            source_image_url,
+            image_source,
+        ) in source_images:
 
-            image = download_image(
-                item["title"]
-            )
-
-        else:
-            for (
+            image = download_source_image(
                 source_image_url,
+                url,
                 image_source,
-            ) in source_images:
+            )
 
-                image = download_source_image(
-                    source_image_url,
-                    url,
-                    image_source,
-                )
+            if image:
+                break
 
-                if image:
-                    break
-
-            if image is None:
-                print(
-                    "[IMAGE] No usable image found on source page; "
-                    "falling back to image search."
-                )
-
-                image = download_image(
-                    item["title"]
-                )
+        if image is None:
+            raise RuntimeError(
+                "Could not download any image "
+                "from the article page"
+            )
 
         send_telegram(
             post,
@@ -1837,8 +1359,6 @@ def process_news(
     except Exception as exc:
         message = str(exc)
 
-        stage = "processing"
-
         if (
             "CHAT_ID" in message
             or "Telegram" in message
@@ -1856,9 +1376,7 @@ def process_news(
         ):
             stage = "gemini"
 
-        elif (
-            "image" in message.lower()
-        ):
+        elif "image" in message.lower():
             stage = "image"
 
         elif (
@@ -1866,6 +1384,9 @@ def process_news(
             or "HTTP" in message
         ):
             stage = "article"
+
+        else:
+            stage = "processing"
 
         print(
             "[FATAL ITEM ERROR] "
@@ -1887,14 +1408,17 @@ def process_news(
 
 def main():
     print("=" * 70)
-    print(
-        "NHL NEWS BOT START"
-    )
+    print("NHL NEWS BOT START")
     print("=" * 70)
 
     print(
-        f"[CONFIG] RSS entries limit: "
-        f"{MAX_RSS_ENTRIES}"
+        f"[CONFIG] Donor: "
+        f"{SOURCE_URL}"
+    )
+
+    print(
+        f"[CONFIG] Heavy articles limit: "
+        f"{MAX_NEWS}"
     )
 
     print(
@@ -1908,114 +1432,106 @@ def main():
     )
 
     print(
-        "[CONFIG] Images: source page first; "
-        "X/Twitter + source fallback use image search"
+        "[CONFIG] Images: article page only; "
+        "no image search fallback"
     )
 
     print("=" * 70)
 
     try:
-        get_db().close()
-
-        items = load_rss()
+        conn = get_db()
+        conn.close()
 
     except Exception as exc:
         print(
-            "[STARTUP ERROR] "
+            "[DATABASE ERROR] "
             f"{exc}"
         )
 
         log_error(
             "",
-            exc,
-            "startup",
+            str(exc),
+            "database",
         )
 
         return
 
-    new_items = []
+    # -----------------------------------------------------
+    # HEAVY
+    # -----------------------------------------------------
 
-    for item in items:
-        try:
-            if not is_processed(
-                item["url"]
-            ):
-                new_items.append(
-                    item
-                )
+    try:
+        items = load_news()
 
-        except Exception as exc:
-            print(
-                "[DATABASE CHECK ERROR] "
-                f"{exc}"
-            )
+    except Exception as exc:
+        print(
+            "[HEAVY ERROR] "
+            f"{exc}"
+        )
 
-            log_error(
-                item.get(
-                    "url",
-                    "",
-                ),
-                exc,
-                "database",
-            )
+        log_error(
+            SOURCE_URL,
+            str(exc),
+            "source",
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # NEW NEWS
+    # -----------------------------------------------------
+
+    new_items = [
+        item
+        for item in items
+        if not is_processed(
+            item["url"]
+        )
+    ]
 
     print(
-        f"[RSS] New news: "
+        f"[HEAVY] New articles: "
         f"{len(new_items)}"
     )
 
-    if not new_items:
-        print(
-            "[BOT] Nothing to publish."
-        )
-
-        print("=" * 70)
-        print(
-            "NHL NEWS BOT FINISHED"
-        )
-        print(
-            "Published: 0"
-        )
-        print(
-            "Failed: 0"
-        )
-        print("=" * 70)
-
-        return
+    # -----------------------------------------------------
+    # PROCESS
+    # -----------------------------------------------------
 
     published = 0
     failed = 0
 
-    total = len(
-        new_items
-    )
-
     for index, item in enumerate(
         new_items,
-        start=1,
+        1,
     ):
-        success = process_news(
+        if process_news(
             item,
             index,
-            total,
-        )
-
-        if success:
+            len(new_items),
+        ):
             published += 1
 
         else:
             failed += 1
 
+    # -----------------------------------------------------
+    # FINISH
+    # -----------------------------------------------------
+
     print("=" * 70)
+    print("NHL NEWS BOT FINISHED")
+
     print(
-        "NHL NEWS BOT FINISHED"
+        f"Published: "
+        f"{published}"
     )
+
     print(
-        f"Published: {published}"
+        f"Failed: "
+        f"{failed}"
     )
-    print(
-        f"Failed: {failed}"
-    )
+
     print("=" * 70)
 
 
