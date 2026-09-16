@@ -1,20 +1,17 @@
 import os
 import re
-import time
-import sqlite3
 import hashlib
-from datetime import datetime
-from urllib.parse import urlparse
+import sqlite3
+import tempfile
+import time
+from datetime import datetime, timezone
+from urllib.parse import urlparse, urlunparse
 
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from ddgs import DDGS
 
-
-# =============================================================================
-# CONFIG
-# =============================================================================
 
 RSS_URL = os.getenv("RSS_URL", "").strip()
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
@@ -35,947 +32,788 @@ IMAGE_RESULTS_LIMIT = 30
 IMAGE_DOWNLOAD_TIMEOUT = 20
 
 GEMINI_DELAY = 1.0
-
 MAX_ARTICLE_TEXT = 12000
 
 FRESH_DAYS = 90
 HISTORICAL_YEAR_TOLERANCE = 3
 
-gemini_primary_disabled = False
+DATABASE_READY = False
+GEMINI_PRIMARY_DISABLED = False
 
 
-GOOD_DOMAINS = {
-    "nhl.com": 70,
-    "espn.com": 65,
-    "sportsnet.ca": 60,
-    "tsn.ca": 60,
-    "reuters.com": 50,
-    "apnews.com": 50,
-    "usatoday.com": 45,
-    "theathletic.com": 45,
-    "cbc.ca": 40,
-    "si.com": 40,
-    "detroitnews.com": 40,
-    "freep.com": 40,
-}
+# =========================================================
+# URL
+# =========================================================
+
+def normalize_url(url):
+    url = (url or "").strip()
+
+    if not url:
+        return ""
+
+    try:
+        parsed = urlparse(url)
+
+        host = parsed.netloc.lower().replace("www.", "")
+        path = parsed.path.rstrip("/") or "/"
+
+        return urlunparse(
+            (
+                parsed.scheme.lower(),
+                host,
+                path,
+                "",
+                parsed.query,
+                "",
+            )
+        )
+
+    except Exception:
+        return url
 
 
-BAD_DOMAINS = {
-    "gettyimages.com": -100,
-    "alamy.com": -100,
-    "shutterstock.com": -100,
-    "depositphotos.com": -100,
-    "dreamstime.com": -100,
-    "istockphoto.com": -100,
-    "123rf.com": -100,
-    "stock.adobe.com": -100,
-}
+# =========================================================
+# DATABASE HELPERS
+# =========================================================
 
-
-BAD_WORDS = {
-    "logo": -100,
-    "infographic": -100,
-    "illustration": -80,
-    "wallpaper": -70,
-    "poster": -70,
-    "merchandise": -100,
-    "shirt": -80,
-    "jersey sale": -80,
-    "basketball": -120,
-    "football": -120,
-    "baseball": -120,
-    "soccer": -120,
-    "golf": -100,
-    "wrestling": -100,
-    "podcast": -30,
-}
-
-
-GOOD_WORDS = {
-    "nhl": 10,
-    "hockey": 10,
-    "ice hockey": 10,
-}
-
-
-OPPONENT_PATTERNS = [
-    r"\bvs\.?\b",
-    r"\bversus\b",
-    r"\bagainst\b",
-    r"\bface\b",
-    r"\bfacing\b",
-    r"\bfaces\b",
-]
-
-
-TEAM_CHANGE_WORDS = [
-    "sign",
-    "signed",
-    "signing",
-    "contract",
-    "joins",
-    "joined",
-    "join",
-    "acquired",
-    "traded",
-    "trade",
-    "deal",
-    "agrees",
-    "agreed",
-    "lands",
-    "new home",
-]
-
-
-BAD_URL_PATTERNS = [
-    "getty",
-    "alamy",
-    "shutterstock",
-    "depositphotos",
-    "dreamstime",
-    "istockphoto",
-    "stockphoto",
-    "stock",
-    "vector",
-    "illustration",
-    "wallpaper",
-    "wallpapers",
-    "pinterest",
-    "facebook",
-    "instagram",
-    "twitter",
-    "x.com",
-    "logo",
-    "icon",
-    "avatar",
-    "thumbnail",
-    "sprite",
-    "favicon",
-    "default",
-    "placeholder",
-]
-
-
-BAD_DOMAIN_PATTERNS = [
-    "gettyimages",
-    "alamy",
-    "shutterstock",
-    "depositphotos",
-    "dreamstime",
-    "istockphoto",
-    "pinterest",
-    "facebook",
-    "instagram",
-    "twitter",
-]
-
-
-# =============================================================================
-# DATABASE
-# =============================================================================
-
-def get_existing_columns(connection, table_name):
-    cursor = connection.execute(
-        f"PRAGMA table_info({table_name})"
-    )
-
-    return {
-        row[1]
-        for row in cursor.fetchall()
-    }
-
-
-def table_exists(connection, table_name):
-    row = connection.execute(
+def table_exists(conn, table):
+    row = conn.execute(
         """
-        SELECT name
+        SELECT 1
         FROM sqlite_master
         WHERE type = 'table'
         AND name = ?
         """,
-        (table_name,)
+        (table,),
     ).fetchone()
 
     return row is not None
 
 
-def index_exists(connection, index_name):
-    row = connection.execute(
-        """
-        SELECT name
-        FROM sqlite_master
-        WHERE type = 'index'
-        AND name = ?
-        """,
-        (index_name,)
-    ).fetchone()
+def get_existing_columns(conn, table):
+    if not table_exists(conn, table):
+        return set()
 
-    return row is not None
+    rows = conn.execute(
+        f'PRAGMA table_info("{table}")'
+    ).fetchall()
+
+    return {row[1] for row in rows}
 
 
 def add_column_if_missing(
-    connection,
-    table_name,
-    column_name,
-    column_definition
+    conn,
+    table,
+    column,
+    definition,
 ):
-    columns = get_existing_columns(
-        connection,
-        table_name
-    )
+    columns = get_existing_columns(conn, table)
 
-    if column_name in columns:
-        return False
+    if column not in columns:
+        print(
+            f"[DATABASE] Adding missing column "
+            f"{table}.{column}"
+        )
 
-    print(
-        f"[DATABASE] Adding missing column "
-        f"{table_name}.{column_name}"
-    )
-
-    connection.execute(
-        f"""
-        ALTER TABLE {table_name}
-        ADD COLUMN {column_name}
-        {column_definition}
-        """
-    )
-
-    return True
+        conn.execute(
+            f'ALTER TABLE "{table}" '
+            f'ADD COLUMN "{column}" {definition}'
+        )
 
 
-def remove_duplicate_news(connection):
-    """
-    Remove duplicate news rows while keeping the oldest record.
+# =========================================================
+# DATABASE MIGRATION
+# =========================================================
 
-    This is necessary before creating a UNIQUE index on news.url.
-    """
-
-    if not table_exists(
-        connection,
-        "news"
-    ):
+def remove_duplicate_news(conn):
+    if not table_exists(conn, "news"):
         return
 
-    print(
-        "[DATABASE] Checking duplicate news URLs..."
-    )
-
-    connection.execute(
+    rows = conn.execute(
         """
-        DELETE FROM news
-        WHERE id NOT IN (
-            SELECT MIN(id)
-            FROM news
-            WHERE url IS NOT NULL
-            GROUP BY url
-        )
-        AND url IS NOT NULL
+        SELECT rowid, url
+        FROM news
+        ORDER BY rowid
         """
-    )
+    ).fetchall()
 
-    connection.commit()
+    seen = set()
+
+    for rowid, url in rows:
+        normalized = normalize_url(url)
+
+        if not normalized:
+            continue
+
+        if normalized in seen:
+            conn.execute(
+                "DELETE FROM news WHERE rowid = ?",
+                (rowid,),
+            )
+        else:
+            seen.add(normalized)
 
 
-def remove_duplicate_images(connection):
-    """
-    Remove duplicate image URLs while keeping the oldest record.
-    """
-
-    if not table_exists(
-        connection,
-        "images"
-    ):
+def remove_duplicate_images(conn):
+    if not table_exists(conn, "images"):
         return
 
-    print(
-        "[DATABASE] Checking duplicate image URLs..."
-    )
-
-    connection.execute(
+    rows = conn.execute(
         """
-        DELETE FROM images
-        WHERE id NOT IN (
-            SELECT MIN(id)
-            FROM images
-            WHERE url IS NOT NULL
-            GROUP BY url
-        )
-        AND url IS NOT NULL
+        SELECT rowid, url
+        FROM images
+        ORDER BY rowid
         """
-    )
+    ).fetchall()
 
-    connection.commit()
+    seen = set()
 
+    for rowid, url in rows:
+        normalized = normalize_url(url)
 
-def ensure_unique_indexes(connection):
-    """
-    Ensure URL uniqueness for old and new databases.
+        if not normalized:
+            continue
 
-    Existing duplicate rows are removed before indexes are created.
-    """
-
-    remove_duplicate_news(
-        connection
-    )
-
-    remove_duplicate_images(
-        connection
-    )
-
-    if not index_exists(
-        connection,
-        "idx_news_url_unique"
-    ):
-
-        print(
-            "[DATABASE] Creating unique index "
-            "for news.url..."
-        )
-
-        connection.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_news_url_unique
-            ON news(url)
-            """
-        )
-
-    if not index_exists(
-        connection,
-        "idx_images_url_unique"
-    ):
-
-        print(
-            "[DATABASE] Creating unique index "
-            "for images.url..."
-        )
-
-        connection.execute(
-            """
-            CREATE UNIQUE INDEX IF NOT EXISTS
-            idx_images_url_unique
-            ON images(url)
-            """
-        )
-
-    connection.commit()
+        if normalized in seen:
+            conn.execute(
+                "DELETE FROM images WHERE rowid = ?",
+                (rowid,),
+            )
+        else:
+            seen.add(normalized)
 
 
-def migrate_database(connection):
-    print(
-        "[DATABASE] Checking database schema..."
-    )
+def normalize_existing_urls(conn, table):
+    if not table_exists(conn, table):
+        return
 
-    # -------------------------------------------------------------------------
+    columns = get_existing_columns(conn, table)
+
+    if "url" not in columns:
+        return
+
+    rows = conn.execute(
+        f'SELECT rowid, url FROM "{table}"'
+    ).fetchall()
+
+    for rowid, url in rows:
+        normalized = normalize_url(url)
+
+        if normalized and normalized != url:
+            conn.execute(
+                f'UPDATE "{table}" SET url = ? WHERE rowid = ?',
+                (normalized, rowid),
+            )
+
+
+def migrate_database(conn):
+    print("[DATABASE] Checking database schema...")
+
+    # -----------------------------------------------------
     # NEWS
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------
 
-    connection.execute(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS news (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE NOT NULL,
+            url TEXT NOT NULL,
             title TEXT,
-            processed INTEGER DEFAULT 0,
-            created_at TEXT
+            source TEXT,
+            published TEXT,
+            processed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
     add_column_if_missing(
-        connection,
+        conn,
         "news",
-        "title",
-        "TEXT"
+        "processed",
+        "INTEGER NOT NULL DEFAULT 1",
     )
-
-    existing_news_columns = get_existing_columns(
-        connection,
-        "news"
-    )
-
-    if "processed" not in existing_news_columns:
-
-        print(
-            "[DATABASE] Adding news.processed; "
-            "existing rows marked as processed."
-        )
-
-        connection.execute(
-            """
-            ALTER TABLE news
-            ADD COLUMN processed INTEGER DEFAULT 1
-            """
-        )
 
     add_column_if_missing(
-        connection,
+        conn,
         "news",
-        "created_at",
-        "TEXT"
+        "title",
+        "TEXT",
     )
 
-    # -------------------------------------------------------------------------
-    # IMAGES
-    # -------------------------------------------------------------------------
+    add_column_if_missing(
+        conn,
+        "news",
+        "source",
+        "TEXT",
+    )
 
-    connection.execute(
+    add_column_if_missing(
+        conn,
+        "news",
+        "published",
+        "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
+        "news",
+        "created_at",
+        "TEXT",
+    )
+
+    # -----------------------------------------------------
+    # IMAGES
+    # -----------------------------------------------------
+
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS images (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
-            url TEXT UNIQUE NOT NULL,
-            used INTEGER DEFAULT 0,
-            created_at TEXT
+            url TEXT NOT NULL,
+            used INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
     add_column_if_missing(
-        connection,
+        conn,
         "images",
         "used",
-        "INTEGER DEFAULT 0"
+        "INTEGER NOT NULL DEFAULT 0",
     )
 
     add_column_if_missing(
-        connection,
+        conn,
         "images",
         "created_at",
-        "TEXT"
+        "TEXT",
     )
 
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------
     # ERRORS
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------
 
-    connection.execute(
+    conn.execute(
         """
         CREATE TABLE IF NOT EXISTS errors (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             url TEXT,
             error TEXT,
+            error_message TEXT,
             stage TEXT NOT NULL DEFAULT 'unknown',
-            created_at TEXT
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
     )
 
     add_column_if_missing(
-        connection,
+        conn,
         "errors",
         "url",
-        "TEXT"
+        "TEXT",
     )
 
     add_column_if_missing(
-        connection,
+        conn,
         "errors",
         "error",
-        "TEXT"
+        "TEXT",
     )
 
     add_column_if_missing(
-        connection,
+        conn,
+        "errors",
+        "error_message",
+        "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
         "errors",
         "stage",
-        "TEXT NOT NULL DEFAULT 'unknown'"
+        "TEXT NOT NULL DEFAULT 'unknown'",
     )
 
     add_column_if_missing(
-        connection,
+        conn,
         "errors",
         "created_at",
-        "TEXT"
+        "TEXT",
     )
 
-    connection.commit()
+    # -----------------------------------------------------
+    # NORMALIZE + DUPLICATES
+    # -----------------------------------------------------
 
-    # -------------------------------------------------------------------------
+    print("[DATABASE] Normalizing existing URLs...")
+
+    normalize_existing_urls(
+        conn,
+        "news",
+    )
+
+    normalize_existing_urls(
+        conn,
+        "images",
+    )
+
+    print("[DATABASE] Checking duplicate news URLs...")
+
+    remove_duplicate_news(conn)
+
+    print("[DATABASE] Checking duplicate image URLs...")
+
+    remove_duplicate_images(conn)
+
+    # -----------------------------------------------------
     # UNIQUE INDEXES
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------
 
-    ensure_unique_indexes(
-        connection
+    print("[DATABASE] Creating unique index for news.url...")
+
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_news_url_unique
+        ON news(url)
+        """
     )
 
-    connection.commit()
+    print("[DATABASE] Creating unique index for images.url...")
 
-    print(
-        "[DATABASE] Schema check complete."
+    conn.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_images_url_unique
+        ON images(url)
+        """
     )
+
+    conn.commit()
+
+    print("[DATABASE] Schema check complete.")
 
 
 def get_db():
-    connection = sqlite3.connect(
+    global DATABASE_READY
+
+    conn = sqlite3.connect(
         DATABASE_FILE,
-        timeout=30
+        timeout=30,
     )
 
-    migrate_database(
-        connection
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
     )
 
-    return connection
-
-
-# =============================================================================
-# URL / NEWS DATABASE HELPERS
-# =============================================================================
-
-def normalize_url(url):
-    if not url:
-        return ""
-
-    url = str(url).strip()
-
-    if "#" in url:
-        url = url.split(
-            "#",
-            1
-        )[0]
-
-    url = url.replace(
-        "https://www.",
-        "https://"
+    conn.execute(
+        "PRAGMA busy_timeout=30000"
     )
 
-    url = url.replace(
-        "http://www.",
-        "http://"
-    )
+    # ВАЖНО:
+    # миграция выполняется только один раз
+    # за весь запуск программы.
+    if not DATABASE_READY:
+        migrate_database(conn)
+        DATABASE_READY = True
 
-    return url.rstrip("/")
+    return conn
 
 
-def is_news_processed(url):
+# =========================================================
+# NEWS DATABASE
+# =========================================================
+
+def save_news(item):
+    conn = get_db()
+
     url = normalize_url(
-        url
+        item.get("url", "")
     )
 
-    if not url:
-        return True
+    row = conn.execute(
+        """
+        SELECT id
+        FROM news
+        WHERE url = ?
+        """,
+        (url,),
+    ).fetchone()
 
-    connection = get_db()
+    if row:
+        news_id = row[0]
 
-    try:
-        row = connection.execute(
-            """
-            SELECT processed
-            FROM news
-            WHERE url = ?
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (url,)
-        ).fetchone()
-
-        if not row:
-            return False
-
-        return bool(
-            row[0]
-        )
-
-    finally:
-        connection.close()
-
-
-def save_news(
-    url,
-    title="",
-    processed=False
-):
-    url = normalize_url(
-        url
-    )
-
-    if not url:
-        return
-
-    connection = get_db()
-
-    try:
-        existing = connection.execute(
-            """
-            SELECT id
-            FROM news
-            WHERE url = ?
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (url,)
-        ).fetchone()
-
-        if existing:
-
-            connection.execute(
-                """
-                UPDATE news
-                SET title = ?,
-                    processed = ?
-                WHERE id = ?
-                """,
-                (
-                    title,
-                    1 if processed else 0,
-                    existing[0]
-                )
-            )
-
-        else:
-
-            connection.execute(
-                """
-                INSERT INTO news (
-                    url,
-                    title,
-                    processed,
-                    created_at
-                )
-                VALUES (?, ?, ?, ?)
-                """,
-                (
-                    url,
-                    title,
-                    1 if processed else 0,
-                    datetime.utcnow().isoformat()
-                )
-            )
-
-        connection.commit()
-
-    finally:
-        connection.close()
-
-
-def mark_news_processed(url):
-    url = normalize_url(
-        url
-    )
-
-    if not url:
-        return
-
-    connection = get_db()
-
-    try:
-        connection.execute(
+        conn.execute(
             """
             UPDATE news
-            SET processed = 1
-            WHERE url = ?
+            SET title = ?,
+                source = ?,
+                published = ?
+            WHERE id = ?
             """,
-            (url,)
+            (
+                item.get("title", ""),
+                item.get("source", ""),
+                item.get("published", ""),
+                news_id,
+            ),
         )
 
-        connection.commit()
-
-    finally:
-        connection.close()
-
-
-# =============================================================================
-# IMAGE DATABASE HELPERS
-# =============================================================================
-
-def is_image_used(url):
-    if not url:
-        return False
-
-    connection = get_db()
-
-    try:
-        row = connection.execute(
+    else:
+        cursor = conn.execute(
             """
-            SELECT used
-            FROM images
-            WHERE url = ?
-            ORDER BY id ASC
-            LIMIT 1
+            INSERT INTO news (
+                url,
+                title,
+                source,
+                published,
+                processed
+            )
+            VALUES (?, ?, ?, ?, 0)
             """,
-            (url,)
-        ).fetchone()
-
-        if not row:
-            return False
-
-        return bool(
-            row[0]
+            (
+                url,
+                item.get("title", ""),
+                item.get("source", ""),
+                item.get("published", ""),
+            ),
         )
 
-    finally:
-        connection.close()
+        news_id = cursor.lastrowid
+
+    conn.commit()
+    conn.close()
+
+    return news_id
 
 
-def save_image(
-    url,
-    used=False
-):
+def is_processed(url):
+    conn = get_db()
+
+    row = conn.execute(
+        """
+        SELECT processed
+        FROM news
+        WHERE url = ?
+        """,
+        (normalize_url(url),),
+    ).fetchone()
+
+    conn.close()
+
+    return bool(
+        row and row[0]
+    )
+
+
+def mark_processed(url):
+    conn = get_db()
+
+    conn.execute(
+        """
+        UPDATE news
+        SET processed = 1
+        WHERE url = ?
+        """,
+        (normalize_url(url),),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+# =========================================================
+# IMAGE DATABASE
+# =========================================================
+
+def save_image(url, used=0):
+    url = normalize_url(url)
+
     if not url:
         return
 
-    connection = get_db()
+    conn = get_db()
 
-    try:
-        existing = connection.execute(
-            """
-            SELECT id
-            FROM images
-            WHERE url = ?
-            ORDER BY id ASC
-            LIMIT 1
-            """,
-            (url,)
-        ).fetchone()
+    row = conn.execute(
+        """
+        SELECT id
+        FROM images
+        WHERE url = ?
+        """,
+        (url,),
+    ).fetchone()
 
-        if existing:
-
-            connection.execute(
-                """
-                UPDATE images
-                SET used = ?
-                WHERE id = ?
-                """,
-                (
-                    1 if used else 0,
-                    existing[0]
-                )
-            )
-
-        else:
-
-            connection.execute(
-                """
-                INSERT INTO images (
-                    url,
-                    used,
-                    created_at
-                )
-                VALUES (?, ?, ?)
-                """,
-                (
-                    url,
-                    1 if used else 0,
-                    datetime.utcnow().isoformat()
-                )
-            )
-
-        connection.commit()
-
-    finally:
-        connection.close()
-
-
-def mark_image_used(url):
-    if not url:
-        return
-
-    connection = get_db()
-
-    try:
-        connection.execute(
+    if row:
+        conn.execute(
             """
             UPDATE images
-            SET used = 1
-            WHERE url = ?
+            SET used = ?
+            WHERE id = ?
             """,
-            (url,)
+            (
+                used,
+                row[0],
+            ),
         )
 
-        connection.commit()
+    else:
+        conn.execute(
+            """
+            INSERT INTO images (
+                url,
+                used
+            )
+            VALUES (?, ?)
+            """,
+            (
+                url,
+                used,
+            ),
+        )
 
-    finally:
-        connection.close()
+    conn.commit()
+    conn.close()
 
 
-# =============================================================================
+# =========================================================
 # ERROR LOGGING
-# =============================================================================
+# =========================================================
 
 def log_error(
     url,
     error,
-    stage="unknown"
+    stage="unknown",
 ):
-    connection = get_db()
+    message = str(error)[:4000]
 
     try:
-        connection.execute(
-            """
-            INSERT INTO errors (
-                url,
-                error,
-                stage,
-                created_at
-            )
-            VALUES (?, ?, ?, ?)
-            """,
-            (
-                normalize_url(url),
-                str(error)[:4000],
-                str(stage)[:100],
-                datetime.utcnow().isoformat()
-            )
+        conn = get_db()
+
+        columns = get_existing_columns(
+            conn,
+            "errors",
         )
 
-        connection.commit()
+        fields = []
+        values = []
 
-    finally:
-        connection.close()
+        if "url" in columns:
+            fields.append("url")
+            values.append(url)
+
+        if "error" in columns:
+            fields.append("error")
+            values.append(message)
+
+        # Поддерживаем старую схему БД.
+        if "error_message" in columns:
+            fields.append("error_message")
+            values.append(message)
+
+        if "stage" in columns:
+            fields.append("stage")
+            values.append(
+                stage or "unknown"
+            )
+
+        if "created_at" in columns:
+            fields.append("created_at")
+            values.append(
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            )
+
+        placeholders = ",".join(
+            "?" for _ in fields
+        )
+
+        conn.execute(
+            f"""
+            INSERT INTO errors (
+                {",".join(fields)}
+            )
+            VALUES (
+                {placeholders}
+            )
+            """,
+            tuple(values),
+        )
+
+        conn.commit()
+        conn.close()
+
+    except Exception as exc:
+        print(
+            f"[ERROR LOGGER FAILURE] {exc}"
+        )
 
 
-# =============================================================================
-# HTML / RSS
-# =============================================================================
+# =========================================================
+# RSS
+# =========================================================
 
-def clean_html(text):
-    if not text:
-        return ""
-
-    soup = BeautifulSoup(
-        str(text),
-        "html.parser"
-    )
-
-    return soup.get_text(
-        " ",
-        strip=True
-    )
-
-
-def get_rss_entries():
+def load_rss():
     if not RSS_URL:
         raise RuntimeError(
             "RSS_URL is not configured"
         )
 
-    print(
-        "[RSS] Loading feed..."
-    )
+    print("[RSS] Loading feed...")
 
     feed = feedparser.parse(
         RSS_URL
     )
 
+    entries = list(
+        feed.entries
+    )[:MAX_RSS_ENTRIES]
+
     print(
         f"[RSS] Entries received: "
-        f"{len(feed.entries)}"
+        f"{len(entries)}"
     )
 
-    entries = []
+    result = []
 
-    for entry in feed.entries[
-        :MAX_RSS_ENTRIES
-    ]:
-
-        title = clean_html(
-            getattr(
-                entry,
-                "title",
-                ""
-            )
+    for entry in entries:
+        url = normalize_url(
+            entry.get("link", "")
         )
 
-        link = normalize_url(
-            getattr(
-                entry,
-                "link",
-                ""
-            )
-        )
-
-        summary = clean_html(
-            getattr(
-                entry,
-                "summary",
-                ""
-            )
-        )
-
-        if not link:
+        if not url:
             continue
 
-        entries.append(
+        summary = BeautifulSoup(
+            entry.get(
+                "summary",
+                "",
+            ),
+            "html.parser",
+        ).get_text(
+            " ",
+            strip=True,
+        )
+
+        result.append(
             {
-                "title": title,
-                "link": link,
-                "summary": summary
+                "url": url,
+                "title": entry.get(
+                    "title",
+                    "",
+                ).strip(),
+                "source": urlparse(
+                    url
+                ).netloc,
+                "published": entry.get(
+                    "published",
+                    entry.get(
+                        "updated",
+                        "",
+                    ),
+                ),
+                "summary": summary,
             }
         )
 
-    return entries
+    return result
 
 
-# =============================================================================
-# ARTICLE TEXT
-# =============================================================================
+# =========================================================
+# ARTICLE
+# =========================================================
 
-def get_article_text(entry):
-    parts = []
+def fetch_article(
+    url,
+    fallback_summary="",
+):
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(NHLNewsBot/1.0)"
+    }
 
-    title = entry.get(
-        "title",
-        ""
+    response = requests.get(
+        url,
+        headers=headers,
+        timeout=30,
     )
 
-    summary = entry.get(
-        "summary",
-        ""
+    response.raise_for_status()
+
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
     )
 
-    if title:
-        parts.append(
-            f"TITLE:\n{title}"
-        )
+    for tag in soup(
+        [
+            "script",
+            "style",
+            "noscript",
+            "svg",
+        ]
+    ):
+        tag.decompose()
 
-    if summary:
-        parts.append(
-            f"SUMMARY:\n{summary}"
-        )
-
-    text = "\n\n".join(
-        parts
+    text = soup.get_text(
+        " ",
+        strip=True,
     )
 
-    return text[:MAX_ARTICLE_TEXT]
+    if len(text) < 300:
+        text = fallback_summary
+
+    text = re.sub(
+        r"\s+",
+        " ",
+        text,
+    ).strip()
+
+    return text[
+        :MAX_ARTICLE_TEXT
+    ]
 
 
-# =============================================================================
+# =========================================================
 # GEMINI
-# =============================================================================
+# =========================================================
 
 def gemini_request(
+    model,
     prompt,
-    model
 ):
     url = (
         "https://generativelanguage.googleapis.com/"
-        "v1beta/models/"
-        f"{model}:generateContent"
+        f"v1beta/models/{model}:generateContent"
     )
+
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
 
     response = requests.post(
         url,
         params={
             "key": GEMINI_API_KEY
         },
-        json={
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text": prompt
-                        }
-                    ]
-                }
-            ]
-        },
-        timeout=GEMINI_TIMEOUT
+        json=payload,
+        timeout=GEMINI_TIMEOUT,
     )
 
-    if response.status_code != 200:
+    if response.status_code >= 400:
         raise RuntimeError(
-            f"Gemini HTTP "
+            "Gemini HTTP "
             f"{response.status_code}: "
             f"{response.text[:1000]}"
         )
@@ -984,7 +822,7 @@ def gemini_request(
 
     candidates = data.get(
         "candidates",
-        []
+        [],
     )
 
     if not candidates:
@@ -992,217 +830,56 @@ def gemini_request(
             "Gemini returned no candidates"
         )
 
-    content = candidates[0].get(
-        "content",
-        {}
+    parts = (
+        candidates[0]
+        .get("content", {})
+        .get("parts", [])
     )
 
-    parts = content.get(
-        "parts",
-        []
-    )
-
-    texts = []
-
-    for part in parts:
-
-        text = part.get(
-            "text",
-            ""
-        )
-
-        if text:
-            texts.append(
-                text
-            )
-
-    result = "\n".join(
-        texts
+    text = "".join(
+        part.get("text", "")
+        for part in parts
     ).strip()
 
-    if not result:
-        raise RuntimeError(
-            "Gemini returned empty text"
-        )
-
-    return result
-
-
-def clean_gemini_response(text):
     if not text:
-        return ""
+        raise RuntimeError(
+            "Gemini returned an empty response"
+        )
 
-    text = str(
-        text
-    ).strip()
+    return text
+
+
+def clean_post(text):
+    text = text.strip()
 
     text = re.sub(
-        r"```(?:text|json)?",
+        r"^```(?:text)?\s*",
         "",
         text,
-        flags=re.IGNORECASE
+        flags=re.IGNORECASE,
     )
 
-    text = text.replace(
-        "```",
-        ""
+    text = re.sub(
+        r"\s*```$",
+        "",
+        text,
+    )
+
+    text = re.sub(
+        r"^(Пост|Текст)\s*:\s*",
+        "",
+        text,
+        flags=re.IGNORECASE,
     )
 
     return text.strip()
 
 
-def extract_field(
-    text,
-    field
-):
-    pattern = (
-        rf"{re.escape(field)}\s*:"
-        rf"\s*(.+)"
-    )
-
-    match = re.search(
-        pattern,
-        text,
-        flags=re.IGNORECASE
-    )
-
-    if not match:
-        return ""
-
-    value = match.group(1).strip()
-
-    value = value.strip(
-        "\"'[]"
-    )
-
-    return value.strip()
-
-
-def build_fallback_search_query(
+def generate_post(
     title,
-    summary
+    article,
 ):
-    text = " ".join(
-        [
-            title or "",
-            summary or ""
-        ]
-    )
-
-    text = clean_html(
-        text
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    ).strip()
-
-    if not text:
-        return "NHL hockey"
-
-    stopwords = {
-        "the",
-        "a",
-        "an",
-        "and",
-        "or",
-        "but",
-        "for",
-        "with",
-        "from",
-        "into",
-        "after",
-        "before",
-        "about",
-        "this",
-        "that",
-        "have",
-        "has",
-        "had",
-        "will",
-        "would",
-        "could",
-        "should",
-        "their",
-        "they",
-        "them",
-        "his",
-        "her",
-        "its",
-        "are",
-        "was",
-        "were",
-        "been",
-        "being",
-        "is",
-        "to",
-        "of",
-        "in",
-        "on",
-        "at",
-        "by",
-        "as",
-        "it",
-        "he",
-        "she",
-        "who",
-        "what",
-        "why",
-        "how",
-        "when",
-        "where",
-        "which",
-        "more",
-        "most",
-        "some",
-        "any",
-        "not",
-        "no"
-    }
-
-    result = []
-
-    for word in text.split():
-
-        clean = re.sub(
-            r"[^A-Za-z0-9'-]",
-            "",
-            word
-        )
-
-        if not clean:
-            continue
-
-        if clean.lower() in stopwords:
-            continue
-
-        result.append(
-            clean
-        )
-
-        if len(result) >= 8:
-            break
-
-    if not any(
-        word.lower() == "nhl"
-        for word in result
-    ):
-        result.append(
-            "NHL"
-        )
-
-    return " ".join(
-        result[:10]
-    )
-
-
-def translate_tweet(
-    title,
-    article_text
-):
-    global gemini_primary_disabled
+    global GEMINI_PRIMARY_DISABLED
 
     if not GEMINI_API_KEY:
         raise RuntimeError(
@@ -1210,1655 +887,322 @@ def translate_tweet(
         )
 
     prompt = f"""
-Ты работаешь с новостью NHL.
+Ты пишешь пост для русскоязычного Telegram-канала про NHL.
 
-Твоя задача:
+Сделай из материала ниже живой авторский пост на русском языке.
 
-1. Написать короткий естественный пост
-   на русском языке для Telegram-канала.
-2. Не переводить исходный текст дословно.
-3. Сохранить факты исходной новости.
-4. Не придумывать информацию.
-5. Пост должен звучать как текст живого
-   автора спортивного Telegram-канала.
-6. Не использовать формальный журналистский
-   стиль и канцелярит.
-7. Не добавлять информацию, которой нет
-   в исходном материале.
-8. Отдельно создать поисковый запрос
-   для фотографии.
+Не переводи дословно.
+Не добавляй фактов, которых нет в материале.
+Не выдумывай цитаты.
+Не начинай с шаблонных фраз вроде:
+«Стало известно»,
+«Похоже, что»,
+«Вот это поворот».
 
-ВАЖНО:
+Пиши естественно, как человек, который следит за NHL и делится новостью с аудиторией.
 
-SEARCH_QUERY должен описывать смысл
-конкретной новости.
-
-Не делай запрос просто в формате:
-"Имя игрока NHL".
-
-Если новость о переходе, контракте,
-обмене, конфликте, новом клубе,
-увольнении, травме, слухе или другом
-событии — это событие должно попасть
-в поисковый запрос.
-
-Запрос должен быть на английском языке.
-
-Верни результат строго в формате:
-
-POST:
-текст поста
-
-SEARCH_QUERY:
-поисковый запрос
-
-TITLE:
+Заголовок:
 {title}
 
-ARTICLE:
-{article_text}
-"""
+Материал:
+{article}
 
-    models = []
+Верни только готовый текст поста.
+Без пояснений.
+Без служебных комментариев.
+Без «Пост:».
+""".strip()
 
-    if not gemini_primary_disabled:
-        models.append(
-            GEMINI_PRIMARY_MODEL
-        )
-
-    models.append(
-        GEMINI_FALLBACK_MODEL
-    )
-
-    last_error = None
-
-    for index, model in enumerate(
-        models
-    ):
-
+    if not GEMINI_PRIMARY_DISABLED:
         try:
-
-            print(
-                f"[GEMINI] Model: {model}"
-            )
-
             result = gemini_request(
+                GEMINI_PRIMARY_MODEL,
                 prompt,
-                model
             )
 
-            result = clean_gemini_response(
+            time.sleep(
+                GEMINI_DELAY
+            )
+
+            return clean_post(
                 result
             )
 
-            post = extract_field(
-                result,
-                "POST"
-            )
-
-            search_query = extract_field(
-                result,
-                "SEARCH_QUERY"
-            )
-
-            if not post:
-                raise RuntimeError(
-                    "Gemini did not return POST"
-                )
-
-            if not search_query:
-
-                search_query = (
-                    build_fallback_search_query(
-                        title,
-                        article_text
-                    )
-                )
-
-                print(
-                    "[GEMINI] SEARCH_QUERY "
-                    "missing, using fallback"
-                )
-
+        except Exception as exc:
             print(
-                f"[GEMINI] Success: "
-                f"{model}"
-            )
-
-            return {
-                "post": post,
-                "search_query": search_query
-            }
-
-        except Exception as error:
-
-            last_error = error
-
-            print(
-                f"[GEMINI ERROR] "
-                f"{model}: {error}"
+                "[GEMINI PRIMARY ERROR] "
+                f"{exc}"
             )
 
             error_text = str(
-                error
+                exc
             ).lower()
 
             if (
-                "429" in error_text
-                or "quota" in error_text
-                or "resource_exhausted"
-                in error_text
+                "404" in error_text
+                or "not found" in error_text
             ):
+                GEMINI_PRIMARY_DISABLED = True
 
-                if model == GEMINI_PRIMARY_MODEL:
-
-                    gemini_primary_disabled = True
-
-                    print(
-                        "[GEMINI] Primary model "
-                        "disabled for this run."
-                    )
-
-            if index < len(models) - 1:
-
-                print(
-                    "[GEMINI] Switching "
-                    "to fallback model..."
-                )
-
-                time.sleep(
-                    1
-                )
-
-    print(
-        "[GEMINI] All models failed."
+    result = gemini_request(
+        GEMINI_FALLBACK_MODEL,
+        prompt,
     )
 
-    if last_error:
-        print(
-            f"[GEMINI] Emergency fallback: "
-            f"{last_error}"
-        )
-
-    return {
-        "post": article_text[:4000],
-        "search_query": (
-            build_fallback_search_query(
-                title,
-                article_text
-            )
-        )
-    }
-
-
-# =============================================================================
-# IMAGE SEARCH HELPERS
-# =============================================================================
-
-def normalize_text(value):
-    if not value:
-        return ""
-
-    value = str(
-        value
-    ).lower()
-
-    value = value.replace(
-        "’",
-        "'"
+    time.sleep(
+        GEMINI_DELAY
     )
 
-    value = re.sub(
-        r"\s+",
-        " ",
-        value
+    return clean_post(
+        result
     )
 
-    return value.strip()
 
+# =========================================================
+# IMAGE SEARCH
+# =========================================================
 
-def get_domain(url):
-    if not url:
-        return ""
+def parse_date_year(value):
+    match = re.search(
+        r"\b(20\d{2})\b",
+        value or "",
+    )
 
-    try:
-        domain = urlparse(
-            url
-        ).netloc.lower()
-
-        return domain.replace(
-            "www.",
-            ""
+    if match:
+        return int(
+            match.group(1)
         )
-
-    except Exception:
-        return ""
-
-
-def get_base_domain(domain):
-    parts = domain.split(".")
-
-    if len(parts) >= 2:
-        return ".".join(
-            parts[-2:]
-        )
-
-    return domain
-
-
-def extract_years(text):
-    if not text:
-        return []
-
-    return [
-        int(match)
-        for match in re.findall(
-            r"\b(19\d{2}|20\d{2})\b",
-            str(text)
-        )
-    ]
-
-
-def to_int(value):
-    if value is None:
-        return None
-
-    try:
-        return int(value)
-
-    except (
-        TypeError,
-        ValueError
-    ):
-        return None
-
-
-def parse_result_date(result):
-    possible_fields = [
-        "date",
-        "published",
-        "published_date",
-        "datetime",
-        "timestamp",
-        "title",
-        "body",
-        "snippet",
-        "source",
-        "url",
-    ]
-
-    for field in possible_fields:
-
-        value = result.get(
-            field
-        )
-
-        if not value:
-            continue
-
-        years = extract_years(
-            value
-        )
-
-        for year in years:
-
-            if (
-                1900
-                <= year
-                <= datetime.now().year + 1
-            ):
-                return year
 
     return None
 
 
-def is_probably_valid_result(result):
-    image_url = result.get(
-        "image"
-    )
-
-    if not image_url:
-        return False
-
-    width = to_int(
-        result.get(
-            "width"
-        )
-    )
-
-    height = to_int(
-        result.get(
-            "height"
-        )
-    )
-
-    if width and width < 300:
-        return False
-
-    if height and height < 200:
-        return False
-
-    return True
-
-
-def normalize_page_url(url):
-    if not url:
-        return ""
-
-    try:
-        parsed = urlparse(
-            url
-        )
-
-        path = parsed.path.rstrip(
-            "/"
-        )
-
-        return (
-            f"{parsed.scheme.lower()}://"
-            f"{parsed.netloc.lower()}"
-            f"{path}"
-        )
-
-    except Exception:
-        return url
-
-
-def make_result_key(result):
-    page_url = normalize_page_url(
-        result.get(
-            "url"
-        )
-    )
-
-    if page_url:
-        return page_url
-
-    image_url = result.get(
-        "image",
-        ""
-    )
-
-    return image_url.split(
-        "?",
-        1
-    )[0]
-
-
-def deduplicate_results(results):
-    unique = {}
-
-    for result in results:
-
-        key = make_result_key(
-            result
-        )
-
-        if not key:
-            continue
-
-        if key not in unique:
-
-            unique[key] = result
-            continue
-
-        old = unique[key]
-
-        old_width = (
-            to_int(
-                old.get("width")
-            )
-            or 0
-        )
-
-        old_height = (
-            to_int(
-                old.get("height")
-            )
-            or 0
-        )
-
-        new_width = (
-            to_int(
-                result.get("width")
-            )
-            or 0
-        )
-
-        new_height = (
-            to_int(
-                result.get("height")
-            )
-            or 0
-        )
-
-        if (
-            new_width * new_height
-            > old_width * old_height
-        ):
-            unique[key] = result
-
-    return list(
-        unique.values()
-    )
-
-
-def image_is_bad(item):
-    image_url = str(
-        item.get(
-            "image",
-            ""
-        )
-    ).lower()
-
-    thumbnail_url = str(
-        item.get(
-            "thumbnail",
-            ""
-        )
-    ).lower()
-
-    page_url = str(
-        item.get(
-            "url",
-            ""
-        )
-    ).lower()
-
-    title = str(
-        item.get(
-            "title",
-            ""
-        )
-    ).lower()
-
-    source = str(
-        item.get(
-            "source",
-            ""
-        )
-    ).lower()
-
-    combined = " ".join(
-        [
-            image_url,
-            thumbnail_url,
-            page_url,
-            title,
-            source
-        ]
-    )
-
-    for pattern in BAD_URL_PATTERNS:
-
-        if pattern in combined:
-            return True
-
-    try:
-
-        domain = urlparse(
-            page_url
-        ).netloc.lower()
-
-        for pattern in BAD_DOMAIN_PATTERNS:
-
-            if pattern in domain:
-                return True
-
-    except Exception:
-        pass
-
-    return False
-
-
-def score_query_match(
-    text,
-    query
-):
-    score = 0
-    reasons = []
-
-    text = normalize_text(
-        text
-    )
-
-    query_words = [
-        word
-        for word in normalize_text(
-            query
-        ).split()
-        if len(word) >= 3
-    ]
-
-    if not query_words:
-        return 0, []
-
-    matched = sum(
-        1
-        for word in query_words
-        if word in text
-    )
-
-    ratio = matched / len(
-        query_words
-    )
-
-    if matched == len(
-        query_words
-    ):
-
-        score += 25
-
-        reasons.append(
-            f"query_match:all "
-            f"{matched}/{len(query_words)}"
-        )
-
-    elif ratio >= 0.75:
-
-        score += 18
-
-        reasons.append(
-            f"query_match:high "
-            f"{matched}/{len(query_words)}"
-        )
-
-    elif ratio >= 0.5:
-
-        score += 10
-
-        reasons.append(
-            f"query_match:medium "
-            f"{matched}/{len(query_words)}"
-        )
-
-    else:
-
-        score -= 10
-
-        reasons.append(
-            f"query_match:low "
-            f"{matched}/{len(query_words)}"
-        )
-
-    return score, reasons
-
-
-def score_source(domain):
-    domain = get_base_domain(
-        domain
-    )
-
-    if domain in GOOD_DOMAINS:
-
-        return (
-            GOOD_DOMAINS[domain],
-            f"source:{domain}"
-        )
-
-    if domain in BAD_DOMAINS:
-
-        return (
-            BAD_DOMAINS[domain],
-            f"source:{domain}"
-        )
-
-    return 0, None
-
-
-def score_bad_words(text):
-    score = 0
-    reasons = []
-
-    normalized = normalize_text(
-        text
-    )
-
-    for word, penalty in BAD_WORDS.items():
-
-        if word in normalized:
-
-            score += penalty
-
-            reasons.append(
-                f"bad:{word}"
-            )
-
-    return score, reasons
-
-
-def score_good_words(text):
-    score = 0
-    reasons = []
-
-    normalized = normalize_text(
-        text
-    )
-
-    for word, bonus in GOOD_WORDS.items():
-
-        if word in normalized:
-
-            score += bonus
-
-            reasons.append(
-                f"good:{word}"
-            )
-
-    return score, reasons
-
-
-def score_dimensions(
-    width,
-    height
-):
-    score = 0
-    reasons = []
-
-    if width:
-
-        if width >= 1200:
-            score += 10
-
-        elif width >= 800:
-            score += 6
-
-        elif width >= 600:
-            score += 3
-
-        if width >= 600:
-            reasons.append(
-                f"width:{width}"
-            )
-
-    if height:
-
-        if height >= 700:
-            score += 10
-
-        elif height >= 500:
-            score += 6
-
-        elif height >= 400:
-            score += 3
-
-        if height >= 400:
-            reasons.append(
-                f"height:{height}"
-            )
-
-    if width and height:
-
-        ratio = width / height
-
-        if 1.3 <= ratio <= 2.0:
-            score += 10
-
-        elif 1.15 <= ratio <= 2.2:
-            score += 5
-
-        elif ratio < 0.8:
-            score -= 10
-
-        reasons.append(
-            f"ratio:{ratio:.2f}"
-        )
-
-    return score, reasons
-
-
-def title_has_team_change_context(title):
-    normalized = normalize_text(
-        title
-    )
-
-    for word in TEAM_CHANGE_WORDS:
-
-        if word in normalized:
-            return True
-
-    return False
-
-
-def get_query_phrases(query):
-    words = re.findall(
-        r"[A-Za-z0-9'-]+",
-        normalize_text(query)
-    )
-
-    if not words:
-        return []
-
-    phrases = []
-
-    for size in (
-        4,
-        3,
-        2
-    ):
-
-        for index in range(
-            len(words) - size + 1
-        ):
-
-            phrase = " ".join(
-                words[
-                    index:index + size
-                ]
-            )
-
-            if phrase not in phrases:
-                phrases.append(
-                    phrase
-                )
-
-    return phrases
-
-
-def is_phrase_opponent_in_title(
-    title,
-    phrase
-):
-    normalized_title = normalize_text(
-        title
-    )
-
-    normalized_phrase = normalize_text(
-        phrase
-    )
-
-    if (
-        not normalized_title
-        or not normalized_phrase
-    ):
-        return False
-
-    position = normalized_title.find(
-        normalized_phrase
-    )
-
-    if position == -1:
-        return False
-
-    start = max(
-        0,
-        position - 80
-    )
-
-    end = min(
-        len(normalized_title),
-        position
-        + len(normalized_phrase)
-        + 30
-    )
-
-    context = normalized_title[
-        start:end
-    ]
-
-    for pattern in OPPONENT_PATTERNS:
-
-        if re.search(
-            pattern,
-            context
-        ):
-            return True
-
-    return False
-
-
-def score_title_context(
-    title,
-    query,
-    historical_year=None
-):
-    score = 0
-    reasons = []
-
-    normalized = normalize_text(
-        title
-    )
-
-    if not normalized:
-        return score, reasons
-
-    query_words = [
-        word
-        for word in normalize_text(
-            query
-        ).split()
-        if len(word) >= 3
-    ]
-
-    phrases = get_query_phrases(
-        query
-    )
-
-    opponent_found = False
-
-    for phrase in phrases:
-
-        if len(
-            phrase.split()
-        ) < 2:
-            continue
-
-        if phrase in normalized:
-
-            if is_phrase_opponent_in_title(
-                title,
-                phrase
-            ):
-
-                score -= 35
-
-                reasons.append(
-                    f"title:query_phrase:"
-                    f"opponent:{phrase}"
-                )
-
-                opponent_found = True
-
-                break
-
-    if query_words:
-
-        matched = sum(
-            1
-            for word in query_words
-            if word in normalized
-        )
-
-        ratio = matched / len(
-            query_words
-        )
-
-        if matched == len(
-            query_words
-        ):
-
-            score += 20
-
-            reasons.append(
-                f"title:query_match:"
-                f"all {matched}/{len(query_words)}"
-            )
-
-        elif ratio >= 0.75:
-
-            score += 12
-
-            reasons.append(
-                f"title:query_match:"
-                f"high {matched}/{len(query_words)}"
-            )
-
-        elif ratio >= 0.5:
-
-            score += 6
-
-            reasons.append(
-                f"title:query_match:"
-                f"medium {matched}/{len(query_words)}"
-            )
-
-    if (
-        title_has_team_change_context(
-            title
-        )
-        and not opponent_found
-    ):
-
-        score += 25
-
-        reasons.append(
-            "title:team_change"
-        )
-
-    if historical_year:
-
-        if str(
-            historical_year
-        ) in normalized:
-
-            score += 60
-
-            reasons.append(
-                f"title:historical_year:"
-                f"{historical_year}"
-            )
-
-        historical_words = [
-            "goal",
-            "scored",
-            "scoring",
-            "hat trick",
-            "historic",
-            "history",
-            "classic",
-            "legendary",
-            "highlights",
-            "throwback",
-            "retro",
-        ]
-
-        for word in historical_words:
-
-            if word in normalized:
-
-                score += 8
-
-                reasons.append(
-                    f"title:event:{word}"
-                )
-
-    else:
-
-        current_words = [
-            "2026",
-            "2025",
-            "2024",
-            "signing",
-            "signed",
-            "contract",
-            "trade",
-            "traded",
-            "acquired",
-            "joins",
-            "joined",
-            "debut",
-        ]
-
-        for word in current_words:
-
-            if word in normalized:
-
-                score += 4
-
-                reasons.append(
-                    f"title:current:{word}"
-                )
-
-    return score, reasons
-
-
-def score_date(
-    result,
-    historical_year=None
-):
-    score = 0
-    reasons = []
-
-    result_year = parse_result_date(
-        result
-    )
-
-    if result_year is None:
-
-        possible_text = " ".join(
-            [
-                str(
-                    result.get("title")
-                    or ""
-                ),
-                str(
-                    result.get("body")
-                    or ""
-                ),
-                str(
-                    result.get("snippet")
-                    or ""
-                ),
-                str(
-                    result.get("url")
-                    or ""
-                ),
-            ]
-        )
-
-        years = extract_years(
-            possible_text
-        )
-
-        if years:
-            result_year = max(
-                years
-            )
-
-    if not result_year:
-
-        return 0, [
-            "date:unknown"
-        ]
-
-    current_year = datetime.now().year
-
-    if historical_year:
-
-        difference = abs(
-            result_year
-            - historical_year
-        )
-
-        if difference == 0:
-
-            score += 80
-
-            reasons.append(
-                f"historical_date:"
-                f"exact:{result_year}"
-            )
-
-        elif difference == 1:
-
-            score += 55
-
-            reasons.append(
-                f"historical_date:"
-                f"+-1:{result_year}"
-            )
-
-        elif difference <= HISTORICAL_YEAR_TOLERANCE:
-
-            score += 30
-
-            reasons.append(
-                f"historical_date:"
-                f"near:{result_year}"
-            )
-
-        elif difference <= 10:
-
-            score += 5
-
-            reasons.append(
-                f"historical_date:"
-                f"far:{result_year}"
-            )
-
-        else:
-
-            score -= 45
-
-            reasons.append(
-                f"historical_date:"
-                f"mismatch:{result_year}"
-            )
-
-        return score, reasons
-
-    age_years = (
-        current_year
-        - result_year
-    )
-
-    if age_years <= 0:
-
-        score += 30
-
-        reasons.append(
-            f"date:current:{result_year}"
-        )
-
-    elif age_years == 1:
-
-        score += 20
-
-        reasons.append(
-            f"date:recent:{result_year}"
-        )
-
-    elif age_years == 2:
-
-        score += 10
-
-        reasons.append(
-            f"date:fairly_recent:"
-            f"{result_year}"
-        )
-
-    elif age_years > 5:
-
-        score -= 20
-
-        reasons.append(
-            f"date:old:{result_year}"
-        )
-
-    else:
-
-        reasons.append(
-            f"date:older:{result_year}"
-        )
-
-    return score, reasons
-
-
-def score_result(
+def image_score(
     result,
     query,
-    historical_year=None
+    historical_year=None,
 ):
-    title = result.get(
-        "title"
-    ) or ""
+    title = (
+        result.get("title", "")
+        or ""
+    ).lower()
 
-    body = (
-        result.get(
-            "body"
-        )
-        or result.get(
-            "snippet"
-        )
+    source = (
+        result.get("source", "")
+        or ""
+    ).lower()
+
+    image_url = (
+        result.get("image", "")
         or ""
     )
 
-    source = result.get(
-        "source"
-    ) or ""
-
-    url = result.get(
-        "url"
-    ) or ""
-
-    image = result.get(
-        "image"
-    ) or ""
-
-    width = to_int(
-        result.get(
-            "width"
-        )
-    )
-
-    height = to_int(
-        result.get(
-            "height"
-        )
-    )
-
-    domain = get_domain(
-        url
-    )
-
-    combined_text = " ".join(
-        [
-            str(title),
-            str(body),
-            str(source),
-            str(url),
-            str(image),
-        ]
-    )
-
     score = 0
-    reasons = []
 
-    points, why = score_query_match(
-        combined_text,
-        query
-    )
-
-    score += points
-    reasons.extend(
-        why
-    )
-
-    points, why = score_title_context(
-        title,
+    words = re.findall(
+        r"[a-zA-Z0-9À-ÿ]+",
         query,
-        historical_year
     )
 
-    score += points
-    reasons.extend(
-        why
-    )
-
-    points, why = score_source(
-        domain
-    )
-
-    score += points
-
-    if why:
-        reasons.append(
-            why
-        )
-
-    points, why = score_bad_words(
-        combined_text
-    )
-
-    score += points
-    reasons.extend(
-        why
-    )
-
-    points, why = score_good_words(
-        combined_text
-    )
-
-    score += points
-    reasons.extend(
-        why
-    )
-
-    points, why = score_dimensions(
-        width,
-        height
-    )
-
-    score += points
-    reasons.extend(
-        why
-    )
-
-    points, why = score_date(
-        result,
-        historical_year
-    )
-
-    score += points
-    reasons.extend(
-        why
-    )
-
-    return score, reasons
-
-
-# =============================================================================
-# IMAGE SEARCH / DOWNLOAD
-# =============================================================================
-
-def download_image(
-    query,
-    historical_year=None
-):
-    if not query:
-        return None
-
-    print(
-        f"[IMAGE] Search query: "
-        f"{query}"
-    )
-
-    if historical_year:
-        print(
-            f"[IMAGE] Historical year: "
-            f"{historical_year}"
-        )
-
-    searches = [
-        {
-            "timelimit": "m",
-            "label": "recent month"
-        },
-        {
-            "timelimit": "y",
-            "label": "recent year"
-        },
-        {
-            "timelimit": None,
-            "label": "all time"
-        }
+    query_words = [
+        word.lower()
+        for word in words
+        if len(word) > 2
     ]
 
-    all_results = []
-
-    for search in searches:
-
-        try:
-
-            print(
-                f"[IMAGE] Search mode: "
-                f"{search['label']}"
-            )
-
-            kwargs = {
-                "query": query,
-                "max_results": IMAGE_RESULTS_LIMIT,
-                "safesearch": "moderate",
-                "layout": "Wide",
-                "size": "Large"
-            }
-
-            if search["timelimit"]:
-                kwargs["timelimit"] = (
-                    search["timelimit"]
-                )
-
-            with DDGS() as ddgs:
-
-                results = list(
-                    ddgs.images(
-                        **kwargs
-                    )
-                )
-
-            print(
-                f"[IMAGE] Results: "
-                f"{len(results)}"
-            )
-
-            for item in results:
-
-                item["_search_query"] = (
-                    query
-                )
-
-                all_results.append(
-                    item
-                )
-
-        except Exception as error:
-
-            print(
-                "[IMAGE SEARCH ERROR] "
-                f"{error}"
-            )
-
-    if not all_results:
-
-        print(
-            "[IMAGE] No search results."
-        )
-
-        return None
-
-    print(
-        f"[IMAGE] Total raw results: "
-        f"{len(all_results)}"
-    )
-
-    unique_results = (
-        deduplicate_results(
-            all_results
-        )
-    )
-
-    print(
-        f"[IMAGE] Unique article/image "
-        f"groups: {len(unique_results)}"
-    )
-
-    valid_results = []
-
-    for result in unique_results:
-
-        if not is_probably_valid_result(
-            result
-        ):
-            continue
-
-        if image_is_bad(
-            result
-        ):
-            continue
-
-        image_url = result.get(
-            "image"
-        )
-
-        if not image_url:
-            continue
-
-        if is_image_used(
-            image_url
-        ):
-            continue
-
-        valid_results.append(
-            result
-        )
-
-    print(
-        f"[IMAGE] Valid candidates: "
-        f"{len(valid_results)}"
-    )
-
-    if not valid_results:
-
-        print(
-            "[IMAGE] No acceptable "
-            "candidates."
-        )
-
-        return None
-
-    scored = []
-
-    for result in valid_results:
-
-        result_query = (
-            result.get(
-                "_search_query",
-                query
-            )
-        )
-
-        score, reasons = score_result(
-            result,
-            result_query,
-            historical_year
-        )
-
-        result["_score"] = score
-        result["_reasons"] = reasons
-
-        scored.append(
-            result
-        )
-
-    scored.sort(
-        key=lambda item: (
-            item.get(
-                "_score",
-                0
-            )
+    score += min(
+        50,
+        sum(
+            5
+            for word in query_words
+            if word in title
         ),
-        reverse=True
     )
 
-    print()
-    print(
-        "[IMAGE] TOP CANDIDATES"
+    if source:
+        score += 3
+
+    if image_url:
+        score += 5
+
+    result_year = parse_date_year(
+        result.get(
+            "title",
+            "",
+        )
     )
 
-    for index, result in enumerate(
-        scored[:10],
-        start=1
+    if (
+        historical_year
+        and result_year
     ):
-
-        print(
-            f"[{index}] "
-            f"SCORE: "
-            f"{result.get('_score', 0)}"
+        score += max(
+            0,
+            20
+            - abs(
+                result_year
+                - historical_year
+            ) * 5,
         )
 
-        print(
-            "      TITLE: "
-            f"{result.get('title', '')}"
-        )
+    return score
 
-        print(
-            "      SOURCE: "
-            f"{result.get('source', '')}"
-        )
 
-        print(
-            "      SIZE: "
-            f"{to_int(result.get('width'))}x"
-            f"{to_int(result.get('height'))}"
-        )
+def download_image(
+    search_query,
+    historical_year=None,
+):
+    print(
+        f"[IMAGE] Searching: "
+        f"{search_query}"
+    )
 
-        print(
-            "      DATE: "
-            f"{parse_result_date(result)}"
-        )
-
-        print(
-            "      PAGE: "
-            f"{result.get('url', '')}"
-        )
-
-        for reason in result.get(
-            "_reasons",
-            []
-        ):
-
-            print(
-                f"      + {reason}"
+    try:
+        with DDGS() as ddgs:
+            results = list(
+                ddgs.images(
+                    search_query,
+                    max_results=IMAGE_RESULTS_LIMIT,
+                )
             )
 
-    for result in scored[:10]:
+    except Exception as exc:
+        print(
+            f"[IMAGE SEARCH ERROR] "
+            f"{exc}"
+        )
 
-        image_url = result.get(
-            "image"
+        return None
+
+    if not results:
+        print(
+            "[IMAGE] No results found."
+        )
+
+        return None
+
+    scored = sorted(
+        results,
+        key=lambda result:
+            image_score(
+                result,
+                search_query,
+                historical_year,
+            ),
+        reverse=True,
+    )
+
+    for candidate in scored:
+        image_url = (
+            candidate.get("image")
+            or candidate.get(
+                "thumbnail"
+            )
         )
 
         if not image_url:
             continue
 
-        print()
         print(
             "[IMAGE] Trying candidate:"
         )
 
         print(
-            f"[IMAGE] Title: "
-            f"{result.get('title', '')}"
+            "[IMAGE] Title: "
+            f"{candidate.get('title', '')}"
         )
 
         print(
-            f"[IMAGE] Source: "
-            f"{result.get('source', '')}"
+            "[IMAGE] Source: "
+            f"{candidate.get('source', '')}"
         )
 
         print(
-            f"[IMAGE] Score: "
-            f"{result.get('_score', 0)}"
+            "[IMAGE] Score: "
+            f"{image_score(candidate, search_query, historical_year)}"
         )
 
         try:
-
             response = requests.get(
                 image_url,
-                timeout=IMAGE_DOWNLOAD_TIMEOUT,
                 headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 "
-                        "(Windows NT 10.0; "
-                        "Win64; x64) "
-                        "AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) "
-                        "Chrome/124.0 "
-                        "Safari/537.36"
-                    )
-                }
+                    "User-Agent":
+                        "Mozilla/5.0"
+                },
+                timeout=IMAGE_DOWNLOAD_TIMEOUT,
             )
 
-            if response.status_code != 200:
-
-                print(
-                    "[IMAGE] HTTP status: "
-                    f"{response.status_code}"
-                )
-
-                continue
+            response.raise_for_status()
 
             content_type = (
                 response.headers
                 .get(
                     "Content-Type",
-                    ""
+                    "",
                 )
-                .lower()
             )
 
-            if "image" not in content_type:
-
-                print(
-                    "[IMAGE] Not an image: "
-                    f"{content_type}"
-                )
-
+            if not content_type.startswith(
+                "image/"
+            ):
                 continue
 
-            content = response.content
-
-            if len(content) < 10_000:
-
-                print(
-                    "[IMAGE] Image too small."
-                )
-
-                continue
-
-            extension = ".jpg"
+            suffix = ".jpg"
 
             if "png" in content_type:
-                extension = ".png"
-
-            elif "webp" in content_type:
-                extension = ".webp"
-
-            elif "gif" in content_type:
-                extension = ".gif"
-
-            image_hash = hashlib.md5(
-                image_url.encode(
-                    "utf-8"
-                )
-            ).hexdigest()
+                suffix = ".png"
 
             filename = (
-                f"/tmp/"
-                f"nhl_{image_hash}"
-                f"{extension}"
+                "nhl_"
+                + hashlib.md5(
+                    image_url.encode()
+                ).hexdigest()
+                + suffix
+            )
+
+            path = os.path.join(
+                tempfile.gettempdir(),
+                filename,
             )
 
             with open(
-                filename,
-                "wb"
-            ) as file:
-
-                file.write(
-                    content
+                path,
+                "wb",
+            ) as image_file:
+                image_file.write(
+                    response.content
                 )
+
+            save_image(
+                image_url,
+                1,
+            )
 
             print(
                 "[IMAGE] Downloaded: "
-                f"{filename}"
+                f"{path}"
             )
 
-            return {
-                "file": filename,
-                "url": image_url
-            }
+            return path
 
-        except Exception as error:
-
+        except Exception as exc:
             print(
-                "[IMAGE] Download error: "
-                f"{error}"
+                f"[IMAGE ERROR] {exc}"
             )
 
     print(
-        "[IMAGE] All candidates failed "
-        "to download."
+        "[IMAGE] No usable image found."
     )
 
     return None
 
 
-# =============================================================================
+# =========================================================
 # TELEGRAM
-# =============================================================================
+# =========================================================
 
-def telegram_send_photo(
-    image_file,
-    caption
+def send_telegram(
+    post,
+    image_path=None,
 ):
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
@@ -2870,326 +1214,158 @@ def telegram_send_photo(
             "CHAT_ID is not configured"
         )
 
-    url = (
+    base_url = (
         "https://api.telegram.org/"
-        f"bot{TELEGRAM_TOKEN}/sendPhoto"
+        f"bot{TELEGRAM_TOKEN}"
     )
 
-    with open(
-        image_file,
-        "rb"
-    ) as image:
+    if image_path:
+        with open(
+            image_path,
+            "rb",
+        ) as image_file:
 
+            response = requests.post(
+                f"{base_url}/sendPhoto",
+                data={
+                    "chat_id":
+                        TELEGRAM_CHAT_ID,
+                    "caption":
+                        post,
+                },
+                files={
+                    "photo":
+                        image_file
+                },
+                timeout=TELEGRAM_TIMEOUT,
+            )
+
+    else:
         response = requests.post(
-            url,
+            f"{base_url}/sendMessage",
             data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "caption": caption
+                "chat_id":
+                    TELEGRAM_CHAT_ID,
+                "text":
+                    post,
             },
-            files={
-                "photo": image
-            },
-            timeout=TELEGRAM_TIMEOUT
+            timeout=TELEGRAM_TIMEOUT,
         )
 
-    if response.status_code != 200:
-
+    if response.status_code >= 400:
         raise RuntimeError(
-            f"Telegram HTTP "
+            "Telegram HTTP "
             f"{response.status_code}: "
             f"{response.text[:1000]}"
         )
 
-    data = response.json()
 
-    if not data.get(
-        "ok",
-        False
-    ):
-
-        raise RuntimeError(
-            f"Telegram error: "
-            f"{data}"
-        )
-
-    return data
-
-
-# =============================================================================
-# POST CLEANING
-# =============================================================================
-
-def clean_post(text):
-    if not text:
-        return ""
-
-    text = str(
-        text
-    ).strip()
-
-    text = re.sub(
-        r"^(POST|TEXT)\s*:\s*",
-        "",
-        text,
-        flags=re.IGNORECASE
-    )
-
-    text = re.sub(
-        r"\s+",
-        " ",
-        text
-    )
-
-    return text.strip()
-
-
-# =============================================================================
+# =========================================================
 # PROCESS NEWS
-# =============================================================================
+# =========================================================
 
-def process_news(entry):
-    title = entry.get(
-        "title",
-        ""
-    )
-
-    url = normalize_url(
-        entry.get(
-            "link",
-            ""
-        )
-    )
-
-    print()
+def process_news(
+    item,
+    index,
+    total,
+):
     print(
-        "=" * 70
+        f"[BOT] Processing "
+        f"{index}/{total}"
     )
 
-    print(
-        "[NEWS] "
-        f"{title}"
-    )
+    url = item["url"]
 
-    print(
-        "[URL] "
-        f"{url}"
-    )
-
-    print(
-        "=" * 70
-    )
-
-    if not url:
-
-        print(
-            "[SKIP] Empty URL."
-        )
-
-        return False
-
-    if is_news_processed(
-        url
-    ):
-
-        print(
-            "[SKIP] Already processed."
-        )
-
-        return False
-
-    save_news(
-        url,
-        title,
-        processed=False
-    )
-
-    article_text = get_article_text(
-        entry
-    )
-
-    # -------------------------------------------------------------------------
-    # GEMINI
-    # -------------------------------------------------------------------------
+    save_news(item)
 
     try:
-
-        ai_result = translate_tweet(
-            title,
-            article_text
-        )
-
-        post = clean_post(
-            ai_result.get(
-                "post",
-                ""
-            )
-        )
-
-        search_query = str(
-            ai_result.get(
-                "search_query",
-                ""
-            )
-        ).strip()
-
-        print(
-            "[POST]"
-        )
-
-        print(
-            post
-        )
-
-        print(
-            "[SEARCH_QUERY] "
-            f"{search_query}"
-        )
-
-    except Exception as error:
-
-        print(
-            "[GEMINI PROCESS ERROR] "
-            f"{error}"
-        )
-
-        log_error(
+        article = fetch_article(
             url,
-            error,
-            stage="gemini"
+            item.get(
+                "summary",
+                "",
+            ),
         )
 
-        return False
-
-    # -------------------------------------------------------------------------
-    # IMAGE
-    # -------------------------------------------------------------------------
-
-    try:
+        post = generate_post(
+            item["title"],
+            article,
+        )
 
         image = download_image(
-            search_query
+            item["title"]
         )
 
-    except Exception as error:
-
-        print(
-            "[IMAGE ERROR] "
-            f"{error}"
+        send_telegram(
+            post,
+            image,
         )
 
-        log_error(
-            url,
-            error,
-            stage="image"
-        )
-
-        image = None
-
-    if not image:
-
-        print(
-            "[SKIP] No suitable image."
-        )
-
-        log_error(
-            url,
-            "No suitable image found",
-            stage="image"
-        )
-
-        return False
-
-    # -------------------------------------------------------------------------
-    # TELEGRAM
-    # -------------------------------------------------------------------------
-
-    try:
-
-        telegram_send_photo(
-            image["file"],
-            post
-        )
-
-        print(
-            "[TELEGRAM] Published."
-        )
-
-    except Exception as error:
-
-        print(
-            "[TELEGRAM ERROR] "
-            f"{error}"
-        )
-
-        log_error(
-            url,
-            error,
-            stage="telegram"
-        )
-
-        return False
-
-    # -------------------------------------------------------------------------
-    # MARK SUCCESS
-    # -------------------------------------------------------------------------
-
-    try:
-
-        mark_news_processed(
+        mark_processed(
             url
         )
 
-        save_image(
-            image["url"],
-            used=True
+        print(
+            "[BOT] Published successfully"
         )
 
-        print(
-            "[DATABASE] News marked "
-            "as processed."
-        )
+        return True
+
+    except Exception as exc:
+        message = str(exc)
+
+        stage = "processing"
+
+        if (
+            "CHAT_ID" in message
+            or "Telegram" in message
+        ):
+            stage = "telegram"
+
+            print(
+                "[TELEGRAM ERROR] "
+                f"{message}"
+            )
+
+        elif (
+            "Gemini" in message
+            or "GEMINI" in message
+        ):
+            stage = "gemini"
+
+        elif (
+            "image" in message.lower()
+        ):
+            stage = "image"
+
+        elif (
+            "article" in message.lower()
+            or "HTTP" in message
+        ):
+            stage = "article"
 
         print(
-            "[DATABASE] Image marked "
-            "as used."
-        )
-
-    except Exception as error:
-
-        print(
-            "[DATABASE ERROR] "
-            f"{error}"
+            "[FATAL ITEM ERROR] "
+            f"{message}"
         )
 
         log_error(
             url,
-            error,
-            stage="database"
+            message,
+            stage,
         )
 
         return False
 
-    return True
 
-
-# =============================================================================
+# =========================================================
 # MAIN
-# =============================================================================
+# =========================================================
 
 def main():
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "NHL NEWS BOT START"
-    )
-
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
+    print("NHL NEWS BOT START")
+    print("=" * 70)
 
     print(
         f"[CONFIG] RSS entries limit: "
@@ -3211,169 +1387,101 @@ def main():
         "context + source + date scoring"
     )
 
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
-    # -------------------------------------------------------------------------
-    # RSS
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------
+    # DATABASE INITIALIZATION
+    # -----------------------------------------------------
 
     try:
+        conn = get_db()
+        conn.close()
 
-        entries = get_rss_entries()
-
-    except Exception as error:
-
+    except Exception as exc:
         print(
-            "[RSS ERROR] "
-            f"{error}"
+            "[DATABASE ERROR] "
+            f"{exc}"
         )
 
         log_error(
             "",
-            error,
-            stage="rss"
+            str(exc),
+            "database",
         )
 
         return
 
-    if not entries:
+    # -----------------------------------------------------
+    # RSS
+    # -----------------------------------------------------
 
+    try:
+        items = load_rss()
+
+    except Exception as exc:
         print(
-            "[RSS] No entries."
+            "[RSS ERROR] "
+            f"{exc}"
+        )
+
+        log_error(
+            "",
+            str(exc),
+            "rss",
         )
 
         return
 
-    # -------------------------------------------------------------------------
-    # FILTER PROCESSED NEWS
-    # -------------------------------------------------------------------------
+    # -----------------------------------------------------
+    # NEW NEWS
+    # -----------------------------------------------------
 
-    new_entries = []
-
-    for entry in entries:
-
-        url = normalize_url(
-            entry.get(
-                "link",
-                ""
-            )
+    new_items = [
+        item
+        for item in items
+        if not is_processed(
+            item["url"]
         )
-
-        if not url:
-            continue
-
-        if is_news_processed(
-            url
-        ):
-            continue
-
-        new_entries.append(
-            entry
-        )
+    ]
 
     print(
         f"[RSS] New news: "
-        f"{len(new_entries)}"
+        f"{len(new_items)}"
     )
 
-    if not new_entries:
-
-        print(
-            "[BOT] Nothing to publish."
-        )
-
-        return
-
-    # Oldest first.
-    new_entries.reverse()
+    # -----------------------------------------------------
+    # PROCESS
+    # -----------------------------------------------------
 
     published = 0
     failed = 0
 
-    # -------------------------------------------------------------------------
-    # PROCESS
-    # -------------------------------------------------------------------------
-
-    for index, entry in enumerate(
-        new_entries,
-        start=1
+    for index, item in enumerate(
+        new_items,
+        1,
     ):
-
-        print()
-        print(
-            f"[BOT] Processing "
-            f"{index}/{len(new_entries)}"
-        )
-
-        try:
-
-            success = process_news(
-                entry
-            )
-
-            if success:
-                published += 1
-
-            else:
-                failed += 1
-
-        except Exception as error:
-
+        if process_news(
+            item,
+            index,
+            len(new_items),
+        ):
+            published += 1
+        else:
             failed += 1
 
-            print(
-                "[FATAL ITEM ERROR] "
-                f"{error}"
-            )
+    # -----------------------------------------------------
+    # FINISH
+    # -----------------------------------------------------
 
-            try:
-
-                log_error(
-                    entry.get(
-                        "link",
-                        ""
-                    ),
-                    error,
-                    stage="process_news"
-                )
-
-            except Exception as logging_error:
-
-                print(
-                    "[ERROR LOGGER FAILURE] "
-                    f"{logging_error}"
-                )
-
-        time.sleep(
-            GEMINI_DELAY
-        )
-
-    # -------------------------------------------------------------------------
-    # SUMMARY
-    # -------------------------------------------------------------------------
-
-    print()
-    print(
-        "=" * 70
-    )
-
-    print(
-        "NHL NEWS BOT FINISHED"
-    )
-
+    print("=" * 70)
+    print("NHL NEWS BOT FINISHED")
     print(
         f"Published: {published}"
     )
-
     print(
         f"Failed: {failed}"
     )
-
-    print(
-        "=" * 70
-    )
+    print("=" * 70)
 
 
 if __name__ == "__main__":
