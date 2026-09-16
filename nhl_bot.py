@@ -25,19 +25,31 @@ GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
 DATABASE_FILE = "nhl_bot.db"
 
 MAX_NEWS = 30
+
 GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.1-flash-lite"
 
 GEMINI_TIMEOUT = 90
 TELEGRAM_TIMEOUT = 60
-ARTICLE_TIMEOUT = 30
-IMAGE_TIMEOUT = 20
+SOURCE_IMAGE_DOWNLOAD_TIMEOUT = 15
 MIN_IMAGE_BYTES = 5000
+
 GEMINI_DELAY = 1.0
 MAX_ARTICLE_TEXT = 12000
 
+FRESH_DAYS = 90
+HISTORICAL_YEAR_TOLERANCE = 3
+
 DATABASE_READY = False
 GEMINI_PRIMARY_DISABLED = False
+
+
+class PostRejected(Exception):
+    """The generated post must be skipped and permanently marked as processed."""
+
+
+class PostValidationServiceError(Exception):
+    """The validation service failed; the news should remain retryable."""
 
 
 # =========================================================
@@ -52,8 +64,17 @@ def normalize_url(url):
 
     try:
         parsed = urlparse(url)
-        host = parsed.netloc.lower().replace("www.", "")
-        path = parsed.path.rstrip("/") or "/"
+
+        host = (
+            parsed.netloc
+            .lower()
+            .replace("www.", "")
+        )
+
+        path = (
+            parsed.path.rstrip("/")
+            or "/"
+        )
 
         return urlunparse(
             (
@@ -65,6 +86,7 @@ def normalize_url(url):
                 "",
             )
         )
+
     except Exception:
         return url
 
@@ -73,7 +95,10 @@ def normalize_url(url):
 # DATABASE
 # =========================================================
 
-def table_exists(conn, table):
+def table_exists(
+    conn,
+    table,
+):
     row = conn.execute(
         """
         SELECT 1
@@ -87,29 +112,56 @@ def table_exists(conn, table):
     return row is not None
 
 
-def get_existing_columns(conn, table):
-    if not table_exists(conn, table):
+def get_existing_columns(
+    conn,
+    table,
+):
+    if not table_exists(
+        conn,
+        table,
+    ):
         return set()
 
     rows = conn.execute(
         f'PRAGMA table_info("{table}")'
     ).fetchall()
 
-    return {row[1] for row in rows}
+    return {
+        row[1]
+        for row in rows
+    }
 
 
-def add_column_if_missing(conn, table, column, definition):
-    if column not in get_existing_columns(conn, table):
+def add_column_if_missing(
+    conn,
+    table,
+    column,
+    definition,
+):
+    if column not in get_existing_columns(
+        conn,
+        table,
+    ):
         conn.execute(
-            f'ALTER TABLE "{table}" ADD COLUMN "{column}" {definition}'
+            f'ALTER TABLE "{table}" '
+            f'ADD COLUMN "{column}" {definition}'
         )
 
 
-def normalize_existing_urls(conn, table):
-    if not table_exists(conn, table):
+def normalize_existing_urls(
+    conn,
+    table,
+):
+    if not table_exists(
+        conn,
+        table,
+    ):
         return
 
-    if "url" not in get_existing_columns(conn, table):
+    if "url" not in get_existing_columns(
+        conn,
+        table,
+    ):
         return
 
     rows = conn.execute(
@@ -121,17 +173,34 @@ def normalize_existing_urls(conn, table):
 
         if normalized and normalized != url:
             conn.execute(
-                f'UPDATE "{table}" SET url = ? WHERE rowid = ?',
-                (normalized, rowid),
+                f'''
+                UPDATE "{table}"
+                SET url = ?
+                WHERE rowid = ?
+                ''',
+                (
+                    normalized,
+                    rowid,
+                ),
             )
 
 
-def remove_duplicate_rows(conn, table):
-    if not table_exists(conn, table):
+def remove_duplicate_rows(
+    conn,
+    table,
+):
+    if not table_exists(
+        conn,
+        table,
+    ):
         return
 
     rows = conn.execute(
-        f'SELECT rowid, url FROM "{table}" ORDER BY rowid'
+        f'''
+        SELECT rowid, url
+        FROM "{table}"
+        ORDER BY rowid
+        '''
     ).fetchall()
 
     seen = set()
@@ -144,15 +213,21 @@ def remove_duplicate_rows(conn, table):
 
         if normalized in seen:
             conn.execute(
-                f'DELETE FROM "{table}" WHERE rowid = ?',
+                f'''
+                DELETE FROM "{table}"
+                WHERE rowid = ?
+                ''',
                 (rowid,),
             )
+
         else:
             seen.add(normalized)
 
 
 def migrate_database(conn):
-    print("[DATABASE] Checking database schema...")
+    print(
+        "[DATABASE] Checking database schema..."
+    )
 
     conn.execute(
         """
@@ -172,10 +247,18 @@ def migrate_database(conn):
         ("title", "TEXT"),
         ("source", "TEXT"),
         ("published", "TEXT"),
-        ("processed", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "processed",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
         ("created_at", "TEXT"),
     ):
-        add_column_if_missing(conn, "news", column, definition)
+        add_column_if_missing(
+            conn,
+            "news",
+            column,
+            definition,
+        )
 
     conn.execute(
         """
@@ -189,10 +272,18 @@ def migrate_database(conn):
     )
 
     for column, definition in (
-        ("used", "INTEGER NOT NULL DEFAULT 0"),
+        (
+            "used",
+            "INTEGER NOT NULL DEFAULT 0",
+        ),
         ("created_at", "TEXT"),
     ):
-        add_column_if_missing(conn, "images", column, definition)
+        add_column_if_missing(
+            conn,
+            "images",
+            column,
+            definition,
+        )
 
     conn.execute(
         """
@@ -211,32 +302,60 @@ def migrate_database(conn):
         ("url", "TEXT"),
         ("error", "TEXT"),
         ("error_message", "TEXT"),
-        ("stage", "TEXT NOT NULL DEFAULT 'unknown'"),
+        (
+            "stage",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        ),
         ("created_at", "TEXT"),
     ):
-        add_column_if_missing(conn, "errors", column, definition)
+        add_column_if_missing(
+            conn,
+            "errors",
+            column,
+            definition,
+        )
 
-    normalize_existing_urls(conn, "news")
-    normalize_existing_urls(conn, "images")
-    remove_duplicate_rows(conn, "news")
-    remove_duplicate_rows(conn, "images")
+    normalize_existing_urls(
+        conn,
+        "news",
+    )
+
+    normalize_existing_urls(
+        conn,
+        "images",
+    )
+
+    remove_duplicate_rows(
+        conn,
+        "news",
+    )
+
+    remove_duplicate_rows(
+        conn,
+        "images",
+    )
 
     conn.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_news_url_unique
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_news_url_unique
         ON news(url)
         """
     )
 
     conn.execute(
         """
-        CREATE UNIQUE INDEX IF NOT EXISTS idx_images_url_unique
+        CREATE UNIQUE INDEX IF NOT EXISTS
+        idx_images_url_unique
         ON images(url)
         """
     )
 
     conn.commit()
-    print("[DATABASE] Schema check complete.")
+
+    print(
+        "[DATABASE] Schema check complete."
+    )
 
 
 def get_db():
@@ -247,8 +366,13 @@ def get_db():
         timeout=30,
     )
 
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
+    conn.execute(
+        "PRAGMA journal_mode=WAL"
+    )
+
+    conn.execute(
+        "PRAGMA busy_timeout=30000"
+    )
 
     if not DATABASE_READY:
         migrate_database(conn)
@@ -260,10 +384,19 @@ def get_db():
 def save_news(item):
     conn = get_db()
 
-    url = normalize_url(item.get("url", ""))
+    url = normalize_url(
+        item.get(
+            "url",
+            "",
+        )
+    )
 
     row = conn.execute(
-        "SELECT id FROM news WHERE url = ?",
+        """
+        SELECT id
+        FROM news
+        WHERE url = ?
+        """,
         (url,),
     ).fetchone()
 
@@ -273,30 +406,65 @@ def save_news(item):
         conn.execute(
             """
             UPDATE news
-            SET title = ?, source = ?, published = ?
+            SET title = ?,
+                source = ?,
+                published = ?
             WHERE id = ?
             """,
             (
-                item.get("title", ""),
-                item.get("source", ""),
-                item.get("published", ""),
+                item.get(
+                    "title",
+                    "",
+                ),
+                item.get(
+                    "source",
+                    "",
+                ),
+                item.get(
+                    "published",
+                    "",
+                ),
                 news_id,
             ),
         )
+
     else:
         cursor = conn.execute(
             """
             INSERT INTO news (
-                url, title, source, published, processed, created_at
+                url,
+                title,
+                source,
+                published,
+                processed,
+                created_at
             )
-            VALUES (?, ?, ?, ?, 0, ?)
+            VALUES (
+                ?,
+                ?,
+                ?,
+                ?,
+                0,
+                ?
+            )
             """,
             (
                 url,
-                item.get("title", ""),
-                item.get("source", ""),
-                item.get("published", ""),
-                datetime.now(timezone.utc).isoformat(),
+                item.get(
+                    "title",
+                    "",
+                ),
+                item.get(
+                    "source",
+                    "",
+                ),
+                item.get(
+                    "published",
+                    "",
+                ),
+                datetime.now(
+                    timezone.utc
+                ).isoformat(),
             ),
         )
 
@@ -312,13 +480,22 @@ def is_processed(url):
     conn = get_db()
 
     row = conn.execute(
-        "SELECT processed FROM news WHERE url = ?",
-        (normalize_url(url),),
+        """
+        SELECT processed
+        FROM news
+        WHERE url = ?
+        """,
+        (
+            normalize_url(url),
+        ),
     ).fetchone()
 
     conn.close()
 
-    return bool(row and row[0])
+    return bool(
+        row
+        and row[0]
+    )
 
 
 def mark_processed(url):
@@ -330,14 +507,23 @@ def mark_processed(url):
         SET processed = 1
         WHERE url = ?
         """,
-        (normalize_url(url),),
+        (
+            normalize_url(url),
+        ),
     )
 
     conn.commit()
     conn.close()
 
 
-def save_image(url, used=0):
+# =========================================================
+# IMAGE DATABASE
+# =========================================================
+
+def save_image(
+    url,
+    used=0,
+):
     url = normalize_url(url)
 
     if not url:
@@ -346,25 +532,49 @@ def save_image(url, used=0):
     conn = get_db()
 
     row = conn.execute(
-        "SELECT id FROM images WHERE url = ?",
+        """
+        SELECT id
+        FROM images
+        WHERE url = ?
+        """,
         (url,),
     ).fetchone()
 
     if row:
         conn.execute(
-            "UPDATE images SET used = ? WHERE id = ?",
-            (used, row[0]),
+            """
+            UPDATE images
+            SET used = ?
+            WHERE id = ?
+            """,
+            (
+                used,
+                row[0],
+            ),
         )
+
     else:
+        created_at = datetime.now(
+            timezone.utc
+        ).isoformat()
+
         conn.execute(
             """
-            INSERT INTO images (url, used, created_at)
-            VALUES (?, ?, ?)
+            INSERT INTO images (
+                url,
+                used,
+                created_at
+            )
+            VALUES (
+                ?,
+                ?,
+                ?
+            )
             """,
             (
                 url,
                 used,
-                datetime.now(timezone.utc).isoformat(),
+                created_at,
             ),
         )
 
@@ -372,12 +582,24 @@ def save_image(url, used=0):
     conn.close()
 
 
-def log_error(url, error, stage="unknown"):
+# =========================================================
+# ERROR LOGGING
+# =========================================================
+
+def log_error(
+    url,
+    error,
+    stage="unknown",
+):
     message = str(error)[:4000]
 
     try:
         conn = get_db()
-        columns = get_existing_columns(conn, "errors")
+
+        columns = get_existing_columns(
+            conn,
+            "errors",
+        )
 
         fields = []
         values = []
@@ -391,23 +613,40 @@ def log_error(url, error, stage="unknown"):
             values.append(message)
 
         if "error_message" in columns:
-            fields.append("error_message")
+            fields.append(
+                "error_message"
+            )
             values.append(message)
 
         if "stage" in columns:
             fields.append("stage")
-            values.append(stage or "unknown")
+            values.append(
+                stage or "unknown"
+            )
 
         if "created_at" in columns:
-            fields.append("created_at")
-            values.append(datetime.now(timezone.utc).isoformat())
+            fields.append(
+                "created_at"
+            )
+            values.append(
+                datetime.now(
+                    timezone.utc
+                ).isoformat()
+            )
 
-        placeholders = ",".join("?" for _ in fields)
+        placeholders = ",".join(
+            "?"
+            for _ in fields
+        )
 
         conn.execute(
             f"""
-            INSERT INTO errors ({",".join(fields)})
-            VALUES ({placeholders})
+            INSERT INTO errors (
+                {",".join(fields)}
+            )
+            VALUES (
+                {placeholders}
+            )
             """,
             tuple(values),
         )
@@ -416,7 +655,10 @@ def log_error(url, error, stage="unknown"):
         conn.close()
 
     except Exception as exc:
-        print(f"[ERROR LOGGER FAILURE] {exc}")
+        print(
+            "[ERROR LOGGER FAILURE] "
+            f"{exc}"
+        )
 
 
 # =========================================================
@@ -425,14 +667,19 @@ def log_error(url, error, stage="unknown"):
 
 def is_heavy_article_url(url):
     normalized = normalize_url(url)
-    parsed = urlparse(normalized)
+
+    parsed = urlparse(
+        normalized
+    )
 
     if parsed.netloc != "heavy.com":
         return False
 
     path = parsed.path.rstrip("/")
 
-    if not path.startswith("/sports/nhl/"):
+    if not path.startswith(
+        "/sports/nhl/"
+    ):
         return False
 
     if path in (
@@ -446,9 +693,18 @@ def is_heavy_article_url(url):
 
 def extract_listing_title(anchor):
     title = (
-        anchor.get_text(" ", strip=True)
-        or anchor.get("aria-label", "")
-        or anchor.get("title", "")
+        anchor.get_text(
+            " ",
+            strip=True,
+        )
+        or anchor.get(
+            "aria-label",
+            "",
+        )
+        or anchor.get(
+            "title",
+            "",
+        )
         or ""
     )
 
@@ -461,7 +717,7 @@ def extract_listing_title(anchor):
 
 def load_news():
     print(
-        f"[HEAVY] Loading source page: "
+        "[HEAVY] Loading source page: "
         f"{SOURCE_URL}"
     )
 
@@ -496,11 +752,16 @@ def load_news():
         url = normalize_url(
             urljoin(
                 response.url,
-                anchor.get("href", ""),
+                anchor.get(
+                    "href",
+                    "",
+                ),
             )
         )
 
-        if not is_heavy_article_url(url):
+        if not is_heavy_article_url(
+            url
+        ):
             continue
 
         if url in seen:
@@ -529,7 +790,7 @@ def load_news():
             break
 
     print(
-        f"[HEAVY] Articles found: "
+        "[HEAVY] Articles found: "
         f"{len(result)}"
     )
 
@@ -585,7 +846,10 @@ def extract_jsonld_images(
 ):
     images = []
 
-    if isinstance(value, str):
+    if isinstance(
+        value,
+        str,
+    ):
         normalized = normalize_image_url(
             value,
             page_url,
@@ -596,7 +860,10 @@ def extract_jsonld_images(
                 normalized
             )
 
-    elif isinstance(value, list):
+    elif isinstance(
+        value,
+        list,
+    ):
         for item in value:
             images.extend(
                 extract_jsonld_images(
@@ -605,7 +872,10 @@ def extract_jsonld_images(
                 )
             )
 
-    elif isinstance(value, dict):
+    elif isinstance(
+        value,
+        dict,
+    ):
         for key in (
             "url",
             "contentUrl",
@@ -754,6 +1024,7 @@ def extract_source_images(
             data = json.loads(
                 raw
             )
+
         except Exception:
             continue
 
@@ -787,23 +1058,28 @@ def extract_source_images(
     return unique
 
 
-def fetch_article(url):
+def fetch_article(
+    url,
+    fallback_summary="",
+):
     print(
-        f"[ARTICLE] Loading: "
+        "[ARTICLE] Loading: "
         f"{url}"
     )
 
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 "
+            "(X11; Linux x86_64) "
+            "AppleWebKit/537.36 "
+            "(KHTML, like Gecko) "
+            "Chrome/140.0 Safari/537.36 "
+            "NHLNewsBot/1.0"
+    }
+
     response = requests.get(
         url,
-        headers={
-            "User-Agent":
-                "Mozilla/5.0 "
-                "(X11; Linux x86_64) "
-                "AppleWebKit/537.36 "
-                "(KHTML, like Gecko) "
-                "Chrome/140.0 Safari/537.36 "
-                "NHLNewsBot/1.0"
-        },
+        headers=headers,
         timeout=30,
     )
 
@@ -814,16 +1090,9 @@ def fetch_article(url):
         "html.parser",
     )
 
-    final_url = (
-        response.url
-        or url
-    )
-
-    source_images = (
-        extract_source_images(
-            soup,
-            final_url,
-        )
+    source_images = extract_source_images(
+        soup,
+        response.url or url,
     )
 
     print(
@@ -843,9 +1112,6 @@ def fetch_article(url):
             "style",
             "noscript",
             "svg",
-            "nav",
-            "footer",
-            "form",
         ]
     ):
         tag.decompose()
@@ -869,6 +1135,9 @@ def fetch_article(url):
             " ",
             strip=True,
         )
+
+    if len(text) < 300:
+        text = fallback_summary
 
     text = re.sub(
         r"\s+",
@@ -919,7 +1188,7 @@ def download_source_image(
                 "Referer":
                     article_url,
             },
-            timeout=20,
+            timeout=SOURCE_IMAGE_DOWNLOAD_TIMEOUT,
         )
 
         response.raise_for_status()
@@ -966,6 +1235,9 @@ def download_source_image(
 
         elif "gif" in content_type:
             suffix = ".gif"
+
+        elif "jpeg" in content_type:
+            suffix = ".jpg"
 
         filename = (
             "nhl_source_"
@@ -1024,24 +1296,25 @@ def gemini_request(
         f"v1beta/models/{model}:generateContent"
     )
 
+    payload = {
+        "contents": [
+            {
+                "parts": [
+                    {
+                        "text": prompt
+                    }
+                ]
+            }
+        ]
+    }
+
     response = requests.post(
         url,
         params={
             "key":
                 GEMINI_API_KEY
         },
-        json={
-            "contents": [
-                {
-                    "parts": [
-                        {
-                            "text":
-                                prompt
-                        }
-                    ]
-                }
-            ]
-        },
+        json=payload,
         timeout=GEMINI_TIMEOUT,
     )
 
@@ -1118,6 +1391,121 @@ def clean_post(text):
     return text.strip()
 
 
+def validate_post_structure(text):
+    """
+    Deterministic checks for the Telegram post format.
+    """
+
+    text = clean_post(text)
+
+    length = len(text)
+
+    if length < 400 or length > 600:
+        raise PostRejected(
+            "Post length is "
+            f"{length} characters; "
+            "required 400-600"
+        )
+
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in re.split(
+            r"\n\s*\n",
+            text,
+        )
+        if paragraph.strip()
+    ]
+
+    if len(paragraphs) != 3:
+        raise PostRejected(
+            "Post must contain exactly "
+            f"3 paragraphs; found {len(paragraphs)}"
+        )
+
+    paragraph_lengths = [
+        len(paragraph)
+        for paragraph in paragraphs
+    ]
+
+    if min(paragraph_lengths) < 80:
+        raise PostRejected(
+            "One of the paragraphs is too short"
+        )
+
+    if (
+        max(paragraph_lengths)
+        > min(paragraph_lengths) * 1.8
+    ):
+        raise PostRejected(
+            "Paragraphs are not approximately "
+            "equal in length"
+        )
+
+    if "«" in text or "»" in text:
+        raise PostRejected(
+            "Post contains Russian quotation marks"
+        )
+
+    if (
+        text.startswith("-")
+        or text.startswith("•")
+    ):
+        raise PostRejected(
+            "Post looks like a list instead "
+            "of a normal Telegram post"
+        )
+
+    return text
+
+
+def generate_post_prompt(
+    title,
+    article,
+):
+    return f"""
+Ты пишешь короткий пост для русскоязычного Telegram-канала про NHL.
+
+Твоя задача — сделать точную и грамотную выжимку самого важного из материала.
+
+ЖЁСТКИЕ ТРЕБОВАНИЯ:
+
+1. Итоговый текст должен содержать от 400 до 600 символов включительно. Считай все символы, включая пробелы и знаки препинания.
+
+2. Сделай ровно 3 органичных абзаца.
+
+3. Абзацы должны быть примерно равными по объёму.
+
+4. Не растягивай текст ради достижения лимита. Убери всё второстепенное.
+
+5. Сохрани главное событие, ключевые детали, цифры, имена и последствия, если они есть в материале.
+
+6. Не добавляй ни одного факта, которого нет в исходном материале.
+
+7. Не выдумывай цитаты и не меняй смысл существующих цитат.
+
+8. Не переводи дословно. Пиши естественно по-русски, как живой автор Telegram-канала.
+
+9. Не начинай с шаблонных фраз вроде «Стало известно», «Похоже, что», «Вот это поворот».
+
+10. Названия хоккейных команд пиши без кавычек. Не используй «» вокруг названий команд.
+
+11. Не используй списки, подзаголовки, эмодзи и служебные пометки.
+
+12. Перед отправкой обязательно проверь русский язык: орфографию, пунктуацию, грамматику, согласование, падежи и естественность формулировок.
+
+13. Если в исходнике есть сомнительная или противоречивая информация, не додумывай её. Передай только то, что прямо подтверждается материалом.
+
+Заголовок статьи:
+{title}
+
+Материал статьи:
+{article}
+
+Верни только готовый текст поста.
+Никаких пояснений.
+""".strip()
+
+
 def generate_post(
     title,
     article,
@@ -1129,32 +1517,10 @@ def generate_post(
             "GEMINI_API_KEY is not configured"
         )
 
-    prompt = f"""
-Ты пишешь пост для русскоязычного Telegram-канала про NHL.
-
-Сделай из материала ниже живой авторский пост на русском языке.
-
-Не переводи дословно.
-Не добавляй фактов, которых нет в материале.
-Не выдумывай цитаты.
-Не начинай с шаблонных фраз вроде:
-«Стало известно»,
-«Похоже, что»,
-«Вот это поворот».
-
-Пиши естественно, как человек, который следит за NHL и делится новостью с аудиторией.
-
-Заголовок:
-{title}
-
-Материал:
-{article}
-
-Верни только готовый текст поста.
-Без пояснений.
-Без служебных комментариев.
-Без «Пост:».
-""".strip()
+    prompt = generate_post_prompt(
+        title,
+        article,
+    )
 
     if not GEMINI_PRIMARY_DISABLED:
         try:
@@ -1167,8 +1533,14 @@ def generate_post(
                 GEMINI_DELAY
             )
 
-            return clean_post(
+            return validate_post_structure(
                 result
+            )
+
+        except PostRejected as exc:
+            print(
+                "[GEMINI PRIMARY FORMAT ERROR] "
+                f"{exc}"
             )
 
         except Exception as exc:
@@ -1222,17 +1594,137 @@ def generate_post(
         f"{GEMINI_FALLBACK_MODEL}"
     )
 
-    result = gemini_request(
-        GEMINI_FALLBACK_MODEL,
-        prompt,
-    )
+    try:
+        result = gemini_request(
+            GEMINI_FALLBACK_MODEL,
+            prompt,
+        )
+
+    except Exception as exc:
+        print(
+            "[GEMINI FALLBACK ERROR] "
+            f"{exc}"
+        )
+
+        raise
 
     time.sleep(
         GEMINI_DELAY
     )
 
-    return clean_post(
+    return validate_post_structure(
         result
+    )
+
+
+def check_post_language(post):
+    """
+    Use Gemini as a final grammar/spelling
+    gate before publication.
+    """
+
+    prompt = f"""
+Проверь готовый русский Telegram-пост ниже перед публикацией.
+
+Нужно проверить:
+
+- орфографию;
+- пунктуацию;
+- грамматику;
+- согласование слов;
+- падежи;
+- очевидные опечатки;
+- очевидные смысловые ошибки, возникшие из-за неправильной формулировки.
+
+Не оценивай стиль и не предлагай улучшения, если текст просто можно написать иначе.
+
+Проверяй только наличие реальных ошибок.
+
+Если ошибок нет, ответь ровно:
+OK
+
+Если есть хотя бы одна реальная ошибка, ответь ровно:
+ERROR
+
+Пост:
+{post}
+""".strip()
+
+    global GEMINI_PRIMARY_DISABLED
+
+    result = None
+
+    if not GEMINI_PRIMARY_DISABLED:
+        try:
+            result = gemini_request(
+                GEMINI_PRIMARY_MODEL,
+                prompt,
+            )
+
+        except Exception as exc:
+            print(
+                "[GEMINI LANGUAGE PRIMARY ERROR] "
+                f"{exc}"
+            )
+
+            error_text = str(
+                exc
+            ).lower()
+
+            if any(
+                marker in error_text
+                for marker in (
+                    "http 429",
+                    "http 500",
+                    "http 502",
+                    "http 503",
+                    "http 504",
+                    "quota",
+                    "high demand",
+                    "unavailable",
+                    "resource_exhausted",
+                    "rate limit",
+                    "404",
+                    "not found",
+                )
+            ):
+                GEMINI_PRIMARY_DISABLED = True
+
+    if result is None:
+        print(
+            "[GEMINI LANGUAGE FALLBACK] Using "
+            f"{GEMINI_FALLBACK_MODEL}"
+        )
+
+        try:
+            result = gemini_request(
+                GEMINI_FALLBACK_MODEL,
+                prompt,
+            )
+
+        except Exception as exc:
+            raise PostValidationServiceError(
+                "Language validation service failed: "
+                f"{exc}"
+            ) from exc
+
+    answer = clean_post(
+        result
+    ).upper()
+
+    if answer != "OK":
+        raise PostRejected(
+            "Gemini language validation failed: "
+            f"{clean_post(result)[:200]}"
+        )
+
+    time.sleep(
+        GEMINI_DELAY
+    )
+
+    print(
+        "[POST VALIDATION] "
+        "Language check: OK"
     )
 
 
@@ -1242,7 +1734,7 @@ def generate_post(
 
 def send_telegram(
     post,
-    image_path,
+    image_path=None,
 ):
     if not TELEGRAM_TOKEN:
         raise RuntimeError(
@@ -1268,6 +1760,7 @@ def send_telegram(
         image_path,
         "rb",
     ) as image_file:
+
         response = requests.post(
             f"{base_url}/sendPhoto",
             data={
@@ -1280,7 +1773,7 @@ def send_telegram(
                 "photo":
                     image_file
             },
-            timeout=60,
+            timeout=TELEGRAM_TIMEOUT,
         )
 
     if response.status_code >= 400:
@@ -1292,7 +1785,7 @@ def send_telegram(
 
 
 # =========================================================
-# PROCESS
+# PROCESS NEWS
 # =========================================================
 
 def process_news(
@@ -1311,13 +1804,55 @@ def process_news(
         save_news(item)
 
         article, source_images = fetch_article(
-            url
+            url,
+            item.get(
+                "summary",
+                "",
+            ),
         )
 
         post = generate_post(
             item["title"],
             article,
         )
+
+        try:
+            check_post_language(
+                post
+            )
+
+        except PostRejected as exc:
+            print(
+                "[POST SKIPPED] "
+                "Validation failed: "
+                f"{exc}"
+            )
+
+            log_error(
+                url,
+                str(exc),
+                "post_validation",
+            )
+
+            mark_processed(
+                url
+            )
+
+            return False
+
+        except PostValidationServiceError as exc:
+            print(
+                "[POST VALIDATION ERROR] "
+                f"{exc}"
+            )
+
+            log_error(
+                url,
+                str(exc),
+                "post_validation_service",
+            )
+
+            return False
 
         image = None
 
@@ -1356,8 +1891,28 @@ def process_news(
 
         return True
 
+    except PostRejected as exc:
+        print(
+            "[POST SKIPPED] "
+            f"{exc}"
+        )
+
+        log_error(
+            url,
+            str(exc),
+            "post_validation",
+        )
+
+        mark_processed(
+            url
+        )
+
+        return False
+
     except Exception as exc:
         message = str(exc)
+
+        stage = "processing"
 
         if (
             "CHAT_ID" in message
@@ -1376,17 +1931,22 @@ def process_news(
         ):
             stage = "gemini"
 
-        elif "image" in message.lower():
+        elif (
+            "image" in message.lower()
+        ):
             stage = "image"
+
+        elif (
+            "post" in message.lower()
+            or "language" in message.lower()
+        ):
+            stage = "post_validation"
 
         elif (
             "article" in message.lower()
             or "HTTP" in message
         ):
             stage = "article"
-
-        else:
-            stage = "processing"
 
         print(
             "[FATAL ITEM ERROR] "
@@ -1412,11 +1972,6 @@ def main():
     print("=" * 70)
 
     print(
-        f"[CONFIG] Donor: "
-        f"{SOURCE_URL}"
-    )
-
-    print(
         f"[CONFIG] Heavy articles limit: "
         f"{MAX_NEWS}"
     )
@@ -1436,7 +1991,17 @@ def main():
         "no image search fallback"
     )
 
+    print(
+        "[CONFIG] Post length: "
+        "400-600 characters; "
+        "3 paragraphs"
+    )
+
     print("=" * 70)
+
+    # -----------------------------------------------------
+    # DATABASE INITIALIZATION
+    # -----------------------------------------------------
 
     try:
         conn = get_db()
