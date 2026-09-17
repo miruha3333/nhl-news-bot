@@ -418,6 +418,9 @@ def get_db():
         "PRAGMA busy_timeout=30000"
     )
 
+    # ВАЖНО:
+    # миграция выполняется только один раз
+    # за весь запуск программы.
     if not DATABASE_READY:
         migrate_database(conn)
         DATABASE_READY = True
@@ -607,6 +610,8 @@ def log_error(
             "errors",
         )
 
+        # error_message existed in an older database schema and may be NOT NULL.
+        # Therefore, when the column exists, we ALWAYS write it.
         fields = []
         values = []
 
@@ -659,11 +664,11 @@ def log_error(
         conn.close()
 
     except Exception as logging_exc:
+        # Logging must never crash the bot after the original error.
         print(
             "[ERROR LOGGER FAILED] "
             f"{logging_exc}"
         )
-
         print(
             "[ORIGINAL ERROR] "
             f"{stage}: {message}"
@@ -686,10 +691,7 @@ def is_heavy_article_url(url):
     if not path.startswith("/sports/nhl/"):
         return False
 
-    if path in (
-        "/sports/nhl",
-        "/sports/nhl/",
-    ):
+    if path in ("/sports/nhl", "/sports/nhl/"):
         return False
 
     return True
@@ -703,18 +705,11 @@ def extract_listing_title(anchor):
         or ""
     )
 
-    return re.sub(
-        r"\s+",
-        " ",
-        title,
-    ).strip()
+    return re.sub(r"\s+", " ", title).strip()
 
 
 def load_news():
-    print(
-        f"[HEAVY] Loading source page: "
-        f"{SOURCE_URL}"
-    )
+    print(f"[HEAVY] Loading source page: {SOURCE_URL}")
 
     response = requests.get(
         SOURCE_URL,
@@ -726,83 +721,47 @@ def load_news():
         },
         timeout=30,
     )
-
     response.raise_for_status()
 
-    soup = BeautifulSoup(
-        response.text,
-        "html.parser",
-    )
-
+    soup = BeautifulSoup(response.text, "html.parser")
     result = []
     seen = set()
 
-    for anchor in soup.find_all(
-        "a",
-        href=True,
-    ):
-        url = normalize_url(
-            urljoin(
-                response.url,
-                anchor.get("href", ""),
-            )
-        )
+    for anchor in soup.find_all("a", href=True):
+        url = normalize_url(urljoin(response.url, anchor.get("href", "")))
 
-        if (
-            not is_heavy_article_url(url)
-            or url in seen
-        ):
+        if not is_heavy_article_url(url) or url in seen:
             continue
 
         title = extract_listing_title(anchor)
-
         if not title:
             continue
 
         seen.add(url)
-
-        result.append(
-            {
-                "url": url,
-                "title": title,
-                "source": "heavy.com",
-                "published": "",
-                "summary": "",
-            }
-        )
+        result.append({
+            "url": url,
+            "title": title,
+            "source": "heavy.com",
+            "published": "",
+            "summary": "",
+        })
 
         if len(result) >= MAX_NEWS:
             break
 
-    print(
-        f"[HEAVY] Articles found: "
-        f"{len(result)}"
-    )
+    print(f"[HEAVY] Articles found: {len(result)}")
 
-    for index, item in enumerate(
-        result,
-        1,
-    ):
-        print(
-            f"[HEAVY] {index}. "
-            f"{item['title']} | "
-            f"{item['url']}"
-        )
+    for index, item in enumerate(result, 1):
+        print(f"[HEAVY] {index}. {item['title']} | {item['url']}")
 
     return result
 
 
-# =========================================================
 # ARTICLE
 # =========================================================
 
-def normalize_image_url(
-    image_url,
-    page_url,
-):
-    image_url = (
-        image_url or ""
-    ).strip()
+def normalize_image_url(image_url, page_url):
+    image_url = (image_url or "").strip()
 
     if not image_url:
         return ""
@@ -812,43 +771,27 @@ def normalize_image_url(
         image_url,
     )
 
-    parsed = urlparse(
-        image_url
-    )
+    parsed = urlparse(image_url)
 
-    if parsed.scheme not in (
-        "http",
-        "https",
-    ):
+    if parsed.scheme not in ("http", "https"):
         return ""
 
     return image_url
 
 
-def extract_jsonld_images(
-    value,
-    page_url,
-):
+def extract_jsonld_images(value, page_url):
     images = []
 
-    if isinstance(
-        value,
-        str,
-    ):
+    if isinstance(value, str):
         normalized = normalize_image_url(
             value,
             page_url,
         )
 
         if normalized:
-            images.append(
-                normalized
-            )
+            images.append(normalized)
 
-    elif isinstance(
-        value,
-        list,
-    ):
+    elif isinstance(value, list):
         for item in value:
             images.extend(
                 extract_jsonld_images(
@@ -857,10 +800,7 @@ def extract_jsonld_images(
                 )
             )
 
-    elif isinstance(
-        value,
-        dict,
-    ):
+    elif isinstance(value, dict):
         for key in (
             "url",
             "contentUrl",
@@ -887,10 +827,7 @@ def extract_jsonld_images(
                     )
                 )
 
-        for item in value.get(
-            "@graph",
-            [],
-        ):
+        for item in value.get("@graph", []):
             images.extend(
                 extract_jsonld_images(
                     item,
@@ -901,10 +838,7 @@ def extract_jsonld_images(
     return images
 
 
-def extract_source_images(
-    soup,
-    page_url,
-):
+def extract_source_images(soup, page_url):
     candidates = []
 
     for meta in soup.find_all(
@@ -927,10 +861,7 @@ def extract_source_images(
 
             if image_url:
                 candidates.append(
-                    (
-                        image_url,
-                        "og:image",
-                    )
+                    (image_url, "og:image")
                 )
 
         elif prop in (
@@ -944,10 +875,7 @@ def extract_source_images(
 
             if image_url:
                 candidates.append(
-                    (
-                        image_url,
-                        "twitter:image",
-                    )
+                    (image_url, "twitter:image")
                 )
 
     for link in soup.find_all(
@@ -955,10 +883,7 @@ def extract_source_images(
     ):
         rel = [
             str(value).lower()
-            for value in link.get(
-                "rel",
-                [],
-            )
+            for value in link.get("rel", [])
         ]
 
         if "image_src" in rel:
@@ -969,23 +894,14 @@ def extract_source_images(
 
             if image_url:
                 candidates.append(
-                    (
-                        image_url,
-                        "link:image_src",
-                    )
+                    (image_url, "link:image_src")
                 )
 
     for script in soup.find_all(
         "script",
-        attrs={
-            "type":
-                "application/ld+json"
-        },
+        attrs={"type": "application/ld+json"},
     ):
-        raw = (
-            script.string
-            or script.get_text()
-        )
+        raw = script.string or script.get_text()
 
         if not raw.strip():
             continue
@@ -994,7 +910,6 @@ def extract_source_images(
             import json
 
             data = json.loads(raw)
-
         except Exception:
             continue
 
@@ -1003,10 +918,7 @@ def extract_source_images(
             page_url,
         ):
             candidates.append(
-                (
-                    image_url,
-                    "json-ld",
-                )
+                (image_url, "json-ld")
             )
 
     unique = []
@@ -1017,12 +929,8 @@ def extract_source_images(
             continue
 
         seen.add(image_url)
-
         unique.append(
-            (
-                image_url,
-                source,
-            )
+            (image_url, source)
         )
 
     return unique
@@ -1056,10 +964,11 @@ def fetch_article(
         response.url or url,
     )
 
-    print(
-        "[IMAGE] Source page image candidates: "
-        f"{len(source_images)}"
-    )
+    if source_images:
+        print(
+            "[IMAGE] Source page image candidates: "
+            f"{len(source_images)}"
+        )
 
     text_soup = BeautifulSoup(
         response.text,
@@ -1096,6 +1005,126 @@ def fetch_article(
     )
 
 
+def download_source_image(
+    image_url,
+    article_url,
+    image_source="unknown",
+):
+    """Download an image directly from the Heavy article page candidate."""
+    if not image_url:
+        return None
+
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0 Safari/537.36 NHLNewsBot/1.0",
+        "Referer": article_url,
+        "Accept":
+            "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8",
+    }
+
+    print(
+        "[IMAGE] Trying source image: "
+        f"{image_source} | {image_url}"
+    )
+
+    try:
+        response = requests.get(
+            image_url,
+            headers=headers,
+            timeout=SOURCE_IMAGE_DOWNLOAD_TIMEOUT,
+            allow_redirects=True,
+        )
+    except requests.exceptions.RequestException as exc:
+        print(
+            "[IMAGE] Download failed: "
+            f"{exc}"
+        )
+        return None
+
+    if response.status_code >= 400:
+        print(
+            "[IMAGE] Download failed: HTTP "
+            f"{response.status_code}"
+        )
+        return None
+
+    content = response.content
+
+    if len(content) < MIN_IMAGE_BYTES:
+        print(
+            "[IMAGE] Downloaded file is too small: "
+            f"{len(content)} bytes"
+        )
+        return None
+
+    content_type = (
+        response.headers.get("Content-Type", "")
+        .split(";", 1)[0]
+        .strip()
+        .lower()
+    )
+
+    # Some CDN responses omit Content-Type, so inspect common image signatures too.
+    if not content_type.startswith("image/"):
+        if content.startswith(b"\xff\xd8\xff"):
+            content_type = "image/jpeg"
+        elif content.startswith(b"\x89PNG\r\n\x1a\n"):
+            content_type = "image/png"
+        elif content.startswith((b"GIF87a", b"GIF89a")):
+            content_type = "image/gif"
+        elif content.startswith(b"RIFF") and content[8:12] == b"WEBP":
+            content_type = "image/webp"
+        else:
+            print(
+                "[IMAGE] Response is not an image: "
+                f"{content_type or 'unknown content type'}"
+            )
+            return None
+
+    extension_map = {
+        "image/jpeg": ".jpg",
+        "image/jpg": ".jpg",
+        "image/png": ".png",
+        "image/gif": ".gif",
+        "image/webp": ".webp",
+        "image/avif": ".avif",
+    }
+
+    extension = extension_map.get(content_type, ".img")
+
+    try:
+        temp_file = tempfile.NamedTemporaryFile(
+            prefix="nhl_source_image_",
+            suffix=extension,
+            delete=False,
+        )
+        temp_file.write(content)
+        temp_file.flush()
+        temp_file.close()
+    except OSError as exc:
+        print(
+            "[IMAGE] Could not save downloaded image: "
+            f"{exc}"
+        )
+        return None
+
+    image_path = temp_file.name
+
+    print(
+        "[IMAGE] Downloaded successfully: "
+        f"{len(content)} bytes | {content_type} | {image_path}"
+    )
+
+    save_image(
+        response.url or image_url,
+        used=1,
+    )
+
+    return image_path
+
+
 # =========================================================
 # GEMINI
 # =========================================================
@@ -1130,27 +1159,18 @@ def gemini_request(
     try:
         response = requests.post(
             url,
-            params={
-                "key": GEMINI_API_KEY
-            },
+            params={"key": GEMINI_API_KEY},
             json=payload,
-            timeout=(
-                10,
-                GEMINI_TIMEOUT,
-            ),
+            timeout=(10, GEMINI_TIMEOUT),
         )
-
     except requests.exceptions.ReadTimeout as exc:
         raise RuntimeError(
-            f"Gemini read timeout after "
-            f"{GEMINI_TIMEOUT}s"
+            f"Gemini read timeout after {GEMINI_TIMEOUT}s"
         ) from exc
-
     except requests.exceptions.ConnectTimeout as exc:
         raise RuntimeError(
             "Gemini connection timeout"
         ) from exc
-
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(
             f"Gemini network error: {exc}"
@@ -1165,44 +1185,26 @@ def gemini_request(
 
     try:
         data = response.json()
-
     except ValueError as exc:
         raise RuntimeError(
             "Gemini returned invalid JSON"
         ) from exc
 
-    candidates = data.get(
-        "candidates",
-        [],
-    )
+    candidates = data.get("candidates", [])
 
     if not candidates:
-        raise RuntimeError(
-            "Gemini returned no candidates"
-        )
+        raise RuntimeError("Gemini returned no candidates")
 
     parts = (
         candidates[0]
-        .get(
-            "content",
-            {},
-        )
-        .get(
-            "parts",
-            [],
-        )
+        .get("content", {})
+        .get("parts", [])
     )
 
     text = "".join(
-        part.get(
-            "text",
-            "",
-        )
+        part.get("text", "")
         for part in parts
-        if isinstance(
-            part,
-            dict,
-        )
+        if isinstance(part, dict)
     ).strip()
 
     if not text:
@@ -1210,7 +1212,6 @@ def gemini_request(
             "finishReason",
             "unknown",
         )
-
         raise RuntimeError(
             "Gemini returned an empty response; "
             f"finish reason: {finish_reason}"
@@ -1220,9 +1221,7 @@ def gemini_request(
 
 
 def clean_post(text):
-    text = (
-        text or ""
-    ).strip()
+    text = (text or "").strip()
 
     text = re.sub(
         r"^```(?:text)?\s*",
@@ -1267,92 +1266,52 @@ def contains_technical_content(text):
     )
 
     return any(
-        re.search(
-            pattern,
-            lowered,
-        )
+        re.search(pattern, lowered)
         for pattern in technical_patterns
     )
 
 
 def validate_post_content(text):
-    """
-    Only reject clear garbage, non-Russian or technical output.
-    """
-
+    """Only reject clear garbage, non-Russian or technical output."""
     text = clean_post(text)
 
     if not text:
-        raise PostRejected(
-            "Generated post is empty"
-        )
+        raise PostRejected("Generated post is empty")
 
     if len(text) < 40:
-        raise PostRejected(
-            "Generated post is too short to be a news digest"
-        )
+        raise PostRejected("Generated post is too short to be a news digest")
 
     if "\ufffd" in text:
-        raise PostRejected(
-            "Generated post contains a replacement character"
-        )
+        raise PostRejected("Generated post contains a replacement character")
 
-    if re.search(
-        r"(.)\1{7,}",
-        text,
-    ):
-        raise PostRejected(
-            "Generated post contains repeated garbage characters"
-        )
+    if re.search(r"(.)\1{7,}", text):
+        raise PostRejected("Generated post contains repeated garbage characters")
 
-    if contains_technical_content(
-        text
-    ):
-        raise PostRejected(
-            "Generated post contains technical information"
-        )
+    if contains_technical_content(text):
+        raise PostRejected("Generated post contains technical information")
 
-    letters = re.findall(
-        r"[A-Za-zА-Яа-яЁё]",
-        text,
-    )
-
-    cyrillic = re.findall(
-        r"[А-Яа-яЁё]",
-        text,
-    )
+    letters = re.findall(r"[A-Za-zА-Яа-яЁё]", text)
+    cyrillic = re.findall(r"[А-Яа-яЁё]", text)
 
     if not letters:
-        raise PostRejected(
-            "Generated post contains no normal words"
-        )
+        raise PostRejected("Generated post contains no normal words")
 
-    russian_ratio = (
-        len(cyrillic)
-        / len(letters)
-    )
+    russian_ratio = len(cyrillic) / len(letters)
 
     if russian_ratio < 0.45:
-        raise PostRejected(
-            "Generated post is not sufficiently Russian"
-        )
+        raise PostRejected("Generated post is not sufficiently Russian")
 
+    # Control characters are always invalid in a Telegram news post.
     if any(
-        ord(char) < 32
-        and char not in "\n\r\t"
+        ord(char) < 32 and char not in "\n\r\t"
         for char in text
     ):
-        raise PostRejected(
-            "Generated post contains control characters"
-        )
+        raise PostRejected("Generated post contains control characters")
 
     return text
 
 
-def generate_post_prompt(
-    title,
-    article,
-):
+def generate_post_prompt(title, article):
     return f"""
 Ты пишешь короткий пост для русскоязычного Telegram-канала о хоккейной новости.
 
@@ -1380,12 +1339,8 @@ def generate_post_prompt(
 """.strip()
 
 
-def is_gemini_temporary_error(
-    error,
-):
-    error_text = str(
-        error
-    ).lower()
+def is_gemini_temporary_error(error):
+    error_text = str(error).lower()
 
     return any(
         marker in error_text
@@ -1410,64 +1365,36 @@ def is_gemini_temporary_error(
     )
 
 
-def generate_post(
-    title,
-    article,
-):
+def generate_post(title, article):
     global GEMINI_PRIMARY_DISABLED
 
     if not GEMINI_API_KEY:
-        raise RuntimeError(
-            "GEMINI_API_KEY is not configured"
-        )
+        raise RuntimeError("GEMINI_API_KEY is not configured")
 
-    prompt = generate_post_prompt(
-        title,
-        article,
-    )
+    prompt = generate_post_prompt(title, article)
 
     models = []
 
     if not GEMINI_PRIMARY_DISABLED:
-        models.append(
-            (
-                GEMINI_PRIMARY_MODEL,
-                "PRIMARY",
-            )
-        )
+        models.append((GEMINI_PRIMARY_MODEL, "PRIMARY"))
 
-    models.append(
-        (
-            GEMINI_FALLBACK_MODEL,
-            "FALLBACK",
-        )
-    )
+    models.append((GEMINI_FALLBACK_MODEL, "FALLBACK"))
 
     last_error = None
 
     for model, label in models:
-        print(
-            f"[GEMINI {label}] Using {model}"
-        )
+        print(f"[GEMINI {label}] Using {model}")
 
         try:
-            result = gemini_request(
-                model,
-                prompt,
-            )
-
-            result = clean_post(
-                result
-            )
+            result = gemini_request(model, prompt)
+            result = clean_post(result)
 
             if result.upper() == "REJECT":
                 raise PostRejected(
                     "Gemini could not produce a relevant Russian news post"
                 )
 
-            return validate_post_content(
-                result
-            )
+            return validate_post_content(result)
 
         except PostRejected:
             raise
@@ -1476,24 +1403,15 @@ def generate_post(
             last_error = exc
 
             print(
-                f"[GEMINI {label} ERROR] "
-                f"{exc}"
+                f"[GEMINI {label} ERROR] {exc}"
             )
 
-            if (
-                label == "PRIMARY"
-                and is_gemini_temporary_error(
-                    exc
-                )
-            ):
+            if label == "PRIMARY" and is_gemini_temporary_error(exc):
                 GEMINI_PRIMARY_DISABLED = True
-
                 print(
-                    "[GEMINI] Primary disabled for "
-                    "the remainder of this run; "
+                    "[GEMINI] Primary disabled for the remainder of this run; "
                     "using fallback model."
                 )
-
                 continue
 
             if label == "PRIMARY":
@@ -1502,8 +1420,7 @@ def generate_post(
             break
 
     raise PostValidationServiceError(
-        "Gemini content generation service failed: "
-        f"{last_error}"
+        f"Gemini content generation service failed: {last_error}"
     )
 
 
@@ -1516,14 +1433,10 @@ def send_telegram(
     image_path=None,
 ):
     if not TELEGRAM_TOKEN:
-        raise RuntimeError(
-            "TOKEN is not configured"
-        )
+        raise RuntimeError("TOKEN is not configured")
 
     if not TELEGRAM_CHAT_ID:
-        raise RuntimeError(
-            "CHAT_ID is not configured"
-        )
+        raise RuntimeError("CHAT_ID is not configured")
 
     base_url = (
         "https://api.telegram.org/"
@@ -1531,34 +1444,22 @@ def send_telegram(
     )
 
     if image_path:
-        with open(
-            image_path,
-            "rb",
-        ) as image_file:
-
+        with open(image_path, "rb") as image_file:
             response = requests.post(
                 f"{base_url}/sendPhoto",
                 data={
-                    "chat_id":
-                        TELEGRAM_CHAT_ID,
-                    "caption":
-                        post,
+                    "chat_id": TELEGRAM_CHAT_ID,
+                    "caption": post,
                 },
-                files={
-                    "photo":
-                        image_file
-                },
+                files={"photo": image_file},
                 timeout=TELEGRAM_TIMEOUT,
             )
-
     else:
         response = requests.post(
             f"{base_url}/sendMessage",
             data={
-                "chat_id":
-                    TELEGRAM_CHAT_ID,
-                "text":
-                    post,
+                "chat_id": TELEGRAM_CHAT_ID,
+                "text": post,
             },
             timeout=TELEGRAM_TIMEOUT,
         )
@@ -1571,19 +1472,12 @@ def send_telegram(
         )
 
 
-# =========================================================
-# PROCESS NEWS
-# =========================================================
-
 def process_news(
     item,
     index,
     total,
 ):
-    print(
-        f"[BOT] Processing "
-        f"{index}/{total}"
-    )
+    print(f"[BOT] Processing {index}/{total}")
 
     url = item["url"]
 
@@ -1592,10 +1486,7 @@ def process_news(
 
         article, source_images = fetch_article(
             url,
-            item.get(
-                "summary",
-                "",
-            ),
+            item.get("summary", ""),
         )
 
         post = generate_post(
@@ -1627,17 +1518,11 @@ def process_news(
 
         mark_processed(url)
 
-        print(
-            "[BOT] Published successfully"
-        )
-
+        print("[BOT] Published successfully")
         return True
 
     except PostRejected as exc:
-        print(
-            "[POST SKIPPED] "
-            f"{exc}"
-        )
+        print(f"[POST SKIPPED] {exc}")
 
         log_error(
             url,
@@ -1645,16 +1530,12 @@ def process_news(
             "post_rejected",
         )
 
-        # A real content rejection is permanent.
+        # A real content rejection is permanent: do not retry it forever.
         mark_processed(url)
-
         return False
 
     except PostValidationServiceError as exc:
-        print(
-            "[POST VALIDATION ERROR] "
-            f"{exc}"
-        )
+        print(f"[POST VALIDATION ERROR] {exc}")
 
         log_error(
             url,
@@ -1662,8 +1543,7 @@ def process_news(
             "gemini_service",
         )
 
-        # Service failures remain unprocessed
-        # and will be retried later.
+        # Service failures remain unprocessed and will be retried later.
         return False
 
     except Exception as exc:
@@ -1671,38 +1551,20 @@ def process_news(
 
         stage = "processing"
 
-        if (
-            "CHAT_ID" in message
-            or "Telegram" in message
-        ):
+        if "CHAT_ID" in message or "Telegram" in message:
             stage = "telegram"
+            print(f"[TELEGRAM ERROR] {message}")
 
-            print(
-                "[TELEGRAM ERROR] "
-                f"{message}"
-            )
-
-        elif (
-            "Gemini" in message
-            or "GEMINI" in message
-        ):
+        elif "Gemini" in message or "GEMINI" in message:
             stage = "gemini"
 
-        elif (
-            "image" in message.lower()
-        ):
+        elif "image" in message.lower():
             stage = "image"
 
-        elif (
-            "article" in message.lower()
-            or "HTTP" in message
-        ):
+        elif "article" in message.lower() or "HTTP" in message:
             stage = "article"
 
-        print(
-            "[FATAL ITEM ERROR] "
-            f"{message}"
-        )
+        print(f"[FATAL ITEM ERROR] {message}")
 
         log_error(
             url,
@@ -1723,154 +1585,64 @@ def main():
     print("NHL NEWS BOT START")
     print("=" * 70)
 
-    print(
-        f"[CONFIG] Heavy articles limit: "
-        f"{MAX_NEWS}"
-    )
-
-    print(
-        f"[CONFIG] Gemini primary: "
-        f"{GEMINI_PRIMARY_MODEL}"
-    )
-
-    print(
-        f"[CONFIG] Gemini fallback: "
-        f"{GEMINI_FALLBACK_MODEL}"
-    )
-
-    print(
-        "[CONFIG] Images: article page only; "
-        "no image search fallback"
-    )
-
-    print(
-        "[CONFIG] Gemini validation: "
-        "generation + local content checks"
-    )
-
+    print(f"[CONFIG] Heavy articles limit: {MAX_NEWS}")
+    print(f"[CONFIG] Gemini primary: {GEMINI_PRIMARY_MODEL}")
+    print(f"[CONFIG] Gemini fallback: {GEMINI_FALLBACK_MODEL}")
+    print("[CONFIG] Images: article page only; no image search fallback")
+    print("[CONFIG] Gemini validation: generation + local content checks")
     print("=" * 70)
-
-    # -----------------------------------------------------
-    # DATABASE INITIALIZATION
-    # -----------------------------------------------------
 
     try:
         conn = get_db()
         conn.close()
-
     except Exception as exc:
-        print(
-            "[DATABASE ERROR] "
-            f"{exc}"
-        )
-
-        log_error(
-            "",
-            str(exc),
-            "database",
-        )
-
+        print(f"[DATABASE ERROR] {exc}")
+        log_error("", str(exc), "database")
         return
-
-    # -----------------------------------------------------
-    # HEAVY
-    # -----------------------------------------------------
 
     try:
         items = load_news()
-
-        print(
-            "[HEAVY] Source loaded successfully"
-        )
-
+        print("[HEAVY] Source loaded successfully")
     except Exception as exc:
-        print(
-            "[HEAVY ERROR] "
-            f"{exc}"
-        )
-
-        log_error(
-            SOURCE_URL,
-            str(exc),
-            "source",
-        )
-
+        print(f"[HEAVY ERROR] {exc}")
+        log_error(SOURCE_URL, str(exc), "source")
         return
-
-    # -----------------------------------------------------
-    # NEW NEWS
-    # -----------------------------------------------------
 
     new_items = [
         item
         for item in items
-        if not is_processed(
-            item["url"]
-        )
+        if not is_processed(item["url"])
     ]
 
-    print(
-        f"[HEAVY] New articles: "
-        f"{len(new_items)}"
-    )
+    print(f"[HEAVY] New articles: {len(new_items)}")
 
     if not new_items:
-        print(
-            "[BOT] No new articles. "
-            "Nothing to publish."
-        )
-
-        print(
-            "[BOT] Run completed successfully "
-            "with no new articles."
-        )
-
+        print("[BOT] No new articles. Nothing to publish.")
+        print("[BOT] Run completed successfully with no new articles.")
         print("=" * 70)
         print("NHL NEWS BOT FINISHED")
         print("Published: 0")
         print("Failed: 0")
         print("=" * 70)
-
         return
-
-    # -----------------------------------------------------
-    # PROCESS
-    # -----------------------------------------------------
 
     published = 0
     failed = 0
 
-    for index, item in enumerate(
-        new_items,
-        1,
-    ):
+    for index, item in enumerate(new_items, 1):
         if process_news(
             item,
             index,
             len(new_items),
         ):
             published += 1
-
         else:
             failed += 1
 
-    # -----------------------------------------------------
-    # FINISH
-    # -----------------------------------------------------
-
     print("=" * 70)
     print("NHL NEWS BOT FINISHED")
-
-    print(
-        f"Published: "
-        f"{published}"
-    )
-
-    print(
-        f"Failed: "
-        f"{failed}"
-    )
-
+    print(f"Published: {published}")
+    print(f"Failed: {failed}")
     print("=" * 70)
 
 
