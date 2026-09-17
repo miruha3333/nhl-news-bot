@@ -418,9 +418,6 @@ def get_db():
         "PRAGMA busy_timeout=30000"
     )
 
-    # ВАЖНО:
-    # миграция выполняется только один раз
-    # за весь запуск программы.
     if not DATABASE_READY:
         migrate_database(conn)
         DATABASE_READY = True
@@ -610,8 +607,6 @@ def log_error(
             "errors",
         )
 
-        # error_message existed in an older database schema and may be NOT NULL.
-        # Therefore, when the column exists, we ALWAYS write it.
         fields = []
         values = []
 
@@ -664,11 +659,11 @@ def log_error(
         conn.close()
 
     except Exception as logging_exc:
-        # Logging must never crash the bot after the original error.
         print(
             "[ERROR LOGGER FAILED] "
             f"{logging_exc}"
         )
+
         print(
             "[ORIGINAL ERROR] "
             f"{stage}: {message}"
@@ -691,7 +686,10 @@ def is_heavy_article_url(url):
     if not path.startswith("/sports/nhl/"):
         return False
 
-    if path in ("/sports/nhl", "/sports/nhl/"):
+    if path in (
+        "/sports/nhl",
+        "/sports/nhl/",
+    ):
         return False
 
     return True
@@ -705,11 +703,18 @@ def extract_listing_title(anchor):
         or ""
     )
 
-    return re.sub(r"\s+", " ", title).strip()
+    return re.sub(
+        r"\s+",
+        " ",
+        title,
+    ).strip()
 
 
 def load_news():
-    print(f"[HEAVY] Loading source page: {SOURCE_URL}")
+    print(
+        f"[HEAVY] Loading source page: "
+        f"{SOURCE_URL}"
+    )
 
     response = requests.get(
         SOURCE_URL,
@@ -721,47 +726,83 @@ def load_news():
         },
         timeout=30,
     )
+
     response.raise_for_status()
 
-    soup = BeautifulSoup(response.text, "html.parser")
+    soup = BeautifulSoup(
+        response.text,
+        "html.parser",
+    )
+
     result = []
     seen = set()
 
-    for anchor in soup.find_all("a", href=True):
-        url = normalize_url(urljoin(response.url, anchor.get("href", "")))
+    for anchor in soup.find_all(
+        "a",
+        href=True,
+    ):
+        url = normalize_url(
+            urljoin(
+                response.url,
+                anchor.get("href", ""),
+            )
+        )
 
-        if not is_heavy_article_url(url) or url in seen:
+        if (
+            not is_heavy_article_url(url)
+            or url in seen
+        ):
             continue
 
         title = extract_listing_title(anchor)
+
         if not title:
             continue
 
         seen.add(url)
-        result.append({
-            "url": url,
-            "title": title,
-            "source": "heavy.com",
-            "published": "",
-            "summary": "",
-        })
+
+        result.append(
+            {
+                "url": url,
+                "title": title,
+                "source": "heavy.com",
+                "published": "",
+                "summary": "",
+            }
+        )
 
         if len(result) >= MAX_NEWS:
             break
 
-    print(f"[HEAVY] Articles found: {len(result)}")
+    print(
+        f"[HEAVY] Articles found: "
+        f"{len(result)}"
+    )
 
-    for index, item in enumerate(result, 1):
-        print(f"[HEAVY] {index}. {item['title']} | {item['url']}")
+    for index, item in enumerate(
+        result,
+        1,
+    ):
+        print(
+            f"[HEAVY] {index}. "
+            f"{item['title']} | "
+            f"{item['url']}"
+        )
 
     return result
 
 
+# =========================================================
 # ARTICLE
 # =========================================================
 
-def normalize_image_url(image_url, page_url):
-    image_url = (image_url or "").strip()
+def normalize_image_url(
+    image_url,
+    page_url,
+):
+    image_url = (
+        image_url or ""
+    ).strip()
 
     if not image_url:
         return ""
@@ -771,27 +812,43 @@ def normalize_image_url(image_url, page_url):
         image_url,
     )
 
-    parsed = urlparse(image_url)
+    parsed = urlparse(
+        image_url
+    )
 
-    if parsed.scheme not in ("http", "https"):
+    if parsed.scheme not in (
+        "http",
+        "https",
+    ):
         return ""
 
     return image_url
 
 
-def extract_jsonld_images(value, page_url):
+def extract_jsonld_images(
+    value,
+    page_url,
+):
     images = []
 
-    if isinstance(value, str):
+    if isinstance(
+        value,
+        str,
+    ):
         normalized = normalize_image_url(
             value,
             page_url,
         )
 
         if normalized:
-            images.append(normalized)
+            images.append(
+                normalized
+            )
 
-    elif isinstance(value, list):
+    elif isinstance(
+        value,
+        list,
+    ):
         for item in value:
             images.extend(
                 extract_jsonld_images(
@@ -800,7 +857,10 @@ def extract_jsonld_images(value, page_url):
                 )
             )
 
-    elif isinstance(value, dict):
+    elif isinstance(
+        value,
+        dict,
+    ):
         for key in (
             "url",
             "contentUrl",
@@ -827,7 +887,10 @@ def extract_jsonld_images(value, page_url):
                     )
                 )
 
-        for item in value.get("@graph", []):
+        for item in value.get(
+            "@graph",
+            [],
+        ):
             images.extend(
                 extract_jsonld_images(
                     item,
@@ -838,7 +901,10 @@ def extract_jsonld_images(value, page_url):
     return images
 
 
-def extract_source_images(soup, page_url):
+def extract_source_images(
+    soup,
+    page_url,
+):
     candidates = []
 
     for meta in soup.find_all(
@@ -861,7 +927,10 @@ def extract_source_images(soup, page_url):
 
             if image_url:
                 candidates.append(
-                    (image_url, "og:image")
+                    (
+                        image_url,
+                        "og:image",
+                    )
                 )
 
         elif prop in (
@@ -875,7 +944,10 @@ def extract_source_images(soup, page_url):
 
             if image_url:
                 candidates.append(
-                    (image_url, "twitter:image")
+                    (
+                        image_url,
+                        "twitter:image",
+                    )
                 )
 
     for link in soup.find_all(
@@ -883,7 +955,10 @@ def extract_source_images(soup, page_url):
     ):
         rel = [
             str(value).lower()
-            for value in link.get("rel", [])
+            for value in link.get(
+                "rel",
+                [],
+            )
         ]
 
         if "image_src" in rel:
@@ -894,14 +969,23 @@ def extract_source_images(soup, page_url):
 
             if image_url:
                 candidates.append(
-                    (image_url, "link:image_src")
+                    (
+                        image_url,
+                        "link:image_src",
+                    )
                 )
 
     for script in soup.find_all(
         "script",
-        attrs={"type": "application/ld+json"},
+        attrs={
+            "type":
+                "application/ld+json"
+        },
     ):
-        raw = script.string or script.get_text()
+        raw = (
+            script.string
+            or script.get_text()
+        )
 
         if not raw.strip():
             continue
@@ -910,6 +994,7 @@ def extract_source_images(soup, page_url):
             import json
 
             data = json.loads(raw)
+
         except Exception:
             continue
 
@@ -918,7 +1003,10 @@ def extract_source_images(soup, page_url):
             page_url,
         ):
             candidates.append(
-                (image_url, "json-ld")
+                (
+                    image_url,
+                    "json-ld",
+                )
             )
 
     unique = []
@@ -929,8 +1017,12 @@ def extract_source_images(soup, page_url):
             continue
 
         seen.add(image_url)
+
         unique.append(
-            (image_url, source)
+            (
+                image_url,
+                source,
+            )
         )
 
     return unique
@@ -964,11 +1056,10 @@ def fetch_article(
         response.url or url,
     )
 
-    if source_images:
-        print(
-            "[IMAGE] Source page image candidates: "
-            f"{len(source_images)}"
-        )
+    print(
+        "[IMAGE] Source page image candidates: "
+        f"{len(source_images)}"
+    )
 
     text_soup = BeautifulSoup(
         response.text,
@@ -1029,7 +1120,7 @@ def gemini_request(
             }
         ],
         "generationConfig": {
-            "maxOutputTokens": 1400,
+            "maxOutputTokens": 1000,
             "thinkingConfig": {
                 "thinkingLevel": "minimal"
             },
@@ -1043,16 +1134,23 @@ def gemini_request(
                 "key": GEMINI_API_KEY
             },
             json=payload,
-            timeout=(10, GEMINI_TIMEOUT),
+            timeout=(
+                10,
+                GEMINI_TIMEOUT,
+            ),
         )
+
     except requests.exceptions.ReadTimeout as exc:
         raise RuntimeError(
-            f"Gemini read timeout after {GEMINI_TIMEOUT}s"
+            f"Gemini read timeout after "
+            f"{GEMINI_TIMEOUT}s"
         ) from exc
+
     except requests.exceptions.ConnectTimeout as exc:
         raise RuntimeError(
             "Gemini connection timeout"
         ) from exc
+
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(
             f"Gemini network error: {exc}"
@@ -1067,6 +1165,7 @@ def gemini_request(
 
     try:
         data = response.json()
+
     except ValueError as exc:
         raise RuntimeError(
             "Gemini returned invalid JSON"
@@ -1084,14 +1183,26 @@ def gemini_request(
 
     parts = (
         candidates[0]
-        .get("content", {})
-        .get("parts", [])
+        .get(
+            "content",
+            {},
+        )
+        .get(
+            "parts",
+            [],
+        )
     )
 
     text = "".join(
-        part.get("text", "")
+        part.get(
+            "text",
+            "",
+        )
         for part in parts
-        if isinstance(part, dict)
+        if isinstance(
+            part,
+            dict,
+        )
     ).strip()
 
     if not text:
@@ -1099,6 +1210,7 @@ def gemini_request(
             "finishReason",
             "unknown",
         )
+
         raise RuntimeError(
             "Gemini returned an empty response; "
             f"finish reason: {finish_reason}"
@@ -1108,7 +1220,9 @@ def gemini_request(
 
 
 def clean_post(text):
-    text = text.strip()
+    text = (
+        text or ""
+    ).strip()
 
     text = re.sub(
         r"^```(?:text)?\s*",
@@ -1133,67 +1247,167 @@ def clean_post(text):
     return text.strip()
 
 
-def validate_post_structure(text):
-    """Deterministic checks for the Telegram post format."""
+def contains_technical_content(text):
+    lowered = text.lower()
+
+    technical_patterns = (
+        r"```",
+        r"\{\s*[\"']",
+        r"[\"']?(api|json|http|https|endpoint|request|response|prompt|system message|system prompt)\b",
+        r"stack\s*trace",
+        r"traceback",
+        r"generationconfig",
+        r"quota\s*(exceeded|failure)",
+        r"resource_exhausted",
+        r"rate\s*limit",
+        r"internal server error",
+        r"validation service",
+        r"gemini\s+http\s+\d{3}",
+        r"error\s*code\s*[:=]\s*\d{3}",
+    )
+
+    return any(
+        re.search(
+            pattern,
+            lowered,
+        )
+        for pattern in technical_patterns
+    )
+
+
+def validate_post_content(text):
+    """
+    Only reject clear garbage, non-Russian or technical output.
+    """
+
     text = clean_post(text)
-    length = len(text)
 
-    # Length is intentionally not a hard limit. The model should make
-    # a concise digest, but longer posts are allowed when needed to
-    # preserve important facts and context.
-
-    paragraphs = [
-        paragraph.strip()
-        for paragraph in re.split(r"\n\s*\n", text)
-        if paragraph.strip()
-    ]
-
-    if len(paragraphs) != 3:
+    if not text:
         raise PostRejected(
-            f"Post must contain exactly 3 paragraphs; found {len(paragraphs)}"
+            "Generated post is empty"
         )
 
-    if "«" in text or "»" in text:
+    if len(text) < 40:
         raise PostRejected(
-            "Post contains Russian quotation marks"
+            "Generated post is too short to be a news digest"
         )
 
-    if text.startswith("-") or text.startswith("•"):
+    if "\ufffd" in text:
         raise PostRejected(
-            "Post looks like a list instead of a normal Telegram post"
+            "Generated post contains a replacement character"
+        )
+
+    if re.search(
+        r"(.)\1{7,}",
+        text,
+    ):
+        raise PostRejected(
+            "Generated post contains repeated garbage characters"
+        )
+
+    if contains_technical_content(
+        text
+    ):
+        raise PostRejected(
+            "Generated post contains technical information"
+        )
+
+    letters = re.findall(
+        r"[A-Za-zА-Яа-яЁё]",
+        text,
+    )
+
+    cyrillic = re.findall(
+        r"[А-Яа-яЁё]",
+        text,
+    )
+
+    if not letters:
+        raise PostRejected(
+            "Generated post contains no normal words"
+        )
+
+    russian_ratio = (
+        len(cyrillic)
+        / len(letters)
+    )
+
+    if russian_ratio < 0.45:
+        raise PostRejected(
+            "Generated post is not sufficiently Russian"
+        )
+
+    if any(
+        ord(char) < 32
+        and char not in "\n\r\t"
+        for char in text
+    ):
+        raise PostRejected(
+            "Generated post contains control characters"
         )
 
     return text
 
 
-def generate_post_prompt(title, article):
+def generate_post_prompt(
+    title,
+    article,
+):
     return f"""
-Ты пишешь короткий пост для русскоязычного Telegram-канала про NHL.
+Ты пишешь короткий пост для русскоязычного Telegram-канала о хоккейной новости.
 
-Твоя задача — сделать точную и грамотную выжимку самого важного из материала.
+Сделай естественную русскую выжимку самого важного из исходного материала.
 
-ЖЁСТКИЕ ТРЕБОВАНИЯ:
-1. Сделай компактную выжимку самого важного. Жёсткого ограничения по количеству символов нет: если для точной передачи ключевых фактов нужно больше текста, это допустимо. Но не растягивай пост без необходимости.
-2. Сделай ровно 3 органичных абзаца.
-3. Абзацы должны быть естественными по длине, без искусственного выравнивания.
-5. Сохрани главное событие, ключевые детали, цифры, имена и последствия, если они есть в материале.
-6. Не добавляй ни одного факта, которого нет в исходном материале.
-7. Не выдумывай цитаты и не меняй смысл существующих цитат.
-8. Не переводи дословно. Пиши естественно по-русски, как живой автор Telegram-канала.
-9. Не начинай с шаблонных фраз вроде «Стало известно», «Похоже, что», «Вот это поворот».
-10. Названия хоккейных команд пиши без кавычек. Не используй «» вокруг названий команд.
-11. Не используй списки, подзаголовки, эмодзи и служебные пометки.
-12. Перед отправкой обязательно проверь русский язык: орфографию, пунктуацию, грамматику, согласование, падежи и естественность формулировок.
-13. Если в исходнике есть сомнительная или противоречивая информация, не додумывай её. Передай только то, что прямо подтверждается материалом.
+Правила:
+- пиши только на русском языке;
+- передавай только информацию из исходного материала;
+- не добавляй факты от себя;
+- пост должен относиться именно к этой новости;
+- убирай второстепенные детали;
+- не растягивай текст без необходимости;
+- не используй служебные пометки, код, JSON, API-ответы, промпты или другую техническую информацию;
+- не используй списки и подзаголовки;
+- названия команд пиши без кавычек;
+- не добавляй эмодзи;
+- если исходный материал невозможно нормально превратить в русскую новостную выжимку, верни ровно REJECT;
+- если материал нормальный, верни только готовый текст поста.
 
 Заголовок статьи:
 {title}
 
 Материал статьи:
 {article}
-
-Верни только готовый текст поста. Никаких пояснений.
 """.strip()
+
+
+def is_gemini_temporary_error(
+    error,
+):
+    error_text = str(
+        error
+    ).lower()
+
+    return any(
+        marker in error_text
+        for marker in (
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "quota",
+            "high demand",
+            "unavailable",
+            "resource_exhausted",
+            "rate limit",
+            "timeout",
+            "timed out",
+            "network error",
+            "connection timeout",
+            "404",
+            "not found",
+        )
+    )
 
 
 def generate_post(
@@ -1212,289 +1426,84 @@ def generate_post(
         article,
     )
 
-    def repair_prompt(previous_post):
-        return f"""
-Твой предыдущий вариант поста не прошёл техническую проверку.
+    models = []
 
-Исправь ЕГО, а не пиши новый материал с нуля. Сохрани все важные факты, имена, цифры и смысл.
+    if not GEMINI_PRIMARY_DISABLED:
+        models.append(
+            (
+                GEMINI_PRIMARY_MODEL,
+                "PRIMARY",
+            )
+        )
 
-ЖЁСТКИЕ ОГРАНИЧЕНИЯ:
-- сделай компактную выжимку без жёсткого ограничения по количеству символов;
-- ровно 3 абзаца;
-- абзацы должны быть естественными по длине;
-- без кавычек «»;
-- без списков, заголовков, эмодзи и пояснений;
-- только русский текст поста;
-- не добавляй факты, которых нет в исходнике;
-- не растягивай текст: убирай второстепенные детали;
-- проверь орфографию, пунктуацию и грамматику.
+    models.append(
+        (
+            GEMINI_FALLBACK_MODEL,
+            "FALLBACK",
+        )
+    )
 
-Заголовок:
-{title}
+    last_error = None
 
-Исходный материал:
-{article}
-
-Предыдущий вариант:
-{previous_post}
-
-Верни только исправленный пост.
-""".strip()
-
-    def generate_with_model(model, label, request_prompt):
+    for model, label in models:
         print(
             f"[GEMINI {label}] Using {model}"
         )
 
-        result = gemini_request(
-            model,
-            request_prompt,
-        )
-
-        time.sleep(
-            GEMINI_DELAY
-        )
-
-        return result
-
-    # -----------------------------------------------------
-    # PRIMARY MODEL
-    # -----------------------------------------------------
-
-    if not GEMINI_PRIMARY_DISABLED:
         try:
-            result = generate_with_model(
-                GEMINI_PRIMARY_MODEL,
-                "PRIMARY",
+            result = gemini_request(
+                model,
                 prompt,
             )
 
-            try:
-                return validate_post_structure(
-                    result
-                )
-
-            except PostRejected as exc:
-                print(
-                    "[POST FORMAT ERROR] "
-                    f"{exc}"
-                )
-
-                repaired = generate_with_model(
-                    GEMINI_PRIMARY_MODEL,
-                    "PRIMARY REPAIR",
-                    repair_prompt(
-                        clean_post(result)
-                    ),
-                )
-
-                return validate_post_structure(
-                    repaired
-                )
-
-        except PostRejected as exc:
-            print(
-                "[POST REPAIR FAILED] "
-                f"{exc}"
-            )
-            raise
-
-        except Exception as exc:
-            print(
-                "[GEMINI PRIMARY ERROR] "
-                f"{exc}"
-            )
-
-            error_text = str(exc).lower()
-
-            disable_primary = any(
-                marker in error_text
-                for marker in (
-                    "http 429",
-                    "http 500",
-                    "http 502",
-                    "http 503",
-                    "http 504",
-                    "quota",
-                    "high demand",
-                    "unavailable",
-                    "resource_exhausted",
-                    "rate limit",
-                    "timeout",
-                    "timed out",
-                    "network error",
-                    "connection timeout",
-                )
-            )
-
-            if disable_primary:
-                GEMINI_PRIMARY_DISABLED = True
-                print(
-                    "[GEMINI] Primary disabled for the remainder "
-                    "of this run; using fallback model."
-                )
-
-            elif (
-                "404" in error_text
-                or "not found" in error_text
-            ):
-                GEMINI_PRIMARY_DISABLED = True
-                print(
-                    "[GEMINI] Primary model unavailable; "
-                    "using fallback model."
-                )
-
-            else:
-                raise
-
-    # -----------------------------------------------------
-    # FALLBACK MODEL
-    # -----------------------------------------------------
-
-    try:
-        result = generate_with_model(
-            GEMINI_FALLBACK_MODEL,
-            "FALLBACK",
-            prompt,
-        )
-
-        try:
-            return validate_post_structure(
+            result = clean_post(
                 result
             )
 
-        except PostRejected as exc:
-            print(
-                "[POST FORMAT ERROR] Fallback output failed: "
-                f"{exc}"
+            if result.upper() == "REJECT":
+                raise PostRejected(
+                    "Gemini could not produce a relevant Russian news post"
+                )
+
+            return validate_post_content(
+                result
             )
 
-            repaired = generate_with_model(
-                GEMINI_FALLBACK_MODEL,
-                "FALLBACK REPAIR",
-                repair_prompt(
-                    clean_post(result)
-                ),
-            )
+        except PostRejected:
+            raise
 
-            return validate_post_structure(
-                repaired
-            )
-
-    except PostRejected as exc:
-        print(
-            "[POST REPAIR FAILED] Fallback: "
-            f"{exc}"
-        )
-        raise
-
-
-def check_post_language(post):
-    """Final content gate. Only clear publication-blocking problems are checked."""
-    prompt = f"""
-Проверь готовый пост перед публикацией. Это пост русскоязычного Telegram-канала о хоккейной новости.
-
-Отклоняй пост ТОЛЬКО если есть хотя бы одна из этих проблем:
-1. Абракадабра, бессмысленный или явно повреждённый текст.
-2. Странные, случайные или явно технические символы/фрагменты, которые не должны быть в обычном посте.
-3. Пост написан не на русском языке или большая его часть не на русском языке.
-4. Пост не относится к исходной хоккейной новости или не передаёт её содержание.
-5. В пост попала техническая информация: системные сообщения, ошибки API, промпты, служебные инструкции, код, JSON и тому подобное.
-
-НЕ отклоняй пост за:
-- стиль или авторскую манеру;
-- разговорные формулировки;
-- длину;
-- структуру;
-- отсутствие идеальной пунктуации;
-- спорный, но допустимый перевод хоккейных терминов;
-- факт, который нельзя проверить только по самому посту.
-
-Если пост нормальный и пригоден для публикации, ответь ровно:
-OK
-
-Если есть явная причина из пяти пунктов выше, ответь ровно:
-REJECT
-
-Если не уверен — ответь OK.
-
-Исходная новость:
-{post}
-""".strip()
-
-    global GEMINI_PRIMARY_DISABLED
-
-    result = None
-
-    if not GEMINI_PRIMARY_DISABLED:
-        try:
-            result = gemini_request(
-                GEMINI_PRIMARY_MODEL,
-                prompt,
-            )
         except Exception as exc:
+            last_error = exc
+
             print(
-                "[GEMINI CONTENT PRIMARY ERROR] "
+                f"[GEMINI {label} ERROR] "
                 f"{exc}"
             )
 
-            error_text = str(exc).lower()
-
-            if any(
-                marker in error_text
-                for marker in (
-                    "http 429",
-                    "http 500",
-                    "http 502",
-                    "http 503",
-                    "http 504",
-                    "quota",
-                    "high demand",
-                    "unavailable",
-                    "resource_exhausted",
-                    "rate limit",
-                    "timeout",
-                    "timed out",
-                    "network error",
-                    "connection timeout",
-                    "404",
-                    "not found",
+            if (
+                label == "PRIMARY"
+                and is_gemini_temporary_error(
+                    exc
                 )
             ):
                 GEMINI_PRIMARY_DISABLED = True
 
-    if result is None:
-        print(
-            "[GEMINI CONTENT FALLBACK] Using "
-            f"{GEMINI_FALLBACK_MODEL}"
-        )
+                print(
+                    "[GEMINI] Primary disabled for "
+                    "the remainder of this run; "
+                    "using fallback model."
+                )
 
-        try:
-            result = gemini_request(
-                GEMINI_FALLBACK_MODEL,
-                prompt,
-            )
-        except Exception as exc:
-            raise PostValidationServiceError(
-                f"Content validation service failed: {exc}"
-            ) from exc
+                continue
 
-    answer = clean_post(result).upper()
+            if label == "PRIMARY":
+                continue
 
-    if answer == "OK":
-        print(
-            "[POST VALIDATION] Content check: OK"
-        )
-        return
-
-    if answer == "REJECT":
-        raise PostRejected(
-            "Gemini content validation rejected the post"
-        )
+            break
 
     raise PostValidationServiceError(
-        "Content validator returned ambiguous result: "
-        f"{clean_post(result)[:200]}"
+        "Gemini content generation service failed: "
+        f"{last_error}"
     )
 
 
@@ -1594,37 +1603,6 @@ def process_news(
             article,
         )
 
-        try:
-            check_post_language(post)
-        except PostRejected as exc:
-            print(
-                "[POST SKIPPED] Validation failed: "
-                f"{exc}"
-            )
-
-            log_error(
-                url,
-                str(exc),
-                "post_validation",
-            )
-
-            mark_processed(url)
-            return False
-
-        except PostValidationServiceError as exc:
-            print(
-                "[POST VALIDATION ERROR] "
-                f"{exc}"
-            )
-
-            log_error(
-                url,
-                str(exc),
-                "post_validation_service",
-            )
-
-            return False
-
         image = None
 
         for source_image_url, image_source in source_images:
@@ -1647,15 +1625,46 @@ def process_news(
             image,
         )
 
-        mark_processed(
-            url
-        )
+        mark_processed(url)
 
         print(
             "[BOT] Published successfully"
         )
 
         return True
+
+    except PostRejected as exc:
+        print(
+            "[POST SKIPPED] "
+            f"{exc}"
+        )
+
+        log_error(
+            url,
+            str(exc),
+            "post_rejected",
+        )
+
+        # A real content rejection is permanent.
+        mark_processed(url)
+
+        return False
+
+    except PostValidationServiceError as exc:
+        print(
+            "[POST VALIDATION ERROR] "
+            f"{exc}"
+        )
+
+        log_error(
+            url,
+            str(exc),
+            "gemini_service",
+        )
+
+        # Service failures remain unprocessed
+        # and will be retried later.
+        return False
 
     except Exception as exc:
         message = str(exc)
@@ -1685,12 +1694,6 @@ def process_news(
             stage = "image"
 
         elif (
-            "post" in message.lower()
-            or "language" in message.lower()
-        ):
-            stage = "post_validation"
-
-        elif (
             "article" in message.lower()
             or "HTTP" in message
         ):
@@ -1707,6 +1710,7 @@ def process_news(
             stage,
         )
 
+        # Unexpected technical failures also remain retryable.
         return False
 
 
@@ -1735,7 +1739,13 @@ def main():
     )
 
     print(
-        "[CONFIG] Images: article page only; no image search fallback"
+        "[CONFIG] Images: article page only; "
+        "no image search fallback"
+    )
+
+    print(
+        "[CONFIG] Gemini validation: "
+        "generation + local content checks"
     )
 
     print("=" * 70)
@@ -1769,6 +1779,10 @@ def main():
     try:
         items = load_news()
 
+        print(
+            "[HEAVY] Source loaded successfully"
+        )
+
     except Exception as exc:
         print(
             "[HEAVY ERROR] "
@@ -1800,6 +1814,25 @@ def main():
         f"{len(new_items)}"
     )
 
+    if not new_items:
+        print(
+            "[BOT] No new articles. "
+            "Nothing to publish."
+        )
+
+        print(
+            "[BOT] Run completed successfully "
+            "with no new articles."
+        )
+
+        print("=" * 70)
+        print("NHL NEWS BOT FINISHED")
+        print("Published: 0")
+        print("Failed: 0")
+        print("=" * 70)
+
+        return
+
     # -----------------------------------------------------
     # PROCESS
     # -----------------------------------------------------
@@ -1817,6 +1850,7 @@ def main():
             len(new_items),
         ):
             published += 1
+
         else:
             failed += 1
 
@@ -1826,12 +1860,17 @@ def main():
 
     print("=" * 70)
     print("NHL NEWS BOT FINISHED")
+
     print(
-        f"Published: {published}"
+        f"Published: "
+        f"{published}"
     )
+
     print(
-        f"Failed: {failed}"
+        f"Failed: "
+        f"{failed}"
     )
+
     print("=" * 70)
 
 
