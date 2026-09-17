@@ -1,6 +1,7 @@
 import os
 import re
 import hashlib
+import html
 import sqlite3
 import tempfile
 import time
@@ -31,6 +32,9 @@ MIN_IMAGE_BYTES = 5000
 
 GEMINI_DELAY = 1.0
 MAX_ARTICLE_TEXT = 12000
+
+MAX_POST_CHARS = 850
+MAX_POST_PARAGRAPHS = 4
 
 FRESH_DAYS = 90
 HISTORICAL_YEAR_TOLERANCE = 3
@@ -1222,6 +1226,7 @@ def gemini_request(
 
 def clean_post(text):
     text = (text or "").strip()
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
 
     text = re.sub(
         r"^```(?:text)?\s*",
@@ -1244,6 +1249,126 @@ def clean_post(text):
     )
 
     return text.strip()
+
+
+def split_sentences(text):
+    return [
+        part.strip()
+        for part in re.split(r"(?<=[.!?…])\s+", text.strip())
+        if part.strip()
+    ]
+
+
+def build_short_paragraphs(text):
+    """Make the generated text compact and readable without another Gemini call."""
+    text = clean_post(text)
+
+    raw_paragraphs = [
+        re.sub(r"[ \t]+", " ", paragraph).strip()
+        for paragraph in re.split(r"\n\s*\n+", text)
+        if paragraph.strip()
+    ]
+
+    if not raw_paragraphs:
+        return ""
+
+    paragraphs = []
+
+    # If Gemini returned one large block, create paragraphs from sentences.
+    if len(raw_paragraphs) == 1:
+        sentences = split_sentences(raw_paragraphs[0])
+
+        if len(sentences) > 1:
+            current = []
+
+            for sentence in sentences:
+                current.append(sentence)
+
+                # Prefer short paragraphs of one or two sentences.
+                if len(current) >= 2:
+                    paragraphs.append(" ".join(current))
+                    current = []
+
+            if current:
+                paragraphs.append(" ".join(current))
+        else:
+            paragraphs = raw_paragraphs[:]
+    else:
+        paragraphs = raw_paragraphs[:]
+
+    # Never create a wall of tiny paragraphs. Merge overflow into the last
+    # allowed paragraph rather than silently dropping information.
+    if len(paragraphs) > MAX_POST_PARAGRAPHS:
+        paragraphs = (
+            paragraphs[:MAX_POST_PARAGRAPHS - 1]
+            + [" ".join(paragraphs[MAX_POST_PARAGRAPHS - 1:])]
+        )
+
+    # Keep the whole post comfortably below Telegram's caption limit.
+    shortened = []
+    total = 0
+
+    for paragraph in paragraphs:
+        separator = 2 if shortened else 0
+        available = MAX_POST_CHARS - total - separator
+
+        if available <= 0:
+            break
+
+        if len(paragraph) <= available:
+            shortened.append(paragraph)
+            total += separator + len(paragraph)
+            continue
+
+        sentences = split_sentences(paragraph)
+        added = []
+
+        for sentence in sentences:
+            sentence_separator = 1 if added else 0
+            if len(" ".join(added)) + sentence_separator + len(sentence) <= available:
+                added.append(sentence)
+            else:
+                break
+
+        if added:
+            shortened.append(" ".join(added))
+            total += separator + len(shortened[-1])
+        else:
+            # If one sentence is unusually long, keep as much of it as
+            # possible and let the final word-boundary trim handle it.
+            fallback = paragraph[:available].rsplit(" ", 1)[0].rstrip(" ,;:-")
+            if fallback:
+                shortened.append(fallback + "…")
+
+        break
+
+    result = "\n\n".join(shortened).strip()
+
+    # A single unusually long sentence is still preferable to a Telegram
+    # API failure, so trim only at a word boundary as a last resort.
+    if len(result) > MAX_POST_CHARS:
+        result = result[:MAX_POST_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
+
+    return result
+
+
+def format_telegram_post(text):
+    """Apply restrained Telegram HTML formatting to the final post."""
+    paragraphs = [
+        paragraph.strip()
+        for paragraph in text.split("\n\n")
+        if paragraph.strip()
+    ]
+
+    if not paragraphs:
+        return ""
+
+    escaped = [html.escape(paragraph, quote=False) for paragraph in paragraphs]
+
+    # The lead paragraph is bold; the rest stays clean and readable.
+    escaped[0] = f"<b>{escaped[0]}</b>"
+
+    return "\n\n".join(escaped)
 
 
 def contains_technical_content(text):
@@ -1272,14 +1397,11 @@ def contains_technical_content(text):
 
 
 def validate_post_content(text):
-    """Only reject clear garbage, non-Russian or technical output."""
-    text = clean_post(text)
+    """Reject only clear garbage, non-Russian or technical output."""
+    text = build_short_paragraphs(text)
 
     if not text:
         raise PostRejected("Generated post is empty")
-
-    if len(text) < 40:
-        raise PostRejected("Generated post is too short to be a news digest")
 
     if "\ufffd" in text:
         raise PostRejected("Generated post contains a replacement character")
@@ -1301,7 +1423,6 @@ def validate_post_content(text):
     if russian_ratio < 0.45:
         raise PostRejected("Generated post is not sufficiently Russian")
 
-    # Control characters are always invalid in a Telegram news post.
     if any(
         ord(char) < 32 and char not in "\n\r\t"
         for char in text
@@ -1315,21 +1436,28 @@ def generate_post_prompt(title, article):
     return f"""
 Ты пишешь короткий пост для русскоязычного Telegram-канала о хоккейной новости.
 
-Сделай естественную русскую выжимку самого важного из исходного материала.
+Твоя задача — дать читателю быструю и понятную выжимку самого важного. Не пересказывай статью целиком.
 
 Правила:
 - пиши только на русском языке;
 - передавай только информацию из исходного материала;
 - не добавляй факты от себя;
 - пост должен относиться именно к этой новости;
-- убирай второстепенные детали;
-- не растягивай текст без необходимости;
-- не используй служебные пометки, код, JSON, API-ответы, промпты или другую техническую информацию;
+- убирай второстепенные детали, фон и повторы, если без них понятен смысл;
+- ориентируйся примерно на 450–750 символов; абсолютный максимум — около 850 символов;
+- обычно достаточно 2–4 коротких абзацев;
+- каждый абзац должен быть небольшим, не превращай пост в сплошную простыню;
+- первый абзац должен сразу сообщать главное событие;
+- следующие абзацы могут дать ключевые детали и контекст;
+- если новость можно нормально объяснить в 2–3 предложениях, не растягивай её;
+- не повторяй одну и ту же мысль разными словами;
 - не используй списки и подзаголовки;
 - названия команд пиши без кавычек;
 - не добавляй эмодзи;
+- не используй HTML, Markdown или другие специальные обозначения форматирования;
+- не используй служебные пометки, код, JSON, API-ответы, промпты или другую техническую информацию;
 - если исходный материал невозможно нормально превратить в русскую новостную выжимку, верни ровно REJECT;
-- если материал нормальный, верни только готовый текст поста.
+- если материал нормальный, верни только готовый текст поста с обычными переносами строк между абзацами.
 
 Заголовок статьи:
 {title}
@@ -1443,13 +1571,19 @@ def send_telegram(
         f"bot{TELEGRAM_TOKEN}"
     )
 
+    formatted_post = format_telegram_post(post)
+
+    if not formatted_post:
+        raise RuntimeError("Formatted Telegram post is empty")
+
     if image_path:
         with open(image_path, "rb") as image_file:
             response = requests.post(
                 f"{base_url}/sendPhoto",
                 data={
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": post,
+                    "caption": formatted_post,
+                    "parse_mode": "HTML",
                 },
                 files={"photo": image_file},
                 timeout=TELEGRAM_TIMEOUT,
@@ -1459,7 +1593,8 @@ def send_telegram(
             f"{base_url}/sendMessage",
             data={
                 "chat_id": TELEGRAM_CHAT_ID,
-                "text": post,
+                "text": formatted_post,
+                "parse_mode": "HTML",
             },
             timeout=TELEGRAM_TIMEOUT,
         )
@@ -1589,7 +1724,7 @@ def main():
     print(f"[CONFIG] Gemini primary: {GEMINI_PRIMARY_MODEL}")
     print(f"[CONFIG] Gemini fallback: {GEMINI_FALLBACK_MODEL}")
     print("[CONFIG] Images: article page only; no image search fallback")
-    print("[CONFIG] Gemini validation: generation + local content checks")
+    print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
     print("=" * 70)
 
     try:
