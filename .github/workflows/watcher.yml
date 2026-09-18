@@ -2,19 +2,28 @@ name: NHL Feed Watcher
 
 on:
   schedule:
-    # 16:00 - 23:50 по Украине -> каждые 10 минут
-    - cron: '*/10 16-23 * * *'
+    # 16:00 - 23:59 по Украине
+    # Проверка каждые 10 минут.
+    # Запуск смещен на 03, 13, 23, 33, 43 и 53 минуты,
+    # чтобы не попадать постоянно в начало часа.
+    - cron: '3-59/10 16-23 * * *'
       timezone: Europe/Kyiv
 
-    # 00:00 - 10:50 по Украине -> каждые 10 минут
-    - cron: '*/10 0-10 * * *'
+    # 00:00 - 10:59 по Украине
+    # Проверка каждые 10 минут.
+    - cron: '3-59/10 0-10 * * *'
       timezone: Europe/Kyiv
 
-    # 11:00 - 15:30 по Украине -> каждые 30 минут
-    - cron: '0,30 11-15 * * *'
+    # 11:00 - 15:59 по Украине
+    # Проверка каждые 30 минут.
+    - cron: '7,37 11-15 * * *'
       timezone: Europe/Kyiv
 
   workflow_dispatch:
+
+concurrency:
+  group: nhl-feed-watcher
+  cancel-in-progress: false
 
 permissions:
   actions: write
@@ -25,25 +34,106 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - uses: actions/checkout@v4
+
+      # =====================================================
+      # CHECKOUT
+      # =====================================================
+
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      # =====================================================
+      # PYTHON
+      # =====================================================
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: Install dependencies
-        run: pip install feedparser
+      # =====================================================
+      # DEPENDENCIES
+      # =====================================================
 
-      - name: Check RSS for new entries
-        id: check_rss
-        run: python check_rss.py
+      - name: Install watcher dependencies
+        run: |
+          pip install requests beautifulsoup4
+
+      # =====================================================
+      # CHECK HEAVY
+      # =====================================================
+
+      - name: Check Heavy for new NHL articles
+        id: check_heavy
+        run: python check_heavy.py
+
+      # =====================================================
+      # CHECK MAIN BOT
+      # =====================================================
+
+      - name: Check whether NHL News Bot is already running
+        id: bot_status
+        if: steps.check_heavy.outputs.NEW_NEWS == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+        run: |
+          set -e
+
+          echo "[WATCHER] Checking active NHL News Bot runs..."
+
+          QUEUED_COUNT=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/runs?status=queued&per_page=1" \
+            | jq -r '.total_count')
+
+          IN_PROGRESS_COUNT=$(curl -fsSL \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/runs?status=in_progress&per_page=1" \
+            | jq -r '.total_count')
+
+          ACTIVE_COUNT=$((QUEUED_COUNT + IN_PROGRESS_COUNT))
+
+          echo "[WATCHER] Main workflow queued: $QUEUED_COUNT"
+          echo "[WATCHER] Main workflow in progress: $IN_PROGRESS_COUNT"
+          echo "[WATCHER] Main workflow active: $ACTIVE_COUNT"
+
+          if [ "$ACTIVE_COUNT" -gt 0 ]; then
+            echo "[WATCHER] NHL News Bot is already active."
+            echo "[WATCHER] Skipping duplicate dispatch."
+
+            echo "BOT_ALREADY_RUNNING=true" >> "$GITHUB_OUTPUT"
+
+          else
+            echo "[WATCHER] NHL News Bot is not active."
+
+            echo "BOT_ALREADY_RUNNING=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      # =====================================================
+      # TRIGGER MAIN BOT
+      # =====================================================
 
       - name: Trigger NHL News Bot
-        if: steps.check_rss.outputs.NEW_NEWS == 'true'
+        if: steps.check_heavy.outputs.NEW_NEWS == 'true' && steps.bot_status.outputs.BOT_ALREADY_RUNNING != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
         run: |
-          curl -X POST \
-            -H "Authorization: token ${{ secrets.GITHUB_TOKEN }}" \
-            -H "Accept: application/vnd.github.v3+json" \
-            https://api.github.com/repos/${{ github.repository }}/actions/workflows/main.yml/dispatches \
+          set -e
+
+          echo "[WATCHER] Triggering NHL News Bot..."
+          echo "[WATCHER] New articles: ${{ steps.check_heavy.outputs.NEWS_COUNT }}"
+
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer $GH_TOKEN" \
+            -H "Accept: application/vnd.github+json" \
+            -H "X-GitHub-Api-Version: 2026-03-10" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/actions/workflows/main.yml/dispatches" \
             -d '{"ref":"main"}'
+
+          echo "[WATCHER] NHL News Bot dispatch completed successfully."
