@@ -848,102 +848,224 @@ def extract_jsonld_images(value, page_url):
     return images
 
 
+def extract_body_image_url(img, page_url):
+    """Return the most useful image URL exposed by a body <img> element."""
+    attributes = (
+        "src",
+        "data-src",
+        "data-lazy-src",
+        "data-original",
+        "data-image",
+        "data-url",
+    )
+
+    for attribute in attributes:
+        value = img.get(attribute, "")
+        normalized = normalize_image_url(
+            value,
+            page_url,
+        )
+        if normalized:
+            return normalized
+
+    srcset = (
+        img.get("srcset", "")
+        or img.get("data-srcset", "")
+        or ""
+    ).strip()
+
+    if srcset:
+        # Prefer the largest declared source from srcset.
+        candidates = []
+        for part in srcset.split(","):
+            tokens = part.strip().split()
+            if not tokens:
+                continue
+
+            url = normalize_image_url(
+                tokens[0],
+                page_url,
+            )
+            if not url:
+                continue
+
+            score = 0
+            if len(tokens) > 1:
+                descriptor = tokens[1].strip().lower()
+                match = re.match(r"(\d+)w", descriptor)
+                if match:
+                    score = int(match.group(1))
+                else:
+                    match = re.match(r"([0-9.]+)x", descriptor)
+                    if match:
+                        score = int(float(match.group(1)) * 1000)
+
+            candidates.append((score, url))
+
+        if candidates:
+            candidates.sort(
+                key=lambda item: item[0],
+                reverse=True,
+            )
+            return candidates[0][1]
+
+    return ""
+
+
+def image_dimension_score(img):
+    """Estimate whether an <img> is a real article photo rather than an icon."""
+    width = img.get("width", "")
+    height = img.get("height", "")
+
+    try:
+        width = int(re.sub(r"[^0-9]", "", str(width)))
+    except (TypeError, ValueError):
+        width = 0
+
+    try:
+        height = int(re.sub(r"[^0-9]", "", str(height)))
+    except (TypeError, ValueError):
+        height = 0
+
+    if width >= 300 and height >= 200:
+        return 3
+
+    if width >= 300 or height >= 200:
+        return 2
+
+    if width >= 150 or height >= 150:
+        return 1
+
+    return 0
+
+
+def is_probable_non_article_image(img):
+    """Filter obvious logos, icons, avatars and tracking images."""
+    values = []
+
+    for attribute in (
+        "alt",
+        "class",
+        "id",
+        "title",
+        "aria-label",
+    ):
+        value = img.get(attribute, "")
+        if isinstance(value, list):
+            value = " ".join(str(item) for item in value)
+        values.append(str(value).lower())
+
+    marker_text = " ".join(values)
+
+    blocked_markers = (
+        "logo",
+        "icon",
+        "avatar",
+        "author-photo",
+        "author_image",
+        "profile-photo",
+        "profile_image",
+        "placeholder",
+        "sprite",
+        "social",
+        "facebook",
+        "twitter",
+        "instagram",
+        "pinterest",
+    )
+
+    return any(
+        marker in marker_text
+        for marker in blocked_markers
+    )
+
+
 def extract_source_images(soup, page_url):
+    """Extract images from the actual article body, not the page's OG/preview image."""
     candidates = []
+    seen = set()
 
-    for meta in soup.find_all(
-        "meta"
-    ):
-        prop = (
-            meta.get("property", "")
-            or meta.get("name", "")
-        ).lower().strip()
+    article_roots = []
 
-        if prop in (
-            "og:image",
-            "og:image:url",
-            "og:image:secure_url",
-        ):
-            image_url = normalize_image_url(
-                meta.get("content", ""),
-                page_url,
-            )
+    # Heavy may expose the article body using any of these common structures.
+    selectors = (
+        'article',
+        '[itemprop="articleBody"]',
+        'main article',
+        'main',
+        '.article-content',
+        '.article-body',
+        '.entry-content',
+        '.post-content',
+        '.single-post-content',
+    )
 
-            if image_url:
-                candidates.append(
-                    (image_url, "og:image")
-                )
-
-        elif prop in (
-            "twitter:image",
-            "twitter:image:src",
-        ):
-            image_url = normalize_image_url(
-                meta.get("content", ""),
-                page_url,
-            )
-
-            if image_url:
-                candidates.append(
-                    (image_url, "twitter:image")
-                )
-
-    for link in soup.find_all(
-        "link"
-    ):
-        rel = [
-            str(value).lower()
-            for value in link.get("rel", [])
-        ]
-
-        if "image_src" in rel:
-            image_url = normalize_image_url(
-                link.get("href", ""),
-                page_url,
-            )
-
-            if image_url:
-                candidates.append(
-                    (image_url, "link:image_src")
-                )
-
-    for script in soup.find_all(
-        "script",
-        attrs={"type": "application/ld+json"},
-    ):
-        raw = script.string or script.get_text()
-
-        if not raw.strip():
-            continue
-
+    for selector in selectors:
         try:
-            import json
-
-            data = json.loads(raw)
+            for root in soup.select(selector):
+                if root not in article_roots:
+                    article_roots.append(root)
         except Exception:
             continue
 
-        for image_url in extract_jsonld_images(
-            data,
-            page_url,
-        ):
-            candidates.append(
-                (image_url, "json-ld")
+    # Prefer the most specific article-body container. If it is unavailable,
+    # the broader article/main containers still give us body images.
+    for root in article_roots:
+        for img in root.find_all("img"):
+            if is_probable_non_article_image(img):
+                continue
+
+            image_url = extract_body_image_url(
+                img,
+                page_url,
             )
 
-    unique = []
-    seen = set()
+            if not image_url or image_url in seen:
+                continue
 
-    for image_url, source in candidates:
-        if image_url in seen:
-            continue
+            dimension_score = image_dimension_score(img)
 
-        seen.add(image_url)
-        unique.append(
-            (image_url, source)
-        )
+            # Ignore very small images when dimensions are explicitly known.
+            width = img.get("width", "")
+            height = img.get("height", "")
+            try:
+                width_value = int(re.sub(r"[^0-9]", "", str(width)))
+            except (TypeError, ValueError):
+                width_value = 0
+            try:
+                height_value = int(re.sub(r"[^0-9]", "", str(height)))
+            except (TypeError, ValueError):
+                height_value = 0
 
-    return unique
+            if (
+                width_value
+                and height_value
+                and width_value < 120
+                and height_value < 120
+            ):
+                continue
+
+            seen.add(image_url)
+            candidates.append(
+                (
+                    image_url,
+                    "article-body",
+                    dimension_score,
+                )
+            )
+
+    # Put images with explicit large dimensions first, while preserving the
+    # original order among images with the same score. This keeps the first
+    # substantial article photo as the normal choice.
+    candidates.sort(
+        key=lambda item: item[2],
+        reverse=True,
+    )
+
+    return [
+        (image_url, image_source)
+        for image_url, image_source, _score in candidates
+    ]
 
 
 def fetch_article(
@@ -976,7 +1098,7 @@ def fetch_article(
 
     if source_images:
         print(
-            "[IMAGE] Source page image candidates: "
+            "[IMAGE] Article body image candidates: "
             f"{len(source_images)}"
         )
 
@@ -1020,7 +1142,7 @@ def download_source_image(
     article_url,
     image_source="unknown",
 ):
-    """Download an image directly from the Heavy article page candidate."""
+    """Download an image directly from an image found inside the Heavy article body."""
     if not image_url:
         return None
 
@@ -1905,7 +2027,7 @@ def main():
     print(f"[CONFIG] OpenRouter fallback: {OPENROUTER_MODEL}")
     print(f"[CONFIG] AnyModel fallback: {ANYMODEL_MODEL}")
     print(f"[CONFIG] Hugging Face fallback: {HF_MODEL}")
-    print("[CONFIG] Images: article page only; no image search fallback")
+    print("[CONFIG] Images: article body only; no image search fallback")
     print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
     print("=" * 70)
 
