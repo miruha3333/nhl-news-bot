@@ -16,9 +16,6 @@ SOURCE_URL = "https://heavy.com/sports/nhl/"
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
-ANYMODEL_API_KEY = os.getenv("ANYMODEL_API_KEY", "").strip()
-HF_TOKEN = os.getenv("HF_TOKEN", "").strip()
 
 DATABASE_FILE = "nhl_bot.db"
 
@@ -26,9 +23,6 @@ MAX_NEWS = 30
 
 GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
-OPENROUTER_MODEL = "openrouter/free"
-ANYMODEL_MODEL = "am/gpt-oss-20b"
-HF_MODEL = "Qwen/Qwen3.5-27B"
 
 GEMINI_TIMEOUT = 45
 TELEGRAM_TIMEOUT = 60
@@ -50,7 +44,7 @@ GEMINI_PRIMARY_DISABLED = False
 
 
 class PostRejected(Exception):
-    """All generation providers rejected the news or could not produce valid text."""
+    """The generated post must be skipped and permanently marked as processed."""
 
 
 class PostValidationServiceError(Exception):
@@ -848,224 +842,444 @@ def extract_jsonld_images(value, page_url):
     return images
 
 
-def extract_body_image_url(img, page_url):
-    """Return the most useful image URL exposed by a body <img> element."""
-    attributes = (
-        "src",
-        "data-src",
-        "data-lazy-src",
-        "data-original",
-        "data-image",
-        "data-url",
-    )
-
-    for attribute in attributes:
-        value = img.get(attribute, "")
-        normalized = normalize_image_url(
-            value,
-            page_url,
-        )
-        if normalized:
-            return normalized
-
-    srcset = (
-        img.get("srcset", "")
-        or img.get("data-srcset", "")
-        or ""
-    ).strip()
-
-    if srcset:
-        # Prefer the largest declared source from srcset.
-        candidates = []
-        for part in srcset.split(","):
-            tokens = part.strip().split()
-            if not tokens:
-                continue
-
-            url = normalize_image_url(
-                tokens[0],
-                page_url,
-            )
-            if not url:
-                continue
-
-            score = 0
-            if len(tokens) > 1:
-                descriptor = tokens[1].strip().lower()
-                match = re.match(r"(\d+)w", descriptor)
-                if match:
-                    score = int(match.group(1))
-                else:
-                    match = re.match(r"([0-9.]+)x", descriptor)
-                    if match:
-                        score = int(float(match.group(1)) * 1000)
-
-            candidates.append((score, url))
-
-        if candidates:
-            candidates.sort(
-                key=lambda item: item[0],
-                reverse=True,
-            )
-            return candidates[0][1]
-
-    return ""
-
-
-def image_dimension_score(img):
-    """Estimate whether an <img> is a real article photo rather than an icon."""
-    width = img.get("width", "")
-    height = img.get("height", "")
-
-    try:
-        width = int(re.sub(r"[^0-9]", "", str(width)))
-    except (TypeError, ValueError):
-        width = 0
-
-    try:
-        height = int(re.sub(r"[^0-9]", "", str(height)))
-    except (TypeError, ValueError):
-        height = 0
-
-    if width >= 300 and height >= 200:
-        return 3
-
-    if width >= 300 or height >= 200:
-        return 2
-
-    if width >= 150 or height >= 150:
-        return 1
-
-    return 0
-
-
-def is_probable_non_article_image(img):
-    """Filter obvious logos, icons, avatars and tracking images."""
+def image_attr_text(tag):
     values = []
 
-    for attribute in (
+    for attr in (
         "alt",
+        "title",
         "class",
         "id",
-        "title",
+        "data-testid",
+        "data-ad-slot",
+        "data-ad-unit",
         "aria-label",
     ):
-        value = img.get(attribute, "")
+        value = tag.get(attr, "")
+
         if isinstance(value, list):
             value = " ".join(str(item) for item in value)
-        values.append(str(value).lower())
 
-    marker_text = " ".join(values)
+        if value:
+            values.append(str(value))
 
-    blocked_markers = (
-        "logo",
-        "icon",
-        "avatar",
-        "author-photo",
-        "author_image",
-        "profile-photo",
-        "profile_image",
-        "placeholder",
-        "sprite",
-        "social",
-        "facebook",
+    return " ".join(values).lower()
+
+
+def image_url_text(image_url):
+    return (image_url or "").lower()
+
+
+def nearest_context_text(tag, max_parents=4):
+    parts = []
+    current = tag
+
+    for _ in range(max_parents):
+        current = current.parent
+
+        if current is None:
+            break
+
+        text = current.get_text(" ", strip=True)
+
+        if text:
+            parts.append(text[:1200])
+
+    return " ".join(parts).lower()
+
+
+def is_hard_ad_image(tag, image_url):
+    """Return True for image candidates that are clearly promotional/advertising."""
+    attr_text = image_attr_text(tag)
+    url_text = image_url_text(image_url)
+    context_text = nearest_context_text(tag, max_parents=3)
+
+    hard_ad_patterns = (
+        "advertisement",
+        "advertising",
+        "ad-container",
+        "ad_container",
+        "ad-slot",
+        "ad_slot",
+        "adsbygoogle",
+        "sponsored",
+        "sponsor",
+        "promo",
+        "promotional",
+        "promotion",
+        "newsletter",
+        "subscribe",
+        "subscription",
+        "pick'em",
+        "pickem",
+        "contest",
+        "giveaway",
+        "sweepstakes",
+        "betting",
+        "sportsbook",
+        "casino",
+        "shop now",
+        "shop",
+        "store",
+        "deal",
+        "offer",
+        "sale",
+        "buy now",
+        "click here",
+        "enter heavy's",
+        "enter heavys",
+    )
+
+    hard_ad_attr_patterns = (
+        "ad-",
+        "ad_",
+        "ads-",
+        "ads_",
+        "advert",
+        "sponsor",
+        "promo",
+        "promotional",
+        "newsletter",
+        "pickem",
+        "pick'em",
+        "contest",
+        "sponsored",
+    )
+
+    if any(pattern in attr_text for pattern in hard_ad_patterns):
+        return True
+
+    if any(pattern in url_text for pattern in hard_ad_patterns):
+        return True
+
+    if any(pattern in attr_text for pattern in hard_ad_attr_patterns):
+        return True
+
+    # The example Heavy ad uses a normal <img> but exposes its promotional
+    # nature through alt text and the surrounding block. Check the nearby
+    # DOM text as a second hard exclusion signal.
+    if any(pattern in context_text for pattern in hard_ad_patterns):
+        return True
+
+    return False
+
+
+def image_is_social_candidate(tag, image_url):
+    attr_text = image_attr_text(tag)
+    url_text = image_url_text(image_url)
+    context_text = nearest_context_text(tag, max_parents=5)
+
+    social_patterns = (
         "twitter",
+        "x.com",
+        "twitter.com",
+        "tweet",
+        "t.co",
         "instagram",
-        "pinterest",
+        "instagram.com",
+        "facebook",
+        "facebook.com",
+        "threads.net",
+        "threads",
+        "social-embed",
+        "social_embed",
+        "socialembed",
+        "embed-social",
+        "embed_social",
+    )
+
+    text = " ".join(
+        (
+            attr_text,
+            url_text,
+            context_text,
+        )
     )
 
     return any(
-        marker in marker_text
-        for marker in blocked_markers
+        pattern in text
+        for pattern in social_patterns
     )
 
 
-def extract_source_images(soup, page_url):
-    """Extract images from the actual article body, not the page's OG/preview image."""
+def image_candidate_score(tag, image_url, position):
+    """Score an image using deterministic DOM signals only."""
+    attr_text = image_attr_text(tag)
+    url_text = image_url_text(image_url)
+    context_text = nearest_context_text(tag, max_parents=5)
+
+    score = 0
+
+    if image_is_social_candidate(tag, image_url):
+        # Social screenshots are deliberately given a very strong priority.
+        score += 1000
+
+    positive_patterns = (
+        ("twitter", 180),
+        ("x.com", 180),
+        ("tweet", 180),
+        ("instagram", 180),
+        ("facebook", 180),
+        ("threads", 180),
+        ("social", 140),
+        ("figcaption", 120),
+        ("figure", 80),
+        ("article-image", 80),
+        ("article_image", 80),
+        ("featured-image", 60),
+        ("featured_image", 60),
+        ("hero-image", 50),
+        ("hero_image", 50),
+        ("getty", 50),
+    )
+
+    combined = " ".join(
+        (
+            attr_text,
+            url_text,
+            context_text,
+        )
+    )
+
+    for pattern, points in positive_patterns:
+        if pattern in combined:
+            score += points
+
+    # Keep article images ahead of generic decorative images, but never let
+    # these modest bonuses override the strong social-embed preference.
+    width = tag.get("width", "")
+    height = tag.get("height", "")
+
+    try:
+        width_value = int(re.sub(r"[^0-9]", "", str(width)))
+    except (TypeError, ValueError):
+        width_value = 0
+
+    try:
+        height_value = int(re.sub(r"[^0-9]", "", str(height)))
+    except (TypeError, ValueError):
+        height_value = 0
+
+    if width_value >= 500 or height_value >= 300:
+        score += 25
+
+    if width_value and width_value < 180:
+        score -= 120
+
+    if height_value and height_value < 120:
+        score -= 120
+
+    if position < 8:
+        score += 30
+    elif position > 40:
+        score -= 20
+
+    return score
+
+
+def extract_article_body_images(soup, page_url):
+    """Extract and rank real images found inside the Heavy article page."""
     candidates = []
     seen = set()
 
-    article_roots = []
+    for position, image_tag in enumerate(
+        soup.find_all("img"),
+        1,
+    ):
+        image_url = normalize_image_url(
+            image_tag.get("src", "")
+            or image_tag.get("data-src", "")
+            or image_tag.get("data-lazy-src", ""),
+            page_url,
+        )
 
-    # Heavy may expose the article body using any of these common structures.
-    selectors = (
-        'article',
-        '[itemprop="articleBody"]',
-        'main article',
-        'main',
-        '.article-content',
-        '.article-body',
-        '.entry-content',
-        '.post-content',
-        '.single-post-content',
-    )
+        if not image_url:
+            srcset = (
+                image_tag.get("srcset", "")
+                or image_tag.get("data-srcset", "")
+                or ""
+            )
 
-    for selector in selectors:
-        try:
-            for root in soup.select(selector):
-                if root not in article_roots:
-                    article_roots.append(root)
-        except Exception:
+            if srcset:
+                first_src = srcset.split(",", 1)[0].strip().split(" ", 1)[0]
+                image_url = normalize_image_url(
+                    first_src,
+                    page_url,
+                )
+
+        if not image_url or image_url in seen:
             continue
 
-    # Prefer the most specific article-body container. If it is unavailable,
-    # the broader article/main containers still give us body images.
-    for root in article_roots:
-        for img in root.find_all("img"):
-            if is_probable_non_article_image(img):
-                continue
-
-            image_url = extract_body_image_url(
-                img,
-                page_url,
+        if is_hard_ad_image(
+            image_tag,
+            image_url,
+        ):
+            print(
+                "[IMAGE] Hard ad exclusion: "
+                f"{image_url} | "
+                f"{image_attr_text(image_tag)[:220]}"
             )
+            continue
 
-            if not image_url or image_url in seen:
-                continue
+        seen.add(image_url)
 
-            dimension_score = image_dimension_score(img)
+        score = image_candidate_score(
+            image_tag,
+            image_url,
+            position,
+        )
 
-            # Ignore very small images when dimensions are explicitly known.
-            width = img.get("width", "")
-            height = img.get("height", "")
-            try:
-                width_value = int(re.sub(r"[^0-9]", "", str(width)))
-            except (TypeError, ValueError):
-                width_value = 0
-            try:
-                height_value = int(re.sub(r"[^0-9]", "", str(height)))
-            except (TypeError, ValueError):
-                height_value = 0
-
-            if (
-                width_value
-                and height_value
-                and width_value < 120
-                and height_value < 120
-            ):
-                continue
-
-            seen.add(image_url)
-            candidates.append(
-                (
-                    image_url,
-                    "article-body",
-                    dimension_score,
-                )
+        source = (
+            "article:social"
+            if image_is_social_candidate(
+                image_tag,
+                image_url,
             )
+            else "article:body"
+        )
 
-    # Put images with explicit large dimensions first, while preserving the
-    # original order among images with the same score. This keeps the first
-    # substantial article photo as the normal choice.
+        candidates.append(
+            (
+                score,
+                image_url,
+                source,
+            )
+        )
+
     candidates.sort(
-        key=lambda item: item[2],
+        key=lambda item: item[0],
         reverse=True,
     )
 
     return [
-        (image_url, image_source)
-        for image_url, image_source, _score in candidates
+        (image_url, f"{source}:score={score}")
+        for score, image_url, source in candidates
     ]
+
+
+def extract_source_images(soup, page_url):
+    """Return article-body images first, then page metadata as a fallback."""
+    candidates = extract_article_body_images(
+        soup,
+        page_url,
+    )
+
+    seen = {
+        image_url
+        for image_url, _source in candidates
+    }
+
+    metadata_candidates = []
+
+    for meta in soup.find_all("meta"):
+        prop = (
+            meta.get("property", "")
+            or meta.get("name", "")
+        ).lower().strip()
+
+        if prop in (
+            "og:image",
+            "og:image:url",
+            "og:image:secure_url",
+        ):
+            image_url = normalize_image_url(
+                meta.get("content", ""),
+                page_url,
+            )
+
+            if image_url:
+                metadata_candidates.append(
+                    (image_url, "metadata:og:image")
+                )
+
+        elif prop in (
+            "twitter:image",
+            "twitter:image:src",
+        ):
+            image_url = normalize_image_url(
+                meta.get("content", ""),
+                page_url,
+            )
+
+            if image_url:
+                metadata_candidates.append(
+                    (image_url, "metadata:twitter:image")
+                )
+
+    for link in soup.find_all("link"):
+        rel = [
+            str(value).lower()
+            for value in link.get("rel", [])
+        ]
+
+        if "image_src" in rel:
+            image_url = normalize_image_url(
+                link.get("href", ""),
+                page_url,
+            )
+
+            if image_url:
+                metadata_candidates.append(
+                    (image_url, "metadata:link:image_src")
+                )
+
+    for script in soup.find_all(
+        "script",
+        attrs={"type": "application/ld+json"},
+    ):
+        raw = script.string or script.get_text()
+
+        if not raw.strip():
+            continue
+
+        try:
+            import json
+
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        for image_url in extract_jsonld_images(
+            data,
+            page_url,
+        ):
+            metadata_candidates.append(
+                (image_url, "metadata:json-ld")
+            )
+
+    for image_url, source in metadata_candidates:
+        if image_url in seen:
+            continue
+
+        # Metadata is a last-resort source. It is also checked against the
+        # same URL-level ad patterns so a promotional OG image is not allowed
+        # to re-enter the candidate list.
+        if any(
+            pattern in image_url_text(image_url)
+            for pattern in (
+                "advertisement",
+                "sponsored",
+                "promo",
+                "contest",
+                "pickem",
+                "pick'em",
+                "newsletter",
+                "betting",
+                "casino",
+            )
+        ):
+            print(
+                "[IMAGE] Hard ad exclusion (metadata): "
+                f"{image_url}"
+            )
+            continue
+
+        seen.add(image_url)
+        candidates.append(
+            (image_url, source)
+        )
+
+    return candidates
 
 
 def fetch_article(
@@ -1098,7 +1312,7 @@ def fetch_article(
 
     if source_images:
         print(
-            "[IMAGE] Article body image candidates: "
+            "[IMAGE] Source page image candidates: "
             f"{len(source_images)}"
         )
 
@@ -1142,7 +1356,7 @@ def download_source_image(
     article_url,
     image_source="unknown",
 ):
-    """Download an image directly from an image found inside the Heavy article body."""
+    """Download an image directly from the Heavy article page candidate."""
     if not image_url:
         return None
 
@@ -1351,94 +1565,6 @@ def gemini_request(
 
     return text
 
-
-
-def openai_compatible_request(
-    provider,
-    url,
-    api_key,
-    model,
-    prompt,
-):
-    if not api_key:
-        raise RuntimeError(f"{provider} API key is not configured")
-
-    payload = {
-        "model": model,
-        "messages": [
-            {
-                "role": "user",
-                "content": prompt,
-            }
-        ],
-        "temperature": 0.2,
-        "max_tokens": 1000,
-    }
-
-    try:
-        response = requests.post(
-            url,
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=(10, GEMINI_TIMEOUT),
-        )
-    except requests.exceptions.ReadTimeout as exc:
-        raise RuntimeError(
-            f"{provider} read timeout after {GEMINI_TIMEOUT}s"
-        ) from exc
-    except requests.exceptions.ConnectTimeout as exc:
-        raise RuntimeError(f"{provider} connection timeout") from exc
-    except requests.exceptions.RequestException as exc:
-        raise RuntimeError(f"{provider} network error: {exc}") from exc
-
-    if response.status_code >= 400:
-        raise RuntimeError(
-            f"{provider} HTTP {response.status_code}: "
-            f"{response.text[:1000]}"
-        )
-
-    try:
-        data = response.json()
-    except ValueError as exc:
-        raise RuntimeError(f"{provider} returned invalid JSON") from exc
-
-    choices = data.get("choices", [])
-    if not choices:
-        raise RuntimeError(f"{provider} returned no choices")
-
-    message = choices[0].get("message", {})
-    text = message.get("content", "")
-
-    if isinstance(text, list):
-        text = "".join(
-            part.get("text", "")
-            for part in text
-            if isinstance(part, dict)
-        )
-
-    text = str(text or "").strip()
-
-    if not text:
-        raise RuntimeError(f"{provider} returned an empty response")
-
-    return text
-
-
-def extract_reject_reason(text):
-    cleaned = (text or "").strip()
-    match = re.match(r"^REJECT\s*:\s*(.+)$", cleaned, flags=re.IGNORECASE | re.DOTALL)
-
-    if match:
-        reason = re.sub(r"\s+", " ", match.group(1)).strip()
-        return reason[:500] or "No reason provided"
-
-    if cleaned.upper() == "REJECT":
-        return "Model returned REJECT without a reason"
-
-    return ""
 
 def clean_post(text):
     text = (text or "").strip()
@@ -1670,7 +1796,7 @@ def generate_post_prompt(title, article):
 - не добавляй эмодзи;
 - не используй HTML, Markdown или другие специальные обозначения форматирования;
 - не используй служебные пометки, код, JSON, API-ответы, промпты или другую техническую информацию;
-- если исходный материал невозможно нормально превратить в русскую новостную выжимку, верни в формате REJECT: краткая причина (не более 20 слов);
+- если исходный материал невозможно нормально превратить в русскую новостную выжимку, верни ровно REJECT;
 - если материал нормальный, верни только готовый текст поста с обычными переносами строк между абзацами.
 
 Заголовок статьи:
@@ -1709,145 +1835,59 @@ def is_gemini_temporary_error(error):
 def generate_post(title, article):
     global GEMINI_PRIMARY_DISABLED
 
+    if not GEMINI_API_KEY:
+        raise RuntimeError("GEMINI_API_KEY is not configured")
+
     prompt = generate_post_prompt(title, article)
 
-    providers = []
+    models = []
 
-    if GEMINI_API_KEY and not GEMINI_PRIMARY_DISABLED:
-        providers.append((
-            "GEMINI PRIMARY",
-            GEMINI_PRIMARY_MODEL,
-            lambda: gemini_request(GEMINI_PRIMARY_MODEL, prompt),
-            "gemini",
-        ))
+    if not GEMINI_PRIMARY_DISABLED:
+        models.append((GEMINI_PRIMARY_MODEL, "PRIMARY"))
 
-    if GEMINI_API_KEY:
-        providers.append((
-            "GEMINI FALLBACK",
-            GEMINI_FALLBACK_MODEL,
-            lambda: gemini_request(GEMINI_FALLBACK_MODEL, prompt),
-            "gemini_fallback",
-        ))
+    models.append((GEMINI_FALLBACK_MODEL, "FALLBACK"))
 
-    if OPENROUTER_API_KEY:
-        providers.append((
-            "OPENROUTER",
-            OPENROUTER_MODEL,
-            lambda: openai_compatible_request(
-                "OpenRouter",
-                "https://openrouter.ai/api/v1/chat/completions",
-                OPENROUTER_API_KEY,
-                OPENROUTER_MODEL,
-                prompt,
-            ),
-            "openrouter",
-        ))
+    last_error = None
 
-    if ANYMODEL_API_KEY:
-        providers.append((
-            "ANYMODEL",
-            ANYMODEL_MODEL,
-            lambda: openai_compatible_request(
-                "AnyModel",
-                "https://anymodel.org/v1/chat/completions",
-                ANYMODEL_API_KEY,
-                ANYMODEL_MODEL,
-                prompt,
-            ),
-            "anymodel",
-        ))
-
-    if HF_TOKEN:
-        providers.append((
-            "HUGGING FACE",
-            HF_MODEL,
-            lambda: openai_compatible_request(
-                "Hugging Face",
-                "https://router.huggingface.co/v1/chat/completions",
-                HF_TOKEN,
-                HF_MODEL,
-                prompt,
-            ),
-            "huggingface",
-        ))
-
-    if not providers:
-        raise PostValidationServiceError(
-            "No AI generation provider is configured"
-        )
-
-    errors = []
-    rejections = []
-
-    for label, model, request_fn, provider_key in providers:
-        print(f"[AI {label}] Using {model}")
+    for model, label in models:
+        print(f"[GEMINI {label}] Using {model}")
 
         try:
-            raw_result = request_fn()
-            reject_reason = extract_reject_reason(raw_result)
+            result = gemini_request(model, prompt)
+            result = clean_post(result)
 
-            if reject_reason:
-                rejections.append(f"{label}: {reject_reason}")
-                print(
-                    f"[AI {label} REJECT] {reject_reason}"
+            if result.upper() == "REJECT":
+                raise PostRejected(
+                    "Gemini could not produce a relevant Russian news post"
                 )
-                continue
 
-            result = clean_post(raw_result)
-            validated = validate_post_content(result)
+            return validate_post_content(result)
 
-            print(
-                f"[AI {label}] Post generated successfully"
-            )
-            return validated
-
-        except PostRejected as exc:
-            reason = str(exc)
-            rejections.append(f"{label}: {reason}")
-            print(
-                f"[AI {label} VALIDATION REJECT] {reason}"
-            )
-            continue
+        except PostRejected:
+            raise
 
         except Exception as exc:
-            errors.append(f"{label}: {exc}")
+            last_error = exc
+
             print(
-                f"[AI {label} ERROR] {exc}"
+                f"[GEMINI {label} ERROR] {exc}"
             )
 
-            if label == "GEMINI PRIMARY" and is_gemini_temporary_error(exc):
+            if label == "PRIMARY" and is_gemini_temporary_error(exc):
                 GEMINI_PRIMARY_DISABLED = True
                 print(
                     "[GEMINI] Primary disabled for the remainder of this run; "
-                    "continuing through the fallback chain."
+                    "using fallback model."
                 )
+                continue
 
-            continue
+            if label == "PRIMARY":
+                continue
 
-    if rejections and not errors:
-        raise PostRejected(
-            "All AI providers rejected the news. Reasons: "
-            + " | ".join(rejections)
-        )
-
-    if rejections or errors:
-        details = []
-        if rejections:
-            details.append(
-                "rejections=" + " | ".join(rejections)
-            )
-        if errors:
-            details.append(
-                "errors=" + " | ".join(errors)
-            )
-
-        raise PostValidationServiceError(
-            "All AI generation providers failed. "
-            + " ; ".join(details)
-        )
+            break
 
     raise PostValidationServiceError(
-        "AI generation chain ended without a usable post"
+        f"Gemini content generation service failed: {last_error}"
     )
 
 
@@ -1988,11 +2028,8 @@ def process_news(
             stage = "telegram"
             print(f"[TELEGRAM ERROR] {message}")
 
-        elif any(
-            marker in message
-            for marker in ("Gemini", "GEMINI", "OpenRouter", "AnyModel", "Hugging Face")
-        ):
-            stage = "ai_generation"
+        elif "Gemini" in message or "GEMINI" in message:
+            stage = "gemini"
 
         elif "image" in message.lower():
             stage = "image"
@@ -2024,10 +2061,7 @@ def main():
     print(f"[CONFIG] Heavy articles limit: {MAX_NEWS}")
     print(f"[CONFIG] Gemini primary: {GEMINI_PRIMARY_MODEL}")
     print(f"[CONFIG] Gemini fallback: {GEMINI_FALLBACK_MODEL}")
-    print(f"[CONFIG] OpenRouter fallback: {OPENROUTER_MODEL}")
-    print(f"[CONFIG] AnyModel fallback: {ANYMODEL_MODEL}")
-    print(f"[CONFIG] Hugging Face fallback: {HF_MODEL}")
-    print("[CONFIG] Images: article body only; no image search fallback")
+    print("[CONFIG] Images: article page only; no image search fallback")
     print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
     print("=" * 70)
 
