@@ -5,3 +5,4 @@ ddgs
 requests
 pymorphy3
 beautifulsoup4
+Pillow
