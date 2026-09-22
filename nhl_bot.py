@@ -1,5 +1,6 @@
 import os
 import re
+import random
 import hashlib
 import html
 import sqlite3
@@ -24,7 +25,10 @@ MAX_NEWS = 30
 GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
-GEMINI_TIMEOUT = 45
+GEMINI_TIMEOUT = 60
+GEMINI_RETRY_ATTEMPTS = 3
+GEMINI_RETRY_BASE_DELAY = 5
+GEMINI_RETRY_MAX_DELAY = 20
 TELEGRAM_TIMEOUT = 60
 
 SOURCE_IMAGE_DOWNLOAD_TIMEOUT = 15
@@ -538,6 +542,49 @@ def mark_processed(url):
     conn.close()
 
 
+def get_retryable_gemini_items():
+    """Return previously discovered news that failed only because Gemini was unavailable.
+
+    These rows intentionally remain processed=0. That means a temporary Gemini
+    outage cannot permanently lose a news item just because it fell out of the
+    current top-30 Heavy listing before the next successful run.
+    """
+    conn = get_db()
+
+    rows = conn.execute(
+        """
+        SELECT n.url, n.title, n.source, n.published
+        FROM news AS n
+        WHERE n.processed = 0
+          AND EXISTS (
+              SELECT 1
+              FROM errors AS e
+              WHERE e.url = n.url
+                AND e.id = (
+                    SELECT MAX(e2.id)
+                    FROM errors AS e2
+                    WHERE e2.url = n.url
+                )
+                AND e.stage = 'gemini_service'
+          )
+        ORDER BY n.id ASC
+        """
+    ).fetchall()
+
+    conn.close()
+
+    return [
+        {
+            "url": row[0],
+            "title": row[1] or "",
+            "source": row[2] or "heavy.com",
+            "published": row[3] or "",
+            "summary": "",
+        }
+        for row in rows
+    ]
+
+
 # =========================================================
 # IMAGE DATABASE
 # =========================================================
@@ -842,336 +889,12 @@ def extract_jsonld_images(value, page_url):
     return images
 
 
-def image_attr_text(tag):
-    values = []
-
-    for attr in (
-        "alt",
-        "title",
-        "class",
-        "id",
-        "data-testid",
-        "data-ad-slot",
-        "data-ad-unit",
-        "aria-label",
-    ):
-        value = tag.get(attr, "")
-
-        if isinstance(value, list):
-            value = " ".join(str(item) for item in value)
-
-        if value:
-            values.append(str(value))
-
-    return " ".join(values).lower()
-
-
-def image_url_text(image_url):
-    return (image_url or "").lower()
-
-
-def nearest_context_text(tag, max_parents=4):
-    parts = []
-    current = tag
-
-    for _ in range(max_parents):
-        current = current.parent
-
-        if current is None:
-            break
-
-        text = current.get_text(" ", strip=True)
-
-        if text:
-            parts.append(text[:1200])
-
-    return " ".join(parts).lower()
-
-
-def is_hard_ad_image(tag, image_url):
-    """Return True for image candidates that are clearly promotional/advertising."""
-    attr_text = image_attr_text(tag)
-    url_text = image_url_text(image_url)
-    context_text = nearest_context_text(tag, max_parents=3)
-
-    hard_ad_patterns = (
-        "advertisement",
-        "advertising",
-        "ad-container",
-        "ad_container",
-        "ad-slot",
-        "ad_slot",
-        "adsbygoogle",
-        "sponsored",
-        "sponsor",
-        "promo",
-        "promotional",
-        "promotion",
-        "newsletter",
-        "subscribe",
-        "subscription",
-        "pick'em",
-        "pickem",
-        "contest",
-        "giveaway",
-        "sweepstakes",
-        "betting",
-        "sportsbook",
-        "casino",
-        "shop now",
-        "shop",
-        "store",
-        "deal",
-        "offer",
-        "sale",
-        "buy now",
-        "click here",
-        "enter heavy's",
-        "enter heavys",
-    )
-
-    hard_ad_attr_patterns = (
-        "ad-",
-        "ad_",
-        "ads-",
-        "ads_",
-        "advert",
-        "sponsor",
-        "promo",
-        "promotional",
-        "newsletter",
-        "pickem",
-        "pick'em",
-        "contest",
-        "sponsored",
-    )
-
-    if any(pattern in attr_text for pattern in hard_ad_patterns):
-        return True
-
-    if any(pattern in url_text for pattern in hard_ad_patterns):
-        return True
-
-    if any(pattern in attr_text for pattern in hard_ad_attr_patterns):
-        return True
-
-    # The example Heavy ad uses a normal <img> but exposes its promotional
-    # nature through alt text and the surrounding block. Check the nearby
-    # DOM text as a second hard exclusion signal.
-    if any(pattern in context_text for pattern in hard_ad_patterns):
-        return True
-
-    return False
-
-
-def image_is_social_candidate(tag, image_url):
-    attr_text = image_attr_text(tag)
-    url_text = image_url_text(image_url)
-    context_text = nearest_context_text(tag, max_parents=5)
-
-    social_patterns = (
-        "twitter",
-        "x.com",
-        "twitter.com",
-        "tweet",
-        "t.co",
-        "instagram",
-        "instagram.com",
-        "facebook",
-        "facebook.com",
-        "threads.net",
-        "threads",
-        "social-embed",
-        "social_embed",
-        "socialembed",
-        "embed-social",
-        "embed_social",
-    )
-
-    text = " ".join(
-        (
-            attr_text,
-            url_text,
-            context_text,
-        )
-    )
-
-    return any(
-        pattern in text
-        for pattern in social_patterns
-    )
-
-
-def image_candidate_score(tag, image_url, position):
-    """Score an image using deterministic DOM signals only."""
-    attr_text = image_attr_text(tag)
-    url_text = image_url_text(image_url)
-    context_text = nearest_context_text(tag, max_parents=5)
-
-    score = 0
-
-    if image_is_social_candidate(tag, image_url):
-        # Social screenshots are deliberately given a very strong priority.
-        score += 1000
-
-    positive_patterns = (
-        ("twitter", 180),
-        ("x.com", 180),
-        ("tweet", 180),
-        ("instagram", 180),
-        ("facebook", 180),
-        ("threads", 180),
-        ("social", 140),
-        ("figcaption", 120),
-        ("figure", 80),
-        ("article-image", 80),
-        ("article_image", 80),
-        ("featured-image", 60),
-        ("featured_image", 60),
-        ("hero-image", 50),
-        ("hero_image", 50),
-        ("getty", 50),
-    )
-
-    combined = " ".join(
-        (
-            attr_text,
-            url_text,
-            context_text,
-        )
-    )
-
-    for pattern, points in positive_patterns:
-        if pattern in combined:
-            score += points
-
-    # Keep article images ahead of generic decorative images, but never let
-    # these modest bonuses override the strong social-embed preference.
-    width = tag.get("width", "")
-    height = tag.get("height", "")
-
-    try:
-        width_value = int(re.sub(r"[^0-9]", "", str(width)))
-    except (TypeError, ValueError):
-        width_value = 0
-
-    try:
-        height_value = int(re.sub(r"[^0-9]", "", str(height)))
-    except (TypeError, ValueError):
-        height_value = 0
-
-    if width_value >= 500 or height_value >= 300:
-        score += 25
-
-    if width_value and width_value < 180:
-        score -= 120
-
-    if height_value and height_value < 120:
-        score -= 120
-
-    if position < 8:
-        score += 30
-    elif position > 40:
-        score -= 20
-
-    return score
-
-
-def extract_article_body_images(soup, page_url):
-    """Extract and rank real images found inside the Heavy article page."""
-    candidates = []
-    seen = set()
-
-    for position, image_tag in enumerate(
-        soup.find_all("img"),
-        1,
-    ):
-        image_url = normalize_image_url(
-            image_tag.get("src", "")
-            or image_tag.get("data-src", "")
-            or image_tag.get("data-lazy-src", ""),
-            page_url,
-        )
-
-        if not image_url:
-            srcset = (
-                image_tag.get("srcset", "")
-                or image_tag.get("data-srcset", "")
-                or ""
-            )
-
-            if srcset:
-                first_src = srcset.split(",", 1)[0].strip().split(" ", 1)[0]
-                image_url = normalize_image_url(
-                    first_src,
-                    page_url,
-                )
-
-        if not image_url or image_url in seen:
-            continue
-
-        if is_hard_ad_image(
-            image_tag,
-            image_url,
-        ):
-            print(
-                "[IMAGE] Hard ad exclusion: "
-                f"{image_url} | "
-                f"{image_attr_text(image_tag)[:220]}"
-            )
-            continue
-
-        seen.add(image_url)
-
-        score = image_candidate_score(
-            image_tag,
-            image_url,
-            position,
-        )
-
-        source = (
-            "article:social"
-            if image_is_social_candidate(
-                image_tag,
-                image_url,
-            )
-            else "article:body"
-        )
-
-        candidates.append(
-            (
-                score,
-                image_url,
-                source,
-            )
-        )
-
-    candidates.sort(
-        key=lambda item: item[0],
-        reverse=True,
-    )
-
-    return [
-        (image_url, f"{source}:score={score}")
-        for score, image_url, source in candidates
-    ]
-
-
 def extract_source_images(soup, page_url):
-    """Return article-body images first, then page metadata as a fallback."""
-    candidates = extract_article_body_images(
-        soup,
-        page_url,
-    )
+    candidates = []
 
-    seen = {
-        image_url
-        for image_url, _source in candidates
-    }
-
-    metadata_candidates = []
-
-    for meta in soup.find_all("meta"):
+    for meta in soup.find_all(
+        "meta"
+    ):
         prop = (
             meta.get("property", "")
             or meta.get("name", "")
@@ -1188,8 +911,8 @@ def extract_source_images(soup, page_url):
             )
 
             if image_url:
-                metadata_candidates.append(
-                    (image_url, "metadata:og:image")
+                candidates.append(
+                    (image_url, "og:image")
                 )
 
         elif prop in (
@@ -1202,11 +925,13 @@ def extract_source_images(soup, page_url):
             )
 
             if image_url:
-                metadata_candidates.append(
-                    (image_url, "metadata:twitter:image")
+                candidates.append(
+                    (image_url, "twitter:image")
                 )
 
-    for link in soup.find_all("link"):
+    for link in soup.find_all(
+        "link"
+    ):
         rel = [
             str(value).lower()
             for value in link.get("rel", [])
@@ -1219,8 +944,8 @@ def extract_source_images(soup, page_url):
             )
 
             if image_url:
-                metadata_candidates.append(
-                    (image_url, "metadata:link:image_src")
+                candidates.append(
+                    (image_url, "link:image_src")
                 )
 
     for script in soup.find_all(
@@ -1243,43 +968,23 @@ def extract_source_images(soup, page_url):
             data,
             page_url,
         ):
-            metadata_candidates.append(
-                (image_url, "metadata:json-ld")
+            candidates.append(
+                (image_url, "json-ld")
             )
 
-    for image_url, source in metadata_candidates:
+    unique = []
+    seen = set()
+
+    for image_url, source in candidates:
         if image_url in seen:
             continue
 
-        # Metadata is a last-resort source. It is also checked against the
-        # same URL-level ad patterns so a promotional OG image is not allowed
-        # to re-enter the candidate list.
-        if any(
-            pattern in image_url_text(image_url)
-            for pattern in (
-                "advertisement",
-                "sponsored",
-                "promo",
-                "contest",
-                "pickem",
-                "pick'em",
-                "newsletter",
-                "betting",
-                "casino",
-            )
-        ):
-            print(
-                "[IMAGE] Hard ad exclusion (metadata): "
-                f"{image_url}"
-            )
-            continue
-
         seen.add(image_url)
-        candidates.append(
+        unique.append(
             (image_url, source)
         )
 
-    return candidates
+    return unique
 
 
 def fetch_article(
@@ -1564,6 +1269,49 @@ def gemini_request(
         )
 
     return text
+
+
+def gemini_request_with_retry(model, prompt, label):
+    """Retry transient Gemini failures before giving up on a model.
+
+    Google recommends exponential backoff for transient 429/5xx errors.
+    Read/connect timeouts are also treated as transient because they can occur
+    when the model is overloaded and the request never completes.
+    """
+    last_error = None
+
+    for attempt in range(1, GEMINI_RETRY_ATTEMPTS + 1):
+        try:
+            if attempt > 1:
+                print(
+                    f"[GEMINI {label}] Retry attempt "
+                    f"{attempt}/{GEMINI_RETRY_ATTEMPTS}"
+                )
+
+            return gemini_request(model, prompt)
+
+        except Exception as exc:
+            last_error = exc
+
+            if (
+                not is_gemini_temporary_error(exc)
+                or attempt >= GEMINI_RETRY_ATTEMPTS
+            ):
+                raise
+
+            delay = min(
+                GEMINI_RETRY_MAX_DELAY,
+                GEMINI_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+            )
+            delay += random.uniform(0, 2)
+
+            print(
+                f"[GEMINI {label}] Temporary error; "
+                f"retrying in {delay:.1f}s: {exc}"
+            )
+            time.sleep(delay)
+
+    raise last_error
 
 
 def clean_post(text):
@@ -1853,7 +1601,11 @@ def generate_post(title, article):
         print(f"[GEMINI {label}] Using {model}")
 
         try:
-            result = gemini_request(model, prompt)
+            result = gemini_request_with_retry(
+                model,
+                prompt,
+                label,
+            )
             result = clean_post(result)
 
             if result.upper() == "REJECT":
@@ -2063,6 +1815,7 @@ def main():
     print(f"[CONFIG] Gemini fallback: {GEMINI_FALLBACK_MODEL}")
     print("[CONFIG] Images: article page only; no image search fallback")
     print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
+    print(f"[CONFIG] Gemini retries per model: {GEMINI_RETRY_ATTEMPTS}, timeout: {GEMINI_TIMEOUT}s")
     print("=" * 70)
 
     try:
@@ -2087,7 +1840,24 @@ def main():
         if not is_processed(item["url"])
     ]
 
+    retry_items = get_retryable_gemini_items()
+
+    current_urls = {
+        normalize_url(item["url"])
+        for item in new_items
+    }
+
+    for item in retry_items:
+        if normalize_url(item["url"]) not in current_urls:
+            new_items.append(item)
+            current_urls.add(normalize_url(item["url"]))
+
     print(f"[HEAVY] New articles: {len(new_items)}")
+    if retry_items:
+        print(
+            "[RETRY] Previously failed Gemini items queued: "
+            f"{len(retry_items)}"
+        )
 
     if not new_items:
         print("[BOT] No new articles. Nothing to publish.")
