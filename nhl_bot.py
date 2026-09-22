@@ -1780,9 +1780,14 @@ def generate_post(title, article):
                 result = clean_post(result)
 
                 if result.upper() == "REJECT":
-                    raise PostRejected(
-                        "Gemini could not produce a relevant Russian news post"
+                    last_error = RuntimeError(
+                        f"Gemini {label.lower()} rejected the article as not relevant"
                     )
+                    print(
+                        f"[GEMINI {label} REJECTED] "
+                        "Model returned REJECT; trying the next LLM fallback."
+                    )
+                    continue
 
                 validated = validate_post_content(result)
                 print(
@@ -1826,8 +1831,15 @@ def generate_post(title, article):
             result = clean_post(result)
 
             if result.upper() == "REJECT":
-                raise PostRejected(
-                    "OpenRouter could not produce a relevant Russian news post"
+                last_error = RuntimeError(
+                    "OpenRouter rejected the article as not relevant"
+                )
+                print(
+                    "[OPENROUTER REJECTED] Model returned REJECT; "
+                    "content generation failed for this article."
+                )
+                raise PostValidationServiceError(
+                    "All configured LLMs rejected or failed to generate a post"
                 )
 
             validated = validate_post_content(result)
@@ -2111,7 +2123,18 @@ def main():
     print("[CONFIG] Images: article page only; no image search fallback")
     print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
     print(f"[CONFIG] Gemini retries per model: {GEMINI_RETRY_ATTEMPTS}, timeout: {GEMINI_TIMEOUT}s")
-    print(f"[CONFIG] OpenRouter: {OPENROUTER_MODEL if OPENROUTER_API_KEY else 'not configured'}, retries: {OPENROUTER_RETRY_ATTEMPTS}, timeout: {OPENROUTER_TIMEOUT}s")
+    if OPENROUTER_API_KEY:
+        print(
+            f"[CONFIG] OpenRouter: {OPENROUTER_MODEL}, "
+            f"retries: {OPENROUTER_RETRY_ATTEMPTS}, "
+            f"timeout: {OPENROUTER_TIMEOUT}s"
+        )
+    else:
+        print(
+            "[CONFIG] OpenRouter: DISABLED (OPENROUTER_API_KEY is missing); "
+            f"retries: {OPENROUTER_RETRY_ATTEMPTS}, "
+            f"timeout: {OPENROUTER_TIMEOUT}s"
+        )
     print("=" * 70)
 
     try:
