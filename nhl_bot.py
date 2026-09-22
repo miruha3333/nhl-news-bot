@@ -553,7 +553,7 @@ def mark_processed(url):
     conn.close()
 
 
-def get_retryable_gemini_items():
+def get_retryable_llm_items():
     """Return previously discovered news that failed only because Gemini was unavailable.
 
     These rows intentionally remain processed=0. That means a temporary Gemini
@@ -576,7 +576,7 @@ def get_retryable_gemini_items():
                     FROM errors AS e2
                     WHERE e2.url = n.url
                 )
-                AND e.stage = 'gemini_service'
+                AND e.stage IN ('gemini_service', 'llm_service')
           )
         ORDER BY n.id ASC
         """
@@ -2072,7 +2072,7 @@ def process_news(
         log_error(
             url,
             str(exc),
-            "gemini_service",
+            "llm_service",
         )
 
         # Service failures remain unprocessed and will be retried later.
@@ -2123,6 +2123,21 @@ def main():
     print("[CONFIG] Images: article page only; no image search fallback")
     print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
     print(f"[CONFIG] Gemini retries per model: {GEMINI_RETRY_ATTEMPTS}, timeout: {GEMINI_TIMEOUT}s")
+
+    if GEMINI_API_KEY:
+        print(
+            f"[CONFIG] Gemini API key: PRESENT ({len(GEMINI_API_KEY)} chars)"
+        )
+    else:
+        print("[CONFIG] Gemini API key: MISSING")
+
+    if OPENROUTER_API_KEY:
+        print(
+            f"[CONFIG] OpenRouter API key: PRESENT ({len(OPENROUTER_API_KEY)} chars)"
+        )
+    else:
+        print("[CONFIG] OpenRouter API key: MISSING")
+
     if OPENROUTER_API_KEY:
         print(
             f"[CONFIG] OpenRouter: {OPENROUTER_MODEL}, "
@@ -2159,7 +2174,7 @@ def main():
         if not is_processed(item["url"])
     ]
 
-    retry_items = get_retryable_gemini_items()
+    retry_items = get_retryable_llm_items()
 
     current_urls = {
         normalize_url(item["url"])
@@ -2174,7 +2189,7 @@ def main():
     print(f"[HEAVY] New articles: {len(new_items)}")
     if retry_items:
         print(
-            "[RETRY] Previously failed Gemini items queued: "
+            "[RETRY] Previously failed LLM items queued: "
             f"{len(retry_items)}"
         )
 
