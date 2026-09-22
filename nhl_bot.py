@@ -12,6 +12,11 @@ from urllib.parse import urljoin, urlparse, urlunparse
 import requests
 from bs4 import BeautifulSoup
 
+try:
+    from PIL import Image
+except ImportError:
+    Image = None
+
 
 SOURCE_URL = "https://heavy.com/sports/nhl/"
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
@@ -1779,7 +1784,11 @@ def generate_post(title, article):
                         "Gemini could not produce a relevant Russian news post"
                     )
 
-                return validate_post_content(result)
+                validated = validate_post_content(result)
+                print(
+                    f"[POST] Generated successfully by Gemini {label.lower()}: {model}"
+                )
+                return validated
 
             except PostRejected:
                 raise
@@ -1821,7 +1830,11 @@ def generate_post(title, article):
                     "OpenRouter could not produce a relevant Russian news post"
                 )
 
-            return validate_post_content(result)
+            validated = validate_post_content(result)
+            print(
+                f"[POST] Generated successfully by OpenRouter: {OPENROUTER_MODEL}"
+            )
+            return validated
 
         except PostRejected:
             raise
@@ -1838,6 +1851,86 @@ def generate_post(title, article):
 # =========================================================
 # TELEGRAM
 # =========================================================
+
+def prepare_telegram_photo(image_path):
+    """Convert the source image to a Telegram-friendly JPEG photo.
+
+    Telegram may reject otherwise valid WebP/AVIF images or unusual dimensions
+    when they are uploaded through sendPhoto. Re-encode them as JPEG and keep
+    the dimensions within a conservative range.
+    """
+    if not image_path:
+        return None
+
+    if Image is None:
+        raise RuntimeError(
+            "Pillow is required to convert images for Telegram; "
+            "add Pillow to requirements.txt"
+        )
+
+    try:
+        with Image.open(image_path) as source:
+            source.load()
+
+            original_size = source.size
+            image = source.convert("RGB")
+
+            max_dimension = 4096
+            width, height = image.size
+
+            if width <= 0 or height <= 0:
+                raise RuntimeError("Downloaded image has invalid dimensions")
+
+            scale = min(
+                1.0,
+                max_dimension / float(width),
+                max_dimension / float(height),
+            )
+
+            new_size = (width, height)
+
+            if scale < 1.0:
+                new_size = (
+                    max(1, int(round(width * scale))),
+                    max(1, int(round(height * scale))),
+                )
+                image = image.resize(
+                    new_size,
+                    Image.Resampling.LANCZOS,
+                )
+
+            output = tempfile.NamedTemporaryFile(
+                prefix="nhl_telegram_photo_",
+                suffix=".jpg",
+                delete=False,
+            )
+            output_path = output.name
+            output.close()
+
+            image.save(
+                output_path,
+                format="JPEG",
+                quality=92,
+                optimize=True,
+            )
+            image.close()
+
+            print(
+                "[IMAGE] Prepared Telegram photo: "
+                f"{original_size[0]}x{original_size[1]} -> "
+                f"{new_size[0]}x{new_size[1]} | "
+                f"JPEG | {output_path}"
+            )
+
+            return output_path
+
+    except Exception as exc:
+        print(
+            "[IMAGE] Telegram JPEG conversion failed: "
+            f"{exc}"
+        )
+        raise
+
 
 def send_telegram(
     post,
@@ -1859,8 +1952,12 @@ def send_telegram(
     if not formatted_post:
         raise RuntimeError("Formatted Telegram post is empty")
 
+    prepared_image_path = None
+
     if image_path:
-        with open(image_path, "rb") as image_file:
+        prepared_image_path = prepare_telegram_photo(image_path)
+
+        with open(prepared_image_path, "rb") as image_file:
             response = requests.post(
                 f"{base_url}/sendPhoto",
                 data={
@@ -1868,33 +1965,9 @@ def send_telegram(
                     "caption": formatted_post,
                     "parse_mode": "HTML",
                 },
-                files={"photo": image_file},
+                files={"photo": ("nhl.jpg", image_file, "image/jpeg")},
                 timeout=TELEGRAM_TIMEOUT,
             )
-
-        # Some Heavy CDN images are valid files but Telegram rejects them as a
-        # photo because of dimensions/format. Keep the news publishable by
-        # falling back to sendDocument instead of losing the whole item.
-        if (
-            response.status_code == 400
-            and "PHOTO_INVALID_DIMENSIONS" in response.text
-        ):
-            print(
-                "[TELEGRAM] Photo rejected by Telegram; "
-                "retrying the same file as a document.\n"
-            )
-
-            with open(image_path, "rb") as image_file:
-                response = requests.post(
-                    f"{base_url}/sendDocument",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "caption": formatted_post,
-                        "parse_mode": "HTML",
-                    },
-                    files={"document": image_file},
-                    timeout=TELEGRAM_TIMEOUT,
-                )
     else:
         response = requests.post(
             f"{base_url}/sendMessage",
@@ -1912,6 +1985,12 @@ def send_telegram(
             f"{response.status_code}: "
             f"{response.text[:1000]}"
         )
+
+    if prepared_image_path and prepared_image_path != image_path:
+        try:
+            os.unlink(prepared_image_path)
+        except OSError:
+            pass
 
 def process_news(
     item,
