@@ -17,6 +17,7 @@ SOURCE_URL = "https://heavy.com/sports/nhl/"
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
+OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
 
 DATABASE_FILE = "nhl_bot.db"
 
@@ -29,6 +30,11 @@ GEMINI_TIMEOUT = 60
 GEMINI_RETRY_ATTEMPTS = 3
 GEMINI_RETRY_BASE_DELAY = 5
 GEMINI_RETRY_MAX_DELAY = 20
+OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
+OPENROUTER_TIMEOUT = 60
+OPENROUTER_RETRY_ATTEMPTS = 2
+OPENROUTER_RETRY_BASE_DELAY = 5
+OPENROUTER_RETRY_MAX_DELAY = 15
 TELEGRAM_TIMEOUT = 60
 
 SOURCE_IMAGE_DOWNLOAD_TIMEOUT = 15
@@ -1314,6 +1320,160 @@ def gemini_request_with_retry(model, prompt, label):
     raise last_error
 
 
+
+def openrouter_request(
+    model,
+    prompt,
+):
+    """Generate a post through OpenRouter as the emergency LLM fallback."""
+    if not OPENROUTER_API_KEY:
+        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+
+    url = "https://openrouter.ai/api/v1/chat/completions"
+
+    payload = {
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": prompt,
+            }
+        ],
+        "max_tokens": 1000,
+    }
+
+    headers = {
+        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Content-Type": "application/json",
+        "X-Title": "NHL News Bot",
+    }
+
+    try:
+        response = requests.post(
+            url,
+            headers=headers,
+            json=payload,
+            timeout=(10, OPENROUTER_TIMEOUT),
+        )
+    except requests.exceptions.ReadTimeout as exc:
+        raise RuntimeError(
+            f"OpenRouter read timeout after {OPENROUTER_TIMEOUT}s"
+        ) from exc
+    except requests.exceptions.ConnectTimeout as exc:
+        raise RuntimeError(
+            "OpenRouter connection timeout"
+        ) from exc
+    except requests.exceptions.RequestException as exc:
+        raise RuntimeError(
+            f"OpenRouter network error: {exc}"
+        ) from exc
+
+    if response.status_code >= 400:
+        raise RuntimeError(
+            "OpenRouter HTTP "
+            f"{response.status_code}: "
+            f"{response.text[:1000]}"
+        )
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise RuntimeError(
+            "OpenRouter returned invalid JSON"
+        ) from exc
+
+    choices = data.get("choices", [])
+
+    if not choices:
+        raise RuntimeError("OpenRouter returned no choices")
+
+    message = choices[0].get("message", {})
+    text = message.get("content", "")
+
+    if isinstance(text, list):
+        text = "".join(
+            item.get("text", "")
+            for item in text
+            if isinstance(item, dict)
+        )
+
+    text = str(text or "").strip()
+
+    if not text:
+        finish_reason = choices[0].get(
+            "finish_reason",
+            "unknown",
+        )
+        raise RuntimeError(
+            "OpenRouter returned an empty response; "
+            f"finish reason: {finish_reason}"
+        )
+
+    return text
+
+
+def is_openrouter_temporary_error(error):
+    error_text = str(error).lower()
+
+    return any(
+        marker in error_text
+        for marker in (
+            "http 408",
+            "http 429",
+            "http 500",
+            "http 502",
+            "http 503",
+            "http 504",
+            "rate limit",
+            "too many requests",
+            "timeout",
+            "timed out",
+            "network error",
+            "connection timeout",
+            "temporarily unavailable",
+            "overloaded",
+            "high demand",
+        )
+    )
+
+
+def openrouter_request_with_retry(model, prompt):
+    """Retry transient OpenRouter failures before giving up."""
+    last_error = None
+
+    for attempt in range(1, OPENROUTER_RETRY_ATTEMPTS + 1):
+        try:
+            if attempt > 1:
+                print(
+                    f"[OPENROUTER] Retry attempt "
+                    f"{attempt}/{OPENROUTER_RETRY_ATTEMPTS}"
+                )
+
+            return openrouter_request(model, prompt)
+
+        except Exception as exc:
+            last_error = exc
+
+            if (
+                not is_openrouter_temporary_error(exc)
+                or attempt >= OPENROUTER_RETRY_ATTEMPTS
+            ):
+                raise
+
+            delay = min(
+                OPENROUTER_RETRY_MAX_DELAY,
+                OPENROUTER_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+            )
+            delay += random.uniform(0, 2)
+
+            print(
+                "[OPENROUTER] Temporary error; "
+                f"retrying in {delay:.1f}s: {exc}"
+            )
+            time.sleep(delay)
+
+    raise last_error
+
 def clean_post(text):
     text = (text or "").strip()
     text = text.replace("\r\n", "\n").replace("\r", "\n")
@@ -1583,34 +1743,82 @@ def is_gemini_temporary_error(error):
 def generate_post(title, article):
     global GEMINI_PRIMARY_DISABLED
 
-    if not GEMINI_API_KEY:
-        raise RuntimeError("GEMINI_API_KEY is not configured")
+    if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+        raise RuntimeError(
+            "Neither GEMINI_API_KEY nor OPENROUTER_API_KEY is configured"
+        )
 
     prompt = generate_post_prompt(title, article)
 
-    models = []
-
-    if not GEMINI_PRIMARY_DISABLED:
-        models.append((GEMINI_PRIMARY_MODEL, "PRIMARY"))
-
-    models.append((GEMINI_FALLBACK_MODEL, "FALLBACK"))
-
     last_error = None
 
-    for model, label in models:
-        print(f"[GEMINI {label}] Using {model}")
+    # 1) Direct Gemini primary.
+    # 2) Direct Gemini fallback.
+    # 3) OpenRouter emergency fallback.
+    if GEMINI_API_KEY:
+        models = []
+
+        if not GEMINI_PRIMARY_DISABLED:
+            models.append((GEMINI_PRIMARY_MODEL, "PRIMARY"))
+
+        models.append((GEMINI_FALLBACK_MODEL, "FALLBACK"))
+
+        for model, label in models:
+            print(f"[GEMINI {label}] Using {model}")
+
+            try:
+                result = gemini_request_with_retry(
+                    model,
+                    prompt,
+                    label,
+                )
+                result = clean_post(result)
+
+                if result.upper() == "REJECT":
+                    raise PostRejected(
+                        "Gemini could not produce a relevant Russian news post"
+                    )
+
+                return validate_post_content(result)
+
+            except PostRejected:
+                raise
+
+            except Exception as exc:
+                last_error = exc
+
+                print(
+                    f"[GEMINI {label} ERROR] {exc}"
+                )
+
+                if label == "PRIMARY" and is_gemini_temporary_error(exc):
+                    GEMINI_PRIMARY_DISABLED = True
+                    print(
+                        "[GEMINI] Primary disabled for the remainder of this run; "
+                        "using fallback model."
+                    )
+                    continue
+
+                if label == "PRIMARY":
+                    continue
+
+                break
+
+    # OpenRouter is intentionally the emergency provider rather than the normal
+    # path. It keeps the bot alive when Google's direct API is overloaded or down.
+    if OPENROUTER_API_KEY:
+        print(f"[OPENROUTER] Using {OPENROUTER_MODEL}")
 
         try:
-            result = gemini_request_with_retry(
-                model,
+            result = openrouter_request_with_retry(
+                OPENROUTER_MODEL,
                 prompt,
-                label,
             )
             result = clean_post(result)
 
             if result.upper() == "REJECT":
                 raise PostRejected(
-                    "Gemini could not produce a relevant Russian news post"
+                    "OpenRouter could not produce a relevant Russian news post"
                 )
 
             return validate_post_content(result)
@@ -1620,26 +1828,10 @@ def generate_post(title, article):
 
         except Exception as exc:
             last_error = exc
-
-            print(
-                f"[GEMINI {label} ERROR] {exc}"
-            )
-
-            if label == "PRIMARY" and is_gemini_temporary_error(exc):
-                GEMINI_PRIMARY_DISABLED = True
-                print(
-                    "[GEMINI] Primary disabled for the remainder of this run; "
-                    "using fallback model."
-                )
-                continue
-
-            if label == "PRIMARY":
-                continue
-
-            break
+            print(f"[OPENROUTER ERROR] {exc}")
 
     raise PostValidationServiceError(
-        f"Gemini content generation service failed: {last_error}"
+        f"LLM content generation service failed: {last_error}"
     )
 
 
@@ -1679,6 +1871,30 @@ def send_telegram(
                 files={"photo": image_file},
                 timeout=TELEGRAM_TIMEOUT,
             )
+
+        # Some Heavy CDN images are valid files but Telegram rejects them as a
+        # photo because of dimensions/format. Keep the news publishable by
+        # falling back to sendDocument instead of losing the whole item.
+        if (
+            response.status_code == 400
+            and "PHOTO_INVALID_DIMENSIONS" in response.text
+        ):
+            print(
+                "[TELEGRAM] Photo rejected by Telegram; "
+                "retrying the same file as a document.\n"
+            )
+
+            with open(image_path, "rb") as image_file:
+                response = requests.post(
+                    f"{base_url}/sendDocument",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": formatted_post,
+                        "parse_mode": "HTML",
+                    },
+                    files={"document": image_file},
+                    timeout=TELEGRAM_TIMEOUT,
+                )
     else:
         response = requests.post(
             f"{base_url}/sendMessage",
@@ -1816,6 +2032,7 @@ def main():
     print("[CONFIG] Images: article page only; no image search fallback")
     print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
     print(f"[CONFIG] Gemini retries per model: {GEMINI_RETRY_ATTEMPTS}, timeout: {GEMINI_TIMEOUT}s")
+    print(f"[CONFIG] OpenRouter: {OPENROUTER_MODEL if OPENROUTER_API_KEY else 'not configured'}, retries: {OPENROUTER_RETRY_ATTEMPTS}, timeout: {OPENROUTER_TIMEOUT}s")
     print("=" * 70)
 
     try:
