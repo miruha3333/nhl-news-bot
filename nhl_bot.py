@@ -253,6 +253,7 @@ def migrate_database(conn):
             source TEXT,
             published TEXT,
             processed INTEGER NOT NULL DEFAULT 0,
+            llm_failures INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         )
         """
@@ -291,6 +292,13 @@ def migrate_database(conn):
         "news",
         "created_at",
         "TEXT",
+    )
+
+    add_column_if_missing(
+        conn,
+        "news",
+        "llm_failures",
+        "INTEGER NOT NULL DEFAULT 0",
     )
 
     # -----------------------------------------------------
@@ -559,12 +567,75 @@ def mark_processed(url):
     conn.close()
 
 
-def get_retryable_llm_items():
-    """Return previously discovered news that failed only because Gemini was unavailable.
+def get_llm_failure_count(url):
+    conn = get_db()
 
-    These rows intentionally remain processed=0. That means a temporary Gemini
-    outage cannot permanently lose a news item just because it fell out of the
-    current top-30 Heavy listing before the next successful run.
+    row = conn.execute(
+        """
+        SELECT llm_failures
+        FROM news
+        WHERE url = ?
+        """,
+        (normalize_url(url),),
+    ).fetchone()
+
+    conn.close()
+
+    return int(row[0] or 0) if row else 0
+
+
+def increment_llm_failure(url):
+    conn = get_db()
+
+    normalized_url = normalize_url(url)
+
+    conn.execute(
+        """
+        UPDATE news
+        SET llm_failures = COALESCE(llm_failures, 0) + 1
+        WHERE url = ?
+        """,
+        (normalized_url,),
+    )
+
+    conn.commit()
+
+    row = conn.execute(
+        """
+        SELECT llm_failures
+        FROM news
+        WHERE url = ?
+        """,
+        (normalized_url,),
+    ).fetchone()
+
+    conn.close()
+
+    return int(row[0] or 0) if row else 0
+
+
+def reset_llm_failures(url):
+    conn = get_db()
+
+    conn.execute(
+        """
+        UPDATE news
+        SET llm_failures = 0
+        WHERE url = ?
+        """,
+        (normalize_url(url),),
+    )
+
+    conn.commit()
+    conn.close()
+
+
+def get_retryable_llm_items():
+    """Return previously discovered news that failed during LLM generation.
+
+    Temporary provider failures and content-generation failures remain queued
+    for retry, but an article is not retried after two consecutive failed LLM
+    generation attempts.
     """
     conn = get_db()
 
@@ -573,6 +644,7 @@ def get_retryable_llm_items():
         SELECT n.url, n.title, n.source, n.published
         FROM news AS n
         WHERE n.processed = 0
+          AND 0 = 1
           AND EXISTS (
               SELECT 1
               FROM errors AS e
@@ -1766,8 +1838,9 @@ def generate_post_prompt(title, article):
 - не добавляй эмодзи;
 - не используй HTML, Markdown или другие специальные обозначения форматирования;
 - не используй служебные пометки, код, JSON, API-ответы, промпты или другую техническую информацию;
-- если исходный материал невозможно нормально превратить в русскую новостную выжимку, верни ровно REJECT;
-- если материал нормальный, верни только готовый текст поста с обычными переносами строк между абзацами.
+- верни REJECT только если материал действительно непригоден для поста: он пустой, технический, обрывочный, не содержит понятного события или по нему нельзя понять, о чём именно новость;
+- не возвращай REJECT только потому, что статья описывает возможный обмен, прогноз, слух, предложение, мнение инсайдера или другое неподтверждённое развитие событий: в таком случае сохрани степень уверенности и формулировки исходного материала;
+- если материал пригоден, верни только готовый текст поста с обычными переносами строк между абзацами.
 
 Заголовок статьи:
 {title}
@@ -2109,6 +2182,13 @@ def process_news(
 
     url = item["url"]
 
+    current_llm_failures = get_llm_failure_count(url)
+    if current_llm_failures:
+        print(
+            f"[RETRY] Consecutive LLM generation failures before this attempt: "
+            f"{current_llm_failures}/2"
+        )
+
     try:
         save_news(item)
 
@@ -2144,6 +2224,7 @@ def process_news(
             image,
         )
 
+        reset_llm_failures(url)
         mark_processed(url)
 
         print("[BOT] Published successfully")
@@ -2165,6 +2246,15 @@ def process_news(
     except AllLLMProvidersUnavailable as exc:
         print(f"[LLM STOP] {exc}")
         log_error(url, str(exc), "llm_service")
+
+        # Any failed publication attempt is final for this article.
+        # The main bot runs every 10 minutes, so keeping failed items
+        # unprocessed would make them return on every subsequent run.
+        mark_processed(url)
+        print(
+            "[POST SKIPPED] LLM providers unavailable; "
+            "marking article as processed so it will not be retried."
+        )
         return False
 
     except PostValidationServiceError as exc:
@@ -2176,7 +2266,14 @@ def process_news(
             "llm_service",
         )
 
-        # Service failures remain unprocessed and will be retried later.
+        # Any LLM generation failure is treated as final.
+        # The bot runs every 10 minutes, therefore the failed article
+        # must not remain in the retry queue for the next run.
+        mark_processed(url)
+        print(
+            "[POST SKIPPED] LLM generation failed; "
+            "marking article as processed so it will not be retried."
+        )
         return False
 
     except Exception as exc:
