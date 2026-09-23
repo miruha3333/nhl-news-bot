@@ -56,6 +56,8 @@ HISTORICAL_YEAR_TOLERANCE = 3
 
 DATABASE_READY = False
 GEMINI_PRIMARY_DISABLED = False
+GEMINI_FALLBACK_DISABLED = False
+OPENROUTER_DISABLED = False
 
 
 class PostRejected(Exception):
@@ -1282,6 +1284,21 @@ def gemini_request(
     return text
 
 
+def is_gemini_quota_exhausted(error):
+    error_text = str(error).lower()
+
+    return any(
+        marker in error_text
+        for marker in (
+            "generate_content_free_tier_requests",
+            "quota exceeded",
+            "resource_exhausted",
+            "limit: 500",
+            "limit: 20",
+        )
+    )
+
+
 def gemini_request_with_retry(model, prompt, label):
     """Retry transient Gemini failures before giving up on a model.
 
@@ -1303,6 +1320,16 @@ def gemini_request_with_retry(model, prompt, label):
 
         except Exception as exc:
             last_error = exc
+
+            # A daily/free-tier quota exhaustion will not recover by retrying
+            # the same request. Fail fast so one exhausted provider cannot
+            # hold the bot for minutes for every article.
+            if is_gemini_quota_exhausted(exc):
+                print(
+                    f"[GEMINI {label}] Quota exhausted; "
+                    "skipping remaining retries for this model."
+                )
+                raise
 
             if (
                 not is_gemini_temporary_error(exc)
@@ -1442,6 +1469,19 @@ def is_openrouter_temporary_error(error):
     )
 
 
+def is_openrouter_daily_quota_exhausted(error):
+    error_text = str(error).lower()
+
+    return any(
+        marker in error_text
+        for marker in (
+            "free-models-per-day",
+            "openrouter_free_tier_daily",
+            "add 10 credits",
+        )
+    )
+
+
 def openrouter_request_with_retry(model, prompt):
     """Retry transient OpenRouter failures before giving up."""
     last_error = None
@@ -1458,6 +1498,15 @@ def openrouter_request_with_retry(model, prompt):
 
         except Exception as exc:
             last_error = exc
+
+            # OpenRouter's free daily quota is a hard limit. Retrying it only
+            # wastes time and creates a long failed run.
+            if is_openrouter_daily_quota_exhausted(exc):
+                print(
+                    "[OPENROUTER] Daily free-model quota exhausted; "
+                    "skipping remaining retries."
+                )
+                raise
 
             if (
                 not is_openrouter_temporary_error(exc)
@@ -1747,6 +1796,8 @@ def is_gemini_temporary_error(error):
 
 def generate_post(title, article):
     global GEMINI_PRIMARY_DISABLED
+    global GEMINI_FALLBACK_DISABLED
+    global OPENROUTER_DISABLED
 
     if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
         raise RuntimeError(
@@ -1766,7 +1817,8 @@ def generate_post(title, article):
         if not GEMINI_PRIMARY_DISABLED:
             models.append((GEMINI_PRIMARY_MODEL, "PRIMARY"))
 
-        models.append((GEMINI_FALLBACK_MODEL, "FALLBACK"))
+        if not GEMINI_FALLBACK_DISABLED:
+            models.append((GEMINI_FALLBACK_MODEL, "FALLBACK"))
 
         for model, label in models:
             print(f"[GEMINI {label}] Using {model}")
@@ -1805,6 +1857,18 @@ def generate_post(title, article):
                     f"[GEMINI {label} ERROR] {exc}"
                 )
 
+                if is_gemini_quota_exhausted(exc):
+                    if label == "PRIMARY":
+                        GEMINI_PRIMARY_DISABLED = True
+                    else:
+                        GEMINI_FALLBACK_DISABLED = True
+
+                    print(
+                        f"[GEMINI] {label} disabled for the remainder of this run "
+                        "because its quota is exhausted."
+                    )
+                    continue
+
                 if label == "PRIMARY" and is_gemini_temporary_error(exc):
                     GEMINI_PRIMARY_DISABLED = True
                     print(
@@ -1820,7 +1884,7 @@ def generate_post(title, article):
 
     # OpenRouter is intentionally the emergency provider rather than the normal
     # path. It keeps the bot alive when Google's direct API is overloaded or down.
-    if OPENROUTER_API_KEY:
+    if OPENROUTER_API_KEY and not OPENROUTER_DISABLED:
         print(f"[OPENROUTER] Using {OPENROUTER_MODEL}")
 
         try:
@@ -1853,6 +1917,14 @@ def generate_post(title, article):
 
         except Exception as exc:
             last_error = exc
+
+            if is_openrouter_daily_quota_exhausted(exc):
+                OPENROUTER_DISABLED = True
+                print(
+                    "[OPENROUTER] Disabled for the remainder of this run "
+                    "because the daily free-model quota is exhausted."
+                )
+
             print(f"[OPENROUTER ERROR] {exc}")
 
     raise PostValidationServiceError(
@@ -2123,6 +2195,7 @@ def main():
     print("[CONFIG] Images: article page only; no image search fallback")
     print("[CONFIG] Posts: concise, 2-4 paragraphs, max 850 chars, HTML formatting")
     print(f"[CONFIG] Gemini retries per model: {GEMINI_RETRY_ATTEMPTS}, timeout: {GEMINI_TIMEOUT}s")
+    print("[CONFIG] Provider daily-quota errors: fail fast; no repeated retries")
 
     if GEMINI_API_KEY:
         print(
