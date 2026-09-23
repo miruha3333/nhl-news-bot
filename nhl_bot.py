@@ -68,6 +68,10 @@ class PostValidationServiceError(Exception):
     """The validation service failed; the news should remain retryable."""
 
 
+class AllLLMProvidersUnavailable(PostValidationServiceError):
+    """All configured LLM providers are unavailable for this run."""
+
+
 # =========================================================
 # URL
 # =========================================================
@@ -1794,41 +1798,50 @@ def is_gemini_temporary_error(error):
     )
 
 
+def all_llm_providers_disabled():
+    """Return True when every configured LLM provider is unavailable."""
+    gemini_unavailable = (
+        not GEMINI_API_KEY
+        or (GEMINI_PRIMARY_DISABLED and GEMINI_FALLBACK_DISABLED)
+    )
+    openrouter_unavailable = (
+        not OPENROUTER_API_KEY
+        or OPENROUTER_DISABLED
+    )
+    return gemini_unavailable and openrouter_unavailable
+
+
 def generate_post(title, article):
     global GEMINI_PRIMARY_DISABLED
     global GEMINI_FALLBACK_DISABLED
     global OPENROUTER_DISABLED
 
     if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
-        raise RuntimeError(
-            "Neither GEMINI_API_KEY nor OPENROUTER_API_KEY is configured"
+        raise PostValidationServiceError(
+            "No LLM providers are configured "
+            "(GEMINI_API_KEY and OPENROUTER_API_KEY are missing)"
+        )
+
+    if all_llm_providers_disabled():
+        raise AllLLMProvidersUnavailable(
+            "All configured LLM providers are unavailable for this run "
+            "(daily quota exhausted or provider disabled)"
         )
 
     prompt = generate_post_prompt(title, article)
-
     last_error = None
 
-    # 1) Direct Gemini primary.
-    # 2) Direct Gemini fallback.
-    # 3) OpenRouter emergency fallback.
     if GEMINI_API_KEY:
         models = []
-
         if not GEMINI_PRIMARY_DISABLED:
             models.append((GEMINI_PRIMARY_MODEL, "PRIMARY"))
-
         if not GEMINI_FALLBACK_DISABLED:
             models.append((GEMINI_FALLBACK_MODEL, "FALLBACK"))
 
         for model, label in models:
             print(f"[GEMINI {label}] Using {model}")
-
             try:
-                result = gemini_request_with_retry(
-                    model,
-                    prompt,
-                    label,
-                )
+                result = gemini_request_with_retry(model, prompt, label)
                 result = clean_post(result)
 
                 if result.upper() == "REJECT":
@@ -1836,8 +1849,8 @@ def generate_post(title, article):
                         f"Gemini {label.lower()} rejected the article as not relevant"
                     )
                     print(
-                        f"[GEMINI {label} REJECTED] "
-                        "Model returned REJECT; trying the next LLM fallback."
+                        f"[GEMINI {label} REJECTED] Model returned REJECT; "
+                        "trying the next LLM fallback."
                     )
                     continue
 
@@ -1849,24 +1862,24 @@ def generate_post(title, article):
 
             except PostRejected:
                 raise
-
             except Exception as exc:
                 last_error = exc
-
-                print(
-                    f"[GEMINI {label} ERROR] {exc}"
-                )
+                print(f"[GEMINI {label} ERROR] {exc}")
 
                 if is_gemini_quota_exhausted(exc):
                     if label == "PRIMARY":
                         GEMINI_PRIMARY_DISABLED = True
                     else:
                         GEMINI_FALLBACK_DISABLED = True
-
                     print(
                         f"[GEMINI] {label} disabled for the remainder of this run "
                         "because its quota is exhausted."
                     )
+                    if all_llm_providers_disabled():
+                        raise AllLLMProvidersUnavailable(
+                            "All configured LLM providers are unavailable for this run. "
+                            f"Last error: {exc}"
+                        )
                     continue
 
                 if label == "PRIMARY" and is_gemini_temporary_error(exc):
@@ -1875,23 +1888,21 @@ def generate_post(title, article):
                         "[GEMINI] Primary disabled for the remainder of this run; "
                         "using fallback model."
                     )
+                    if all_llm_providers_disabled():
+                        raise AllLLMProvidersUnavailable(
+                            "All configured LLM providers are unavailable for this run. "
+                            f"Last error: {exc}"
+                        )
                     continue
 
                 if label == "PRIMARY":
                     continue
-
                 break
 
-    # OpenRouter is intentionally the emergency provider rather than the normal
-    # path. It keeps the bot alive when Google's direct API is overloaded or down.
     if OPENROUTER_API_KEY and not OPENROUTER_DISABLED:
         print(f"[OPENROUTER] Using {OPENROUTER_MODEL}")
-
         try:
-            result = openrouter_request_with_retry(
-                OPENROUTER_MODEL,
-                prompt,
-            )
+            result = openrouter_request_with_retry(OPENROUTER_MODEL, prompt)
             result = clean_post(result)
 
             if result.upper() == "REJECT":
@@ -1914,21 +1925,30 @@ def generate_post(title, article):
 
         except PostRejected:
             raise
-
         except Exception as exc:
             last_error = exc
-
             if is_openrouter_daily_quota_exhausted(exc):
                 OPENROUTER_DISABLED = True
                 print(
                     "[OPENROUTER] Disabled for the remainder of this run "
                     "because the daily free-model quota is exhausted."
                 )
-
             print(f"[OPENROUTER ERROR] {exc}")
 
+            if all_llm_providers_disabled():
+                raise AllLLMProvidersUnavailable(
+                    "All configured LLM providers are unavailable for this run. "
+                    f"Last error: {exc}"
+                )
+
+    if last_error is not None:
+        raise PostValidationServiceError(
+            f"LLM content generation service failed: {last_error}"
+        )
+
     raise PostValidationServiceError(
-        f"LLM content generation service failed: {last_error}"
+        "LLM content generation service failed: "
+        "all configured providers are currently disabled"
     )
 
 
@@ -2138,6 +2158,11 @@ def process_news(
         mark_processed(url)
         return False
 
+    except AllLLMProvidersUnavailable as exc:
+        print(f"[LLM STOP] {exc}")
+        log_error(url, str(exc), "llm_service")
+        return False
+
     except PostValidationServiceError as exc:
         print(f"[POST VALIDATION ERROR] {exc}")
 
@@ -2185,6 +2210,14 @@ def process_news(
 # =========================================================
 
 def main():
+    global GEMINI_PRIMARY_DISABLED
+    global GEMINI_FALLBACK_DISABLED
+    global OPENROUTER_DISABLED
+
+    GEMINI_PRIMARY_DISABLED = False
+    GEMINI_FALLBACK_DISABLED = False
+    OPENROUTER_DISABLED = False
+
     print("=" * 70)
     print("NHL NEWS BOT START")
     print("=" * 70)
@@ -2280,14 +2313,28 @@ def main():
     failed = 0
 
     for index, item in enumerate(new_items, 1):
-        if process_news(
-            item,
-            index,
-            len(new_items),
-        ):
+        if all_llm_providers_disabled():
+            remaining = len(new_items) - index + 1
+            print(
+                "[BOT] All LLM providers are unavailable. "
+                f"Stopping this run; {remaining} item(s) remain for the next run."
+            )
+            break
+
+        if process_news(item, index, len(new_items)):
             published += 1
         else:
             failed += 1
+
+        if all_llm_providers_disabled():
+            remaining = len(new_items) - index
+            if remaining > 0:
+                print(
+                    "[BOT] All LLM providers became unavailable. "
+                    f"Stopping this run; {remaining} item(s) remain for the next run."
+                )
+            break
+
 
     print("=" * 70)
     print("NHL NEWS BOT FINISHED")
