@@ -27,11 +27,11 @@ jobs:
 
       - name: Run bot
         run: python nhl_bot.py
-        env:
-          TOKEN: ${{ secrets.TOKEN }}
-          CHAT_ID: ${{ secrets.CHAT_ID }}
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
+       env:
+  TOKEN: ${{ secrets.TOKEN }}
+  CHAT_ID: ${{ secrets.CHAT_ID }}
+  GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+  ANYMODEL_API_KEY: ${{ secrets.ANYMODEL_API_KEY }}
 
       - name: Commit bot state
         run: |
