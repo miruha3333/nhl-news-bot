@@ -5,6 +5,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: nhl-news-bot
+  cancel-in-progress: false
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -29,16 +33,19 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           OPENROUTER_API_KEY: ${{ secrets.OPENROUTER_API_KEY }}
 
-      - name: Commit history
+      - name: Commit bot state
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add history.txt
-          
-          # Проверяем, изменился ли файл истории, чтобы избежать пустых коммитов и ошибок
+
+          # КРИТИЧНО: SQLite-база хранит processed=1.
+          # Если не сохранять nhl_bot.db, следующий GitHub Actions runner
+          # снова увидит те же новости как новые и бот будет публиковать их повторно.
+          git add nhl_bot.db history.txt
+
           if ! git diff --staged --quiet; then
-            git commit -m "Update history [skip ci]"
+            git commit -m "Update bot state [skip ci]"
             git push
           else
-            echo "История не изменилась, пушить нечего."
+            echo "Состояние не изменилось, пушить нечего."
           fi
