@@ -22,7 +22,7 @@ SOURCE_URL = "https://heavy.com/sports/nhl/"
 TELEGRAM_TOKEN = os.getenv("TOKEN", "").strip()
 TELEGRAM_CHAT_ID = os.getenv("CHAT_ID", "").strip()
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()
-OPENROUTER_API_KEY = os.getenv("OPENROUTER_API_KEY", "").strip()
+ANYMODEL_API_KEY = os.getenv("ANYMODEL_API_KEY", "").strip()
 
 DATABASE_FILE = "nhl_bot.db"
 
@@ -35,11 +35,11 @@ GEMINI_TIMEOUT = 60
 GEMINI_RETRY_ATTEMPTS = 3
 GEMINI_RETRY_BASE_DELAY = 5
 GEMINI_RETRY_MAX_DELAY = 20
-OPENROUTER_MODEL = os.getenv("OPENROUTER_MODEL", "openrouter/free").strip()
-OPENROUTER_TIMEOUT = 60
-OPENROUTER_RETRY_ATTEMPTS = 2
-OPENROUTER_RETRY_BASE_DELAY = 5
-OPENROUTER_RETRY_MAX_DELAY = 15
+ANYMODEL_MODEL = os.getenv("ANYMODEL_MODEL", "cx/gpt-5.6-luna").strip()
+ANYMODEL_TIMEOUT = 60
+ANYMODEL_RETRY_ATTEMPTS = 2
+ANYMODEL_RETRY_BASE_DELAY = 5
+ANYMODEL_RETRY_MAX_DELAY = 15
 TELEGRAM_TIMEOUT = 60
 
 SOURCE_IMAGE_DOWNLOAD_TIMEOUT = 15
@@ -57,7 +57,7 @@ HISTORICAL_YEAR_TOLERANCE = 3
 DATABASE_READY = False
 GEMINI_PRIMARY_DISABLED = False
 GEMINI_FALLBACK_DISABLED = False
-OPENROUTER_DISABLED = False
+ANYMODEL_DISABLED = False
 
 
 class PostRejected(Exception):
@@ -1357,15 +1357,15 @@ def gemini_request_with_retry(model, prompt, label):
 
 
 
-def openrouter_request(
+def anymodel_request(
     model,
     prompt,
 ):
-    """Generate a post through OpenRouter as the emergency LLM fallback."""
-    if not OPENROUTER_API_KEY:
-        raise RuntimeError("OPENROUTER_API_KEY is not configured")
+    """Generate a post through AnyModel as the emergency LLM fallback."""
+    if not ANYMODEL_API_KEY:
+        raise RuntimeError("ANYMODEL_API_KEY is not configured")
 
-    url = "https://openrouter.ai/api/v1/chat/completions"
+    url = "https://anymodel.org/v1/chat/completions"
 
     payload = {
         "model": model,
@@ -1376,12 +1376,12 @@ def openrouter_request(
             }
         ],
         "max_tokens": 1000,
+        "stream": False,
     }
 
     headers = {
-        "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+        "Authorization": f"Bearer {ANYMODEL_API_KEY}",
         "Content-Type": "application/json",
-        "X-Title": "NHL News Bot",
     }
 
     try:
@@ -1389,24 +1389,24 @@ def openrouter_request(
             url,
             headers=headers,
             json=payload,
-            timeout=(10, OPENROUTER_TIMEOUT),
+            timeout=(10, ANYMODEL_TIMEOUT),
         )
     except requests.exceptions.ReadTimeout as exc:
         raise RuntimeError(
-            f"OpenRouter read timeout after {OPENROUTER_TIMEOUT}s"
+            f"AnyModel read timeout after {ANYMODEL_TIMEOUT}s"
         ) from exc
     except requests.exceptions.ConnectTimeout as exc:
         raise RuntimeError(
-            "OpenRouter connection timeout"
+            "AnyModel connection timeout"
         ) from exc
     except requests.exceptions.RequestException as exc:
         raise RuntimeError(
-            f"OpenRouter network error: {exc}"
+            f"AnyModel network error: {exc}"
         ) from exc
 
     if response.status_code >= 400:
         raise RuntimeError(
-            "OpenRouter HTTP "
+            "AnyModel HTTP "
             f"{response.status_code}: "
             f"{response.text[:1000]}"
         )
@@ -1415,13 +1415,13 @@ def openrouter_request(
         data = response.json()
     except ValueError as exc:
         raise RuntimeError(
-            "OpenRouter returned invalid JSON"
+            "AnyModel returned invalid JSON"
         ) from exc
 
     choices = data.get("choices", [])
 
     if not choices:
-        raise RuntimeError("OpenRouter returned no choices")
+        raise RuntimeError("AnyModel returned no choices")
 
     message = choices[0].get("message", {})
     text = message.get("content", "")
@@ -1441,14 +1441,14 @@ def openrouter_request(
             "unknown",
         )
         raise RuntimeError(
-            "OpenRouter returned an empty response; "
+            "AnyModel returned an empty response; "
             f"finish reason: {finish_reason}"
         )
 
     return text
 
 
-def is_openrouter_temporary_error(error):
+def is_anymodel_temporary_error(error):
     error_text = str(error).lower()
 
     return any(
@@ -1473,59 +1473,63 @@ def is_openrouter_temporary_error(error):
     )
 
 
-def is_openrouter_daily_quota_exhausted(error):
+def is_anymodel_quota_exhausted(error):
     error_text = str(error).lower()
 
     return any(
         marker in error_text
         for marker in (
-            "free-models-per-day",
-            "openrouter_free_tier_daily",
-            "add 10 credits",
+            "rate limit",
+            "quota exceeded",
+            "insufficient balance",
+            "insufficient credits",
+            "credits exhausted",
+            "balance is insufficient",
+            "429",
         )
     )
 
 
-def openrouter_request_with_retry(model, prompt):
-    """Retry transient OpenRouter failures before giving up."""
+def anymodel_request_with_retry(model, prompt):
+    """Retry transient AnyModel failures before giving up."""
     last_error = None
 
-    for attempt in range(1, OPENROUTER_RETRY_ATTEMPTS + 1):
+    for attempt in range(1, ANYMODEL_RETRY_ATTEMPTS + 1):
         try:
             if attempt > 1:
                 print(
-                    f"[OPENROUTER] Retry attempt "
-                    f"{attempt}/{OPENROUTER_RETRY_ATTEMPTS}"
+                    f"[ANYMODEL] Retry attempt "
+                    f"{attempt}/{ANYMODEL_RETRY_ATTEMPTS}"
                 )
 
-            return openrouter_request(model, prompt)
+            return anymodel_request(model, prompt)
 
         except Exception as exc:
             last_error = exc
 
-            # OpenRouter's free daily quota is a hard limit. Retrying it only
+            # AnyModel's free daily quota is a hard limit. Retrying it only
             # wastes time and creates a long failed run.
-            if is_openrouter_daily_quota_exhausted(exc):
+            if is_anymodel_quota_exhausted(exc):
                 print(
-                    "[OPENROUTER] Daily free-model quota exhausted; "
+                    "[ANYMODEL] Daily free-model quota exhausted; "
                     "skipping remaining retries."
                 )
                 raise
 
             if (
-                not is_openrouter_temporary_error(exc)
-                or attempt >= OPENROUTER_RETRY_ATTEMPTS
+                not is_anymodel_temporary_error(exc)
+                or attempt >= ANYMODEL_RETRY_ATTEMPTS
             ):
                 raise
 
             delay = min(
-                OPENROUTER_RETRY_MAX_DELAY,
-                OPENROUTER_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
+                ANYMODEL_RETRY_MAX_DELAY,
+                ANYMODEL_RETRY_BASE_DELAY * (2 ** (attempt - 1)),
             )
             delay += random.uniform(0, 2)
 
             print(
-                "[OPENROUTER] Temporary error; "
+                "[ANYMODEL] Temporary error; "
                 f"retrying in {delay:.1f}s: {exc}"
             )
             time.sleep(delay)
@@ -1805,8 +1809,8 @@ def all_llm_providers_disabled():
         or (GEMINI_PRIMARY_DISABLED and GEMINI_FALLBACK_DISABLED)
     )
     openrouter_unavailable = (
-        not OPENROUTER_API_KEY
-        or OPENROUTER_DISABLED
+        not ANYMODEL_API_KEY
+        or ANYMODEL_DISABLED
     )
     return gemini_unavailable and openrouter_unavailable
 
@@ -1814,12 +1818,12 @@ def all_llm_providers_disabled():
 def generate_post(title, article):
     global GEMINI_PRIMARY_DISABLED
     global GEMINI_FALLBACK_DISABLED
-    global OPENROUTER_DISABLED
+    global ANYMODEL_DISABLED
 
-    if not GEMINI_API_KEY and not OPENROUTER_API_KEY:
+    if not GEMINI_API_KEY and not ANYMODEL_API_KEY:
         raise PostValidationServiceError(
             "No LLM providers are configured "
-            "(GEMINI_API_KEY and OPENROUTER_API_KEY are missing)"
+            "(GEMINI_API_KEY and ANYMODEL_API_KEY are missing)"
         )
 
     if all_llm_providers_disabled():
@@ -1899,18 +1903,18 @@ def generate_post(title, article):
                     continue
                 break
 
-    if OPENROUTER_API_KEY and not OPENROUTER_DISABLED:
-        print(f"[OPENROUTER] Using {OPENROUTER_MODEL}")
+    if ANYMODEL_API_KEY and not ANYMODEL_DISABLED:
+        print(f"[ANYMODEL] Using {ANYMODEL_MODEL}")
         try:
-            result = openrouter_request_with_retry(OPENROUTER_MODEL, prompt)
+            result = anymodel_request_with_retry(ANYMODEL_MODEL, prompt)
             result = clean_post(result)
 
             if result.upper() == "REJECT":
                 last_error = RuntimeError(
-                    "OpenRouter rejected the article as not relevant"
+                    "AnyModel rejected the article as not relevant"
                 )
                 print(
-                    "[OPENROUTER REJECTED] Model returned REJECT; "
+                    "[ANYMODEL REJECTED] Model returned REJECT; "
                     "content generation failed for this article."
                 )
                 raise PostValidationServiceError(
@@ -1919,7 +1923,7 @@ def generate_post(title, article):
 
             validated = validate_post_content(result)
             print(
-                f"[POST] Generated successfully by OpenRouter: {OPENROUTER_MODEL}"
+                f"[POST] Generated successfully by AnyModel: {ANYMODEL_MODEL}"
             )
             return validated
 
@@ -1927,13 +1931,13 @@ def generate_post(title, article):
             raise
         except Exception as exc:
             last_error = exc
-            if is_openrouter_daily_quota_exhausted(exc):
-                OPENROUTER_DISABLED = True
+            if is_anymodel_quota_exhausted(exc):
+                ANYMODEL_DISABLED = True
                 print(
-                    "[OPENROUTER] Disabled for the remainder of this run "
+                    "[ANYMODEL] Disabled for the remainder of this run "
                     "because the daily free-model quota is exhausted."
                 )
-            print(f"[OPENROUTER ERROR] {exc}")
+            print(f"[ANYMODEL ERROR] {exc}")
 
             if all_llm_providers_disabled():
                 raise AllLLMProvidersUnavailable(
@@ -2212,11 +2216,11 @@ def process_news(
 def main():
     global GEMINI_PRIMARY_DISABLED
     global GEMINI_FALLBACK_DISABLED
-    global OPENROUTER_DISABLED
+    global ANYMODEL_DISABLED
 
     GEMINI_PRIMARY_DISABLED = False
     GEMINI_FALLBACK_DISABLED = False
-    OPENROUTER_DISABLED = False
+    ANYMODEL_DISABLED = False
 
     print("=" * 70)
     print("NHL NEWS BOT START")
@@ -2237,24 +2241,24 @@ def main():
     else:
         print("[CONFIG] Gemini API key: MISSING")
 
-    if OPENROUTER_API_KEY:
+    if ANYMODEL_API_KEY:
         print(
-            f"[CONFIG] OpenRouter API key: PRESENT ({len(OPENROUTER_API_KEY)} chars)"
+            f"[CONFIG] AnyModel API key: PRESENT ({len(ANYMODEL_API_KEY)} chars)"
         )
     else:
-        print("[CONFIG] OpenRouter API key: MISSING")
+        print("[CONFIG] AnyModel API key: MISSING")
 
-    if OPENROUTER_API_KEY:
+    if ANYMODEL_API_KEY:
         print(
-            f"[CONFIG] OpenRouter: {OPENROUTER_MODEL}, "
-            f"retries: {OPENROUTER_RETRY_ATTEMPTS}, "
-            f"timeout: {OPENROUTER_TIMEOUT}s"
+            f"[CONFIG] AnyModel: {ANYMODEL_MODEL}, "
+            f"retries: {ANYMODEL_RETRY_ATTEMPTS}, "
+            f"timeout: {ANYMODEL_TIMEOUT}s"
         )
     else:
         print(
-            "[CONFIG] OpenRouter: DISABLED (OPENROUTER_API_KEY is missing); "
-            f"retries: {OPENROUTER_RETRY_ATTEMPTS}, "
-            f"timeout: {OPENROUTER_TIMEOUT}s"
+            "[CONFIG] AnyModel: DISABLED (ANYMODEL_API_KEY is missing); "
+            f"retries: {ANYMODEL_RETRY_ATTEMPTS}, "
+            f"timeout: {ANYMODEL_TIMEOUT}s"
         )
     print("=" * 70)
 
