@@ -77,6 +77,7 @@ class AllLLMProvidersUnavailable(PostValidationServiceError):
 # =========================================================
 
 def normalize_url(url):
+    """Return a stable article URL without common tracking parameters."""
     url = (url or "").strip()
 
     if not url:
@@ -85,8 +86,34 @@ def normalize_url(url):
     try:
         parsed = urlparse(url)
 
-        host = parsed.netloc.lower().replace("www.", "")
+        # Treat www.example.com and example.com as the same host.
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        # Remove the default ports so equivalent URLs have the same key.
+        if host.endswith(":80") and parsed.scheme.lower() == "http":
+            host = host[:-3]
+        elif host.endswith(":443") and parsed.scheme.lower() == "https":
+            host = host[:-4]
+
         path = parsed.path.rstrip("/") or "/"
+
+        # Tracking parameters should not make the same article look new.
+        tracking_keys = {
+            "fbclid", "gclid", "dclid", "mc_cid", "mc_eid",
+            "igshid", "ref_src", "ref_url", "source", "campaign",
+        }
+        query_parts = []
+        for part in parsed.query.split("&") if parsed.query else []:
+            key = part.split("=", 1)[0]
+            decoded_key = requests.utils.unquote(key).lower()
+            if decoded_key.startswith("utm_") or decoded_key in tracking_keys:
+                continue
+            query_parts.append(part)
+
+        # Sorting retained parameters also makes reordered query strings match.
+        query = "&".join(sorted(query_parts))
 
         return urlunparse(
             (
@@ -94,7 +121,7 @@ def normalize_url(url):
                 host,
                 path,
                 "",
-                parsed.query,
+                query,
                 "",
             )
         )
@@ -2375,18 +2402,24 @@ def main():
         log_error(SOURCE_URL, str(exc), "source")
         return
 
-    new_items = [
-        item
-        for item in items
-        if not is_processed(item["url"])
-    ]
+    # Deduplicate the source list before publishing. A single feed page can
+    # contain the same article more than once (for example, with tracking
+    # parameters or repeated cards); checking only the database is not enough
+    # because none of these entries is marked processed until after publishing.
+    new_items = []
+    current_urls = set()
+
+    for item in items:
+        normalized_url = normalize_url(item.get("url", ""))
+        if not normalized_url or normalized_url in current_urls:
+            continue
+        if is_processed(normalized_url):
+            continue
+
+        current_urls.add(normalized_url)
+        new_items.append(item)
 
     retry_items = get_retryable_llm_items()
-
-    current_urls = {
-        normalize_url(item["url"])
-        for item in new_items
-    }
 
     for item in retry_items:
         if normalize_url(item["url"]) not in current_urls:
