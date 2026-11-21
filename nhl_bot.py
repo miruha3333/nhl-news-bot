@@ -1139,17 +1139,34 @@ def fetch_article(
 ):
     headers = {
         "User-Agent":
-            "Mozilla/5.0 "
-            "(NHLNewsBot/1.0)"
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0 Safari/537.36 NHLNewsBot/1.0"
     }
 
-    response = requests.get(
-        url,
-        headers=headers,
-        timeout=30,
-    )
+    response = None
+    last_exc = None
 
-    response.raise_for_status()
+    for attempt in range(1, 3):
+        try:
+            response = requests.get(
+                url,
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                print(
+                    f"[ARTICLE] Attempt {attempt} failed: {exc}. "
+                    "Retrying in 5s..."
+                )
+                time.sleep(5)
+
+    if response is None:
+        raise last_exc
 
     soup = BeautifulSoup(
         response.text,
@@ -1178,23 +1195,74 @@ def fetch_article(
             "style",
             "noscript",
             "svg",
+            "iframe",
+            "form",
+            "nav",
+            "footer",
+            "aside",
         ]
     ):
         tag.decompose()
 
-    text = text_soup.get_text(
-        " ",
-        strip=True,
+    container = (
+        text_soup.select_one("article .entry-content")
+        or text_soup.select_one(".entry-content")
+        or text_soup.select_one("article .post-content")
+        or text_soup.find("article")
+        or text_soup.find("main")
+        or text_soup.body
+        or text_soup
     )
 
-    if len(text) < 300:
-        text = fallback_summary
+    for tag in list(container.find_all(["div", "section", "ul"])):
+        if getattr(tag, "decomposed", False) or tag.attrs is None:
+            continue
 
-    text = re.sub(
-        r"\s+",
-        " ",
-        text,
-    ).strip()
+        classes = " ".join(tag.get("class") or []).lower()
+        tag_id = (tag.get("id") or "").lower()
+        marker = f"{classes} {tag_id}"
+
+        if any(
+            bad in marker
+            for bad in (
+                "related",
+                "recommended",
+                "newsletter",
+                "subscribe",
+                "social-share",
+                "share-buttons",
+                "comments",
+                "sidebar",
+                "author-bio",
+                "author-box",
+                "breadcrumb",
+            )
+        ):
+            tag.decompose()
+
+    paragraphs = [
+        re.sub(r"\s+", " ", p.get_text(" ", strip=True)).strip()
+        for p in container.find_all(["p", "h2", "h3", "blockquote"])
+    ]
+    paragraphs = [p for p in paragraphs if len(p) >= 20]
+    text = "\n\n".join(paragraphs)
+
+    if len(text) < 300:
+        text = re.sub(
+            r"\s+",
+            " ",
+            container.get_text(" ", strip=True),
+        ).strip()
+
+    if len(text) < 300:
+        text = re.sub(
+            r"\s+",
+            " ",
+            text_soup.get_text(" ", strip=True),
+        ).strip()
+
+    if len(text) < 300 and fallback_summary:
+        text = re.sub(r"\s+", " ", fallback_summary).strip()
 
     return (
         text[:MAX_ARTICLE_TEXT],
@@ -1608,13 +1676,12 @@ def is_anymodel_quota_exhausted(error):
     return any(
         marker in error_text
         for marker in (
-            "rate limit",
             "quota exceeded",
+            "daily limit",
             "insufficient balance",
             "insufficient credits",
             "credits exhausted",
             "balance is insufficient",
-            "429",
         )
     )
 
@@ -1700,22 +1767,61 @@ def split_sentences(text):
     ]
 
 
-def build_short_paragraphs(text):
-    """Make the generated text compact and readable without another Gemini call."""
+def split_title_and_body(text):
     text = clean_post(text)
+    # Убираем случайный Markdown-жирный шрифт, если модель его добавила
+    text = re.sub(r"\*\*(.+?)\*\*", r"\1", text)
+
+    lines = [line.strip() for line in text.split("\n")]
+
+    while lines and not lines[0]:
+        lines.pop(0)
+    while lines and not lines[-1]:
+        lines.pop()
+
+    if not lines:
+        return "", ""
+
+    title = re.sub(r"[ \t]+", " ", lines[0]).strip()
+    title = re.sub(
+        r"^(?:#+\s*|Заголовок\s*:\s*|\d+\.\s*)",
+        "",
+        title,
+        flags=re.IGNORECASE,
+    ).strip()
+
+    rest = "\n".join(lines[1:]).strip()
+    return title, rest
+
+
+def build_short_paragraphs(text):
+    """Форматирует заголовок + 2-4 абзаца текста в пределах лимита Telegram caption."""
+    title, body_raw = split_title_and_body(text)
+
+    if not title or not body_raw:
+        return ""
+
+    if len(title) > MAX_TITLE_CHARS:
+        title = title[:MAX_TITLE_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
 
     raw_paragraphs = [
         re.sub(r"[ \t]+", " ", paragraph).strip()
-        for paragraph in re.split(r"\n\s*\n+", text)
+        for paragraph in re.split(r"\n\s*\n+", body_raw)
         if paragraph.strip()
     ]
+
+    if len(raw_paragraphs) == 1 and "\n" in raw_paragraphs[0]:
+        raw_paragraphs = [
+            re.sub(r"[ \t]+", " ", paragraph).strip()
+            for paragraph in raw_paragraphs[0].split("\n")
+            if paragraph.strip()
+        ]
 
     if not raw_paragraphs:
         return ""
 
     paragraphs = []
 
-    # If Gemini returned one large block, create paragraphs from sentences.
     if len(raw_paragraphs) == 1:
         sentences = split_sentences(raw_paragraphs[0])
 
@@ -1725,7 +1831,6 @@ def build_short_paragraphs(text):
             for sentence in sentences:
                 current.append(sentence)
 
-                # Prefer short paragraphs of one or two sentences.
                 if len(current) >= 2:
                     paragraphs.append(" ".join(current))
                     current = []
@@ -1737,21 +1842,19 @@ def build_short_paragraphs(text):
     else:
         paragraphs = raw_paragraphs[:]
 
-    # Never create a wall of tiny paragraphs. Merge overflow into the last
-    # allowed paragraph rather than silently dropping information.
-    if len(paragraphs) > MAX_POST_PARAGRAPHS:
+    if len(paragraphs) > MAX_BODY_PARAGRAPHS:
         paragraphs = (
-            paragraphs[:MAX_POST_PARAGRAPHS - 1]
-            + [" ".join(paragraphs[MAX_POST_PARAGRAPHS - 1:])]
+            paragraphs[:MAX_BODY_PARAGRAPHS - 1]
+            + [" ".join(paragraphs[MAX_BODY_PARAGRAPHS - 1:])]
         )
 
-    # Keep the whole post comfortably below Telegram's caption limit.
+    max_body = min(MAX_BODY_CHARS, MAX_CAPTION_TOTAL - len(title) - 2)
     shortened = []
     total = 0
 
     for paragraph in paragraphs:
         separator = 2 if shortened else 0
-        available = MAX_POST_CHARS - total - separator
+        available = max_body - total - separator
 
         if available <= 0:
             break
@@ -1775,22 +1878,17 @@ def build_short_paragraphs(text):
             shortened.append(" ".join(added))
             total += separator + len(shortened[-1])
         else:
-            # If one sentence is unusually long, keep as much of it as
-            # possible and let the final word-boundary trim handle it.
             fallback = paragraph[:available].rsplit(" ", 1)[0].rstrip(" ,;:-")
             if fallback:
                 shortened.append(fallback + "…")
 
         break
 
-    result = "\n\n".join(shortened).strip()
+    body = "\n\n".join(shortened).strip()
+    if not body:
+        return ""
 
-    # A single unusually long sentence is still preferable to a Telegram
-    # API failure, so trim only at a word boundary as a last resort.
-    if len(result) > MAX_POST_CHARS:
-        result = result[:MAX_POST_CHARS].rsplit(" ", 1)[0].rstrip(" ,;:-") + "…"
-
-    return result
+    return f"{title}\n\n{body}"
 
 
 def format_telegram_post(text):
@@ -1806,10 +1904,11 @@ def format_telegram_post(text):
 
     escaped = [html.escape(paragraph, quote=False) for paragraph in paragraphs]
 
-    # The lead paragraph is bold; the rest stays clean and readable.
+    # Первая часть (заголовок) выделяется жирным; основной текст остаётся чистым.
     escaped[0] = f"<b>{escaped[0]}</b>"
 
     return "\n\n".join(escaped)
+
 
 def contains_technical_content(text):
     lowered = text.lower()
@@ -1817,7 +1916,8 @@ def contains_technical_content(text):
     technical_patterns = (
         r"```",
         r"\{\s*[\"']",
-        r"[\"']?(api|json|http|https|endpoint|request|response|prompt|system message|system prompt)\b",
+        r"\b(api|json|endpoint|system message|system prompt)\b",
+        r"https?://",
         r"stack\s*trace",
         r"traceback",
         r"generationconfig",
@@ -1871,35 +1971,44 @@ def validate_post_content(text):
 
     return text
 
+
+POST_ANGLES = (
+    "спокойное личное наблюдение без лишних эмоций",
+    "разбор мотивации клуба или игрока: что они выигрывают и в чём риск",
+    "неожиданная деталь или контраст внутри новости, который легко пропустить",
+    "короткая живая реакция на событие без раздувания объёма",
+    "аккуратный прогноз или открытый вопрос внутри самой мысли",
+    "взгляд со стороны: в чём здесь спорный момент или неоднозначность",
+)
+
+
 def generate_post_prompt(title, article):
+    suggested_angle = random.choice(POST_ANGLES)
+
     return f"""
-Ты пишешь короткий пост для русскоязычного Telegram-канала о хоккейной новости.
+Ты — автор русскоязычного Telegram-канала об NHL. Ты не пресс-служба и не новостная лента: твоя задача — превратить новость в живой авторский пост, найдя в ней интересный угол и добавив собственный взгляд.
 
-Твоя задача — дать читателю быструю и понятную выжимку самого важного. Не пересказывай статью целиком.
+Предпочтительный угол подачи для этого поста: {suggested_angle}.
+(Если этот угол совсем не подходит к данной новости, выбери другой естественный способ подачи — иронию, цитату, контраст или простую реакцию.)
 
-Правила:
-- пиши только на русском языке;
-- передавай только информацию из исходного материала;
-- не добавляй факты от себя;
-- пост должен относиться именно к этой новости;
-- убирай второстепенные детали, фон и повторы, если без них понятен смысл;
-- ориентируйся примерно на 450–750 символов; абсолютный максимум — около 850 символов;
-- обычно достаточно 2–4 коротких абзацев;
-- каждый абзац должен быть небольшим, не превращай пост в сплошную простыню;
-- первый абзац должен сразу сообщать главное событие;
-- следующие абзацы могут дать ключевые детали и контекст;
-- если новость можно нормально объяснить в 2–3 предложениях, не растягивай её;
-- не повторяй одну и ту же мысль разными словами;
-- не используй списки и подзаголовки;
-- названия команд пиши без кавычек;
-- не добавляй эмодзи;
-- не используй HTML, Markdown или другие специальные обозначения форматирования;
-- не используй служебные пометки, код, JSON, API-ответы, промпты или другую техническую информацию;
-- верни REJECT только если материал действительно непригоден для поста: он пустой, технический, обрывочный, не содержит понятного события или по нему нельзя понять, о чём именно новость;
-- не возвращай REJECT только потому, что статья описывает возможный обмен, прогноз, слух, предложение, мнение инсайдера или другое неподтверждённое развитие событий: в таком случае сохрани степень уверенности и формулировки исходного материала;
-- если материал пригоден, верни только готовый текст поста с обычными переносами строк между абзацами.
+Формат ответа (соблюдай строго):
+1. Первая строка — отдельный цепляющий заголовок (до 90 символов). Он должен передавать тему новости и намекать на деталь, противоречие или вопрос, которые раскрываются дальше, но не выдавать главный вывод поста заранее. Без кликбейта, жёлтой прессы, КАПСА и искусственных многоточий.
+2. Затем — одна пустая строка.
+3. Далее — основной текст поста: 2–4 коротких абзаца, объёмом 450–750 символов (заголовок в этот лимит не входит).
 
-Заголовок статьи:
+Правила содержания и стиля:
+- Пиши только на русском языке.
+- Используй только факты, цифры и цитаты из материала статьи ниже. Ничего не выдумывай от себя (статистику, мотивы, детали переговоров, травмы, будущие события).
+- Сохраняй степень уверенности источника: слух или возможное событие не подавай как решённый факт.
+- Не пересказывай статью целиком — возьми только 2–3 нужные детали вокруг главной мысли.
+- Названия клубов пиши просто по-русски, без кавычек и скобок: Детройт, Торонто, Бостон, Нэшвилл, Эдмонтон.
+- Не пиши по одному шаблону «вступление → факты → вывод». Можешь начать сразу с факта, детали, цитаты или реакции и закончить сразу после основной мысли — без пафосных финалов («время покажет», «дальше будет только интереснее», «это меняет всё»).
+- Не злоупотребляй AI-связками («с одной стороны — с другой стороны», «самое интересное», «это говорит о том, что», «в итоге», «безусловно», «очевидно») и не нагнетай сенсацию («шок», «сенсация», «катастрофа»).
+- Не добавляй в конце вопросы для галочки вроде «А что думаете вы?» или «Согласны?».
+- Запрещены: эмодзи, списки, подзаголовки, нумерация постов, Markdown (`**`, `*`, `#`), HTML-теги и технические пометки.
+- Верни строго слово REJECT (и больше ничего), только если материал пустой, технический, не касается хоккея/NHL или по нему невозможно понять, что произошло.
+
+Заголовок исходной новости:
 {title}
 
 Материал статьи:
@@ -2192,43 +2301,44 @@ def send_telegram(
 
     prepared_image_path = None
 
-    if image_path:
-        prepared_image_path = prepare_telegram_photo(image_path)
+    try:
+        if image_path:
+            prepared_image_path = prepare_telegram_photo(image_path)
 
-        with open(prepared_image_path, "rb") as image_file:
+            with open(prepared_image_path, "rb") as image_file:
+                response = requests.post(
+                    f"{base_url}/sendPhoto",
+                    data={
+                        "chat_id": TELEGRAM_CHAT_ID,
+                        "caption": formatted_post,
+                        "parse_mode": "HTML",
+                    },
+                    files={"photo": ("nhl.jpg", image_file, "image/jpeg")},
+                    timeout=TELEGRAM_TIMEOUT,
+                )
+        else:
             response = requests.post(
-                f"{base_url}/sendPhoto",
+                f"{base_url}/sendMessage",
                 data={
                     "chat_id": TELEGRAM_CHAT_ID,
-                    "caption": formatted_post,
+                    "text": formatted_post,
                     "parse_mode": "HTML",
                 },
-                files={"photo": ("nhl.jpg", image_file, "image/jpeg")},
                 timeout=TELEGRAM_TIMEOUT,
             )
-    else:
-        response = requests.post(
-            f"{base_url}/sendMessage",
-            data={
-                "chat_id": TELEGRAM_CHAT_ID,
-                "text": formatted_post,
-                "parse_mode": "HTML",
-            },
-            timeout=TELEGRAM_TIMEOUT,
-        )
 
-    if response.status_code >= 400:
-        raise RuntimeError(
-            "Telegram HTTP "
-            f"{response.status_code}: "
-            f"{response.text[:1000]}"
-        )
-
-    if prepared_image_path and prepared_image_path != image_path:
-        try:
-            os.unlink(prepared_image_path)
-        except OSError:
-            pass
+        if response.status_code >= 400:
+            raise RuntimeError(
+                "Telegram HTTP "
+                f"{response.status_code}: "
+                f"{response.text[:1000]}"
+            )
+    finally:
+        if prepared_image_path and prepared_image_path != image_path:
+            try:
+                os.unlink(prepared_image_path)
+            except OSError:
+                pass
 
 def process_news(
     item,
@@ -2238,12 +2348,13 @@ def process_news(
     print(f"[BOT] Processing {index}/{total}")
 
     url = item["url"]
+    image = None
 
-    current_llm_failures = get_llm_failure_count(url)
-    if current_llm_failures:
+    current_failures = get_llm_failure_count(url)
+    if current_failures:
         print(
-            f"[RETRY] Consecutive LLM generation failures before this attempt: "
-            f"{current_llm_failures}/2"
+            f"[RETRY] Previous failed attempts for this article: "
+            f"{current_failures}/2"
         )
 
     try:
@@ -2259,8 +2370,6 @@ def process_news(
             article,
         )
 
-        image = None
-
         for source_image_url, image_source in source_images:
             image = download_source_image(
                 source_image_url,
@@ -2272,8 +2381,9 @@ def process_news(
                 break
 
         if image is None:
-            raise RuntimeError(
-                "Could not download any image from the article page"
+            print(
+                "[IMAGE] No downloadable image found; "
+                "sending text-only post."
             )
 
         send_telegram(
@@ -2296,7 +2406,6 @@ def process_news(
             "post_rejected",
         )
 
-        # A real content rejection is permanent: do not retry it forever.
         mark_processed(url)
         return False
 
@@ -2304,14 +2413,18 @@ def process_news(
         print(f"[LLM STOP] {exc}")
         log_error(url, str(exc), "llm_service")
 
-        # Any failed publication attempt is final for this article.
-        # The main bot runs every 10 minutes, so keeping failed items
-        # unprocessed would make them return on every subsequent run.
-        mark_processed(url)
-        print(
-            "[POST SKIPPED] LLM providers unavailable; "
-            "marking article as processed so it will not be retried."
-        )
+        failures = increment_llm_failure(url)
+        if failures >= 2:
+            mark_processed(url)
+            print(
+                "[POST SKIPPED] LLM providers unavailable twice; "
+                "marking article as processed so it will not loop."
+            )
+        else:
+            print(
+                "[RETRY] Keeping article queued for 1 more attempt "
+                f"({failures}/2)."
+            )
         return False
 
     except PostValidationServiceError as exc:
@@ -2323,14 +2436,18 @@ def process_news(
             "llm_service",
         )
 
-        # Any LLM generation failure is treated as final.
-        # The bot runs every 10 minutes, therefore the failed article
-        # must not remain in the retry queue for the next run.
-        mark_processed(url)
-        print(
-            "[POST SKIPPED] LLM generation failed; "
-            "marking article as processed so it will not be retried."
-        )
+        failures = increment_llm_failure(url)
+        if failures >= 2:
+            mark_processed(url)
+            print(
+                "[POST SKIPPED] LLM generation failed twice; "
+                "marking article as processed so it will not loop."
+            )
+        else:
+            print(
+                "[RETRY] Keeping article queued for 1 more attempt "
+                f"({failures}/2)."
+            )
         return False
 
     except Exception as exc:
@@ -2359,8 +2476,21 @@ def process_news(
             stage,
         )
 
-        # Unexpected technical failures also remain retryable.
+        failures = increment_llm_failure(url)
+        if failures >= 2:
+            mark_processed(url)
+            print(
+                "[POST SKIPPED] Article failed twice; "
+                "marking as processed so it will not loop."
+            )
         return False
+
+    finally:
+        if image and os.path.exists(image):
+            try:
+                os.unlink(image)
+            except OSError:
+                pass
 
 
 # =========================================================
