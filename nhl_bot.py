@@ -2200,12 +2200,7 @@ def generate_post(title, article):
 # =========================================================
 
 def prepare_telegram_photo(image_path):
-    """Convert the source image to a Telegram-friendly JPEG photo.
-
-    Telegram may reject otherwise valid WebP/AVIF images or unusual dimensions
-    when they are uploaded through sendPhoto. Re-encode them as JPEG and keep
-    the dimensions within a conservative range.
-    """
+    """Convert the source image to a Telegram-friendly JPEG photo."""
     if not image_path:
         return None
 
@@ -2222,11 +2217,18 @@ def prepare_telegram_photo(image_path):
             original_size = source.size
             image = source.convert("RGB")
 
-            max_dimension = 4096
+            max_dimension = 1920
             width, height = image.size
 
-            if width <= 0 or height <= 0:
-                raise RuntimeError("Downloaded image has invalid dimensions")
+            if width < 100 or height < 100:
+                raise RuntimeError(
+                    f"Downloaded image is too small ({width}x{height})"
+                )
+
+            if max(width, height) / float(min(width, height)) > 10:
+                raise RuntimeError(
+                    f"Downloaded image has extreme aspect ratio ({width}x{height})"
+                )
 
             scale = min(
                 1.0,
@@ -2257,8 +2259,7 @@ def prepare_telegram_photo(image_path):
             image.save(
                 output_path,
                 format="JPEG",
-                quality=92,
-                optimize=True,
+                quality=88,
             )
             image.close()
 
@@ -2300,23 +2301,42 @@ def send_telegram(
         raise RuntimeError("Formatted Telegram post is empty")
 
     prepared_image_path = None
+    response = None
 
     try:
         if image_path:
-            prepared_image_path = prepare_telegram_photo(image_path)
+            try:
+                prepared_image_path = prepare_telegram_photo(image_path)
 
-            with open(prepared_image_path, "rb") as image_file:
-                response = requests.post(
-                    f"{base_url}/sendPhoto",
-                    data={
-                        "chat_id": TELEGRAM_CHAT_ID,
-                        "caption": formatted_post,
-                        "parse_mode": "HTML",
-                    },
-                    files={"photo": ("nhl.jpg", image_file, "image/jpeg")},
-                    timeout=TELEGRAM_TIMEOUT,
+                with open(prepared_image_path, "rb") as image_file:
+                    response = requests.post(
+                        f"{base_url}/sendPhoto",
+                        data={
+                            "chat_id": TELEGRAM_CHAT_ID,
+                            "caption": formatted_post,
+                            "parse_mode": "HTML",
+                        },
+                        files={"photo": ("nhl.jpg", image_file, "image/jpeg")},
+                        timeout=TELEGRAM_TIMEOUT,
+                    )
+            except Exception as photo_exc:
+                print(
+                    "[TELEGRAM] Photo preparation/upload error; "
+                    f"falling back to text-only post: {photo_exc}"
                 )
-        else:
+                response = None
+
+            if response is not None and response.status_code == 400 and (
+                "IMAGE_PROCESS_FAILED" in response.text
+                or "PHOTO_" in response.text
+            ):
+                print(
+                    "[TELEGRAM] Photo rejected by Telegram; "
+                    "falling back to text-only post."
+                )
+                response = None
+
+        if response is None:
             response = requests.post(
                 f"{base_url}/sendMessage",
                 data={
