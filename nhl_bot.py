@@ -1,7 +1,6 @@
 import os
 import re
 import random
-import hashlib
 import html
 import sqlite3
 import tempfile
@@ -28,7 +27,7 @@ DATABASE_FILE = "nhl_bot.db"
 
 MAX_NEWS = 30
 
-GEMINI_PRIMARY_MODEL = "gemini-3.5-flash"
+GEMINI_PRIMARY_MODEL = "gemini-3.6-flash"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 GEMINI_TIMEOUT = 60
@@ -45,14 +44,12 @@ TELEGRAM_TIMEOUT = 60
 SOURCE_IMAGE_DOWNLOAD_TIMEOUT = 15
 MIN_IMAGE_BYTES = 5000
 
-GEMINI_DELAY = 1.0
 MAX_ARTICLE_TEXT = 12000
 
-MAX_POST_CHARS = 850
-MAX_POST_PARAGRAPHS = 4
-
-FRESH_DAYS = 90
-HISTORICAL_YEAR_TOLERANCE = 3
+MAX_TITLE_CHARS = 120
+MAX_BODY_CHARS = 780
+MAX_CAPTION_TOTAL = 980
+MAX_BODY_PARAGRAPHS = 4
 
 DATABASE_READY = False
 GEMINI_PRIMARY_DISABLED = False
@@ -861,6 +858,16 @@ def is_heavy_article_url(url):
     if path in ("/sports/nhl", "/sports/nhl/"):
         return False
 
+    blocked_segments = (
+        "/page/",
+        "/category/",
+        "/tag/",
+        "/author/",
+        "/feed",
+    )
+    if any(segment in path for segment in blocked_segments):
+        return False
+
     return True
 
 
@@ -878,30 +885,53 @@ def extract_listing_title(anchor):
 def load_news():
     print(f"[HEAVY] Loading source page: {SOURCE_URL}")
 
-    response = requests.get(
-        SOURCE_URL,
-        headers={
-            "User-Agent":
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0 Safari/537.36 NHLNewsBot/1.0"
-        },
-        timeout=30,
-    )
-    response.raise_for_status()
+    headers = {
+        "User-Agent":
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0 Safari/537.36 NHLNewsBot/1.0"
+    }
+
+    response = None
+    last_exc = None
+
+    for attempt in range(1, 3):
+        try:
+            response = requests.get(
+                SOURCE_URL,
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                print(
+                    f"[HEAVY] Attempt {attempt} failed: {exc}. "
+                    "Retrying in 5s..."
+                )
+                time.sleep(5)
+
+    if response is None:
+        raise last_exc
 
     soup = BeautifulSoup(response.text, "html.parser")
     result = []
     seen = set()
 
     for anchor in soup.find_all("a", href=True):
-        url = normalize_url(urljoin(response.url, anchor.get("href", "")))
+        raw_href = anchor.get("href", "")
+        if "#comments" in raw_href or "#respond" in raw_href:
+            continue
+
+        url = normalize_url(urljoin(response.url, raw_href))
 
         if not is_heavy_article_url(url) or url in seen:
             continue
 
         title = extract_listing_title(anchor)
-        if not title:
+        if len(title) < 10:
             continue
 
         seen.add(url)
