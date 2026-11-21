@@ -13,12 +13,12 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
@@ -35,16 +35,17 @@ jobs:
 
       - name: Commit bot state
         run: |
+          python -c "import sqlite3; c=sqlite3.connect('nhl_bot.db'); c.execute('PRAGMA wal_checkpoint(TRUNCATE)'); c.close()"
+          rm -f nhl_bot.db-wal nhl_bot.db-shm
+
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
-          # КРИТИЧНО: SQLite-база хранит processed=1.
-          # Если не сохранять nhl_bot.db, следующий GitHub Actions runner
-          # снова увидит те же новости как новые и бот будет публиковать их повторно.
-          git add nhl_bot.db history.txt
+          git add nhl_bot.db
 
           if ! git diff --staged --quiet; then
             git commit -m "Update bot state [skip ci]"
+            git pull --rebase --autostash
             git push
           else
             echo "Состояние не изменилось, пушить нечего."
