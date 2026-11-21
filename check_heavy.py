@@ -1,6 +1,7 @@
 import os
 import sqlite3
 import sys
+import time
 from urllib.parse import urljoin, urlparse, urlunparse
 
 import requests
@@ -25,8 +26,30 @@ def normalize_url(url):
     try:
         parsed = urlparse(url)
 
-        host = parsed.netloc.lower().replace("www.", "")
+        host = parsed.netloc.lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        if host.endswith(":80") and parsed.scheme.lower() == "http":
+            host = host[:-3]
+        elif host.endswith(":443") and parsed.scheme.lower() == "https":
+            host = host[:-4]
+
         path = parsed.path.rstrip("/") or "/"
+
+        tracking_keys = {
+            "fbclid", "gclid", "dclid", "mc_cid", "mc_eid",
+            "igshid", "ref_src", "ref_url", "source", "campaign",
+        }
+        query_parts = []
+        for part in parsed.query.split("&") if parsed.query else []:
+            key = part.split("=", 1)[0]
+            decoded_key = requests.utils.unquote(key).lower()
+            if decoded_key.startswith("utm_") or decoded_key in tracking_keys:
+                continue
+            query_parts.append(part)
+
+        query = "&".join(sorted(query_parts))
 
         return urlunparse(
             (
@@ -34,7 +57,7 @@ def normalize_url(url):
                 host,
                 path,
                 "",
-                parsed.query,
+                query,
                 "",
             )
         )
@@ -65,6 +88,16 @@ def is_heavy_article_url(url):
     ):
         return False
 
+    blocked_segments = (
+        "/page/",
+        "/category/",
+        "/tag/",
+        "/author/",
+        "/feed",
+    )
+    if any(segment in path for segment in blocked_segments):
+        return False
+
     return True
 
 
@@ -88,20 +121,38 @@ def load_heavy_articles():
         f"[WATCHER] Loading Heavy: {SOURCE_URL}"
     )
 
-    response = requests.get(
-        SOURCE_URL,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/140.0 Safari/537.36 "
-                "NHLNewsWatcher/1.0"
-            )
-        },
-        timeout=30,
-    )
+    headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/140.0 Safari/537.36 "
+            "NHLNewsWatcher/1.0"
+        )
+    }
 
-    response.raise_for_status()
+    response = None
+    last_exc = None
+
+    for attempt in range(1, 3):
+        try:
+            response = requests.get(
+                SOURCE_URL,
+                headers=headers,
+                timeout=30,
+            )
+            response.raise_for_status()
+            break
+        except Exception as exc:
+            last_exc = exc
+            if attempt < 2:
+                print(
+                    f"[WATCHER] Attempt {attempt} failed: {exc}. "
+                    "Retrying in 5s..."
+                )
+                time.sleep(5)
+
+    if response is None:
+        raise last_exc
 
     soup = BeautifulSoup(
         response.text,
@@ -115,10 +166,14 @@ def load_heavy_articles():
         "a",
         href=True,
     ):
+        raw_href = anchor.get("href", "")
+        if "#comments" in raw_href or "#respond" in raw_href:
+            continue
+
         url = normalize_url(
             urljoin(
                 response.url,
-                anchor.get("href", ""),
+                raw_href,
             )
         )
 
@@ -130,7 +185,7 @@ def load_heavy_articles():
 
         title = extract_title(anchor)
 
-        if not title:
+        if len(title) < 10:
             continue
 
         seen.add(url)
@@ -284,8 +339,11 @@ def main():
             "NEW_NEWS",
             "false",
         )
-
-        sys.exit(1)
+        set_github_output(
+            "NEWS_COUNT",
+            "0",
+        )
+        return
 
     print(
         f"[WATCHER] Heavy articles found: "
@@ -301,8 +359,11 @@ def main():
             "NEW_NEWS",
             "false",
         )
-
-        sys.exit(1)
+        set_github_output(
+            "NEWS_COUNT",
+            "0",
+        )
+        return
 
     processed_urls = get_processed_urls()
 
