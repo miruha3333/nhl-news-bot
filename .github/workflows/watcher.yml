@@ -17,9 +17,8 @@ on:
     # 11:00 - 15:59 по Украине
     # Проверка каждые 30 минут.
     - cron: '7,37 11-15 * * *'
-      timezone: Europe/Kyiv
-
-  workflow_dispatch:
+      on:
+  workflow_dispatch: # Запускается через cron-job.org или вручную
 
 concurrency:
   group: nhl-feed-watcher
