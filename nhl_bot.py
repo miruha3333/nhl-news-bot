@@ -27,7 +27,7 @@ DATABASE_FILE = "nhl_bot.db"
 
 MAX_NEWS = 30
 
-GEMINI_PRIMARY_MODEL = "gemini-3.6-flash"
+GEMINI_PRIMARY_MODEL = "gemini-4-hydrogen"
 GEMINI_FALLBACK_MODEL = "gemini-3.5-flash-lite"
 
 GEMINI_TIMEOUT = 60
@@ -1403,6 +1403,8 @@ def gemini_request(
         f"v1beta/models/{model}:generateContent"
     )
 
+    is_gemini_4 = model.startswith("gemini-4-")
+
     payload = {
         "contents": [
             {
@@ -1414,9 +1416,9 @@ def gemini_request(
             }
         ],
         "generationConfig": {
-            "maxOutputTokens": 1000,
+            "maxOutputTokens": 4096 if is_gemini_4 else 1000,
             "thinkingConfig": {
-                "thinkingLevel": "minimal"
+                "thinkingLevel": "low" if is_gemini_4 else "minimal"
             },
         },
     }
@@ -1469,7 +1471,7 @@ def gemini_request(
     text = "".join(
         part.get("text", "")
         for part in parts
-        if isinstance(part, dict)
+        if isinstance(part, dict) and not part.get("thought")
     ).strip()
 
     if not text:
